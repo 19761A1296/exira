@@ -3,6 +3,7 @@
 
 # Python cache
 __pycache__/
-
+*.json
+*.db
 *.json
 *.db
