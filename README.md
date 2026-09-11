@@ -1,2 +1,2 @@
 # exira
-Building an end-to-end trade 
+Building an end-to-end trade chatbot
