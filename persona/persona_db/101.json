@@ -1,0 +1,16 @@
+{
+  "user_id": "101",
+  "persona_version": "v1",
+  "created_at": "2026-09-01",
+  "last_updated": "2026-09-01",
+  "business_context": "Not enough information is available yet to determine the user's business context.",
+  "trade_profile": "The user has shown initial interest in buyer discovery.",
+  "product_interests": "Not enough information is available yet to determine specific product interests.",
+  "market_interests": "The user is currently focusing on the Indian market.",
+  "entity_interests": "The user is interested in identifying buyers located in India.",
+  "preferred_analysis_style": "The user prefers short, direct queries for lead generation.",
+  "preferred_metrics_and_filters": "Not enough information is available yet to determine preferred metrics or filters.",
+  "top_of_mind": "Identifying potential buyers in India.",
+  "brief_history": "The user initiated a conversation and requested a list of buyers in India.",
+  "long_term_background": "The user is in the early stages of interacting with EXIRA, primarily focusing on market expansion or lead generation in India."
+}

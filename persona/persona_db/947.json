@@ -1,0 +1,15 @@
+{
+  "user_id": "947",
+  "created_at": "2026-09-09",
+  "last_updated": "2026-09-09",
+  "business_context": "Not enough information is available yet to determine the user's business context.",
+  "trade_profile": "The user is utilizing EXIRA for buyer discovery and shipment-data analysis.",
+  "product_interests": "The user has shown interest in products falling under HS code 22 (Beverages, spirits and vinegar).",
+  "market_interests": "Not enough information is available to determine specific geographic market interests.",
+  "entity_interests": "The user is interested in identifying top buyers associated with HS 22.",
+  "preferred_analysis_style": "The user prefers lists of top-performing entities based on shipment data.",
+  "preferred_metrics_and_filters": "The user prefers a time range of the last 24 months.",
+  "top_of_mind": "Identifying the leading buyers for HS code 22 over the past two years.",
+  "brief_history": "The user initiated a request to find the top buyers for HS code 22 within a 24-month window.",
+  "long_term_background": "Insufficient data to establish long-term behavior; the user has only performed one initial query regarding beverage-related trade data."
+}
