@@ -31,6 +31,7 @@ ACTIVE_ROWS = f"({COL_D_FLAG} IS NULL OR {COL_D_FLAG} = 0)"
 
 import os
 import snowflake.connector
+import re 
 
 TABLE_NAME    = os.getenv("TRADE_TABLE_NAME")
 COL_S_COMPANY = "S_COMPANY"
@@ -51,17 +52,35 @@ def _get_conn():
     )
 
 
-def companies_list(company_name, limit=20):
-
+def companies_list(company_name, limit=50, country=None, hs2=None):
+    
     q = (company_name or "").strip().upper()
     if not q:
         return []
 
-    # escape LIKE wildcards so user input can't act as a pattern
-    q = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    pattern = f"%{q}%"
+    def esc(text):
+        return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
-    limit = max(1, min(int(limit), 500))   # inlined, so keep it a sane int
+    params = {"company": f"%{esc(q)}%"}
+
+    country = (country or "").strip().upper()
+    hs2 = re.sub(r"\D", "", hs2 or "")[:2]
+
+    seller_extra = ""
+    buyer_extra = ""
+
+    if country:
+        params["country"] = f"%{esc(country)}%"
+        seller_extra += " AND UPPER(TRIM(SELLER_COUNTRY)) LIKE %(country)s ESCAPE '\\\\'"
+        buyer_extra  += " AND UPPER(TRIM(BUYER_COUNTRY))  LIKE %(country)s ESCAPE '\\\\'"
+
+    if hs2:
+        params["hs2"] = hs2
+        hs_clause = " AND LEFT(TRIM(HS_CODE), 2) = %(hs2)s"
+        seller_extra += hs_clause
+        buyer_extra += hs_clause
+
+    limit = max(1, min(int(limit), 1000))
 
     query = f"""
         SELECT name FROM (
@@ -70,6 +89,7 @@ def companies_list(company_name, limit=20):
             WHERE {ACTIVE_ROWS}
               AND {COL_S_COMPANY} IS NOT NULL
               AND UPPER({COL_S_COMPANY}) LIKE %(company)s ESCAPE '\\\\'
+              {seller_extra}
 
             UNION
 
@@ -78,6 +98,7 @@ def companies_list(company_name, limit=20):
             WHERE {ACTIVE_ROWS}
               AND {COL_B_COMPANY} IS NOT NULL
               AND UPPER({COL_B_COMPANY}) LIKE %(company)s ESCAPE '\\\\'
+              {buyer_extra}
         )
         ORDER BY name
         LIMIT {limit}
@@ -86,14 +107,12 @@ def companies_list(company_name, limit=20):
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(query, {"company": pattern})
+            cur.execute(query, params)
             rows = cur.fetchall()
     finally:
         conn.close()
 
     return [r[0] for r in rows]
-
-
 
 def build_query(company_name=""):
 

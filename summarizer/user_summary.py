@@ -94,8 +94,7 @@ def build_user_summary(company_name, data=None):
     data: list holding a DataFrame and/or scraped info string. Both optional.
     Returns a dict in card format."""
     company_name = (company_name or "").strip()
-    if not company_name:
-        return dict(EMPTY_CARD)
+ 
 
     body = _as_text(data)
     user_content = f"company_name: {company_name}\n\n{body if body else 'data: (none)'}"
@@ -112,3 +111,8 @@ def build_user_summary(company_name, data=None):
         card["company_name"] = company_name
 
     return card
+
+
+if __name__ == "__main__":
+    result = build_user_summary("", data=["Google LLC is a multinational technology company that specializes in Internet-related services and products, which include online advertising technologies, a search engine, cloud computing, software, and hardware. It is best known for its search engine, Google Search, and its various services such as Google Maps, Google Drive, and YouTube, serving billions of users worldwide."])
+    print("\nFinal Result:\n", result)

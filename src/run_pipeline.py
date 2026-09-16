@@ -7,16 +7,50 @@ from summarizer.user_summary import build_user_summary
 MAX_ATTEMPTS= 3
 COMPANY_FIELDS = ("company_name", "company_info")
 
+NARROW_THRESHOLD = 40
+
+
 def resolve_in_db(company_name):
-   
     if not company_name:
         return None
 
-    company_list = companies_list(company_name)      # your existing DB lookup
-    
+    company_list = companies_list(company_name, limit=40)
     if not company_list:
         print("No company found in DB for:", company_name)
         return None
+
+    country = ""
+    hs2 = ""
+
+    # ── too many: narrow by country ──────────────────────────
+    if len(company_list) > NARROW_THRESHOLD:
+        print(f"{len(company_list)} companies matched '{company_name}'.")
+        country = input("Enter a country to narrow it down (Enter to skip): ").strip()
+        if country:
+            filtered = companies_list(company_name, limit=500, country=country)
+            if filtered:
+                company_list = filtered
+                print(f"{len(company_list)} companies in {country}.")
+            else:
+                print(f"Nothing matched in '{country}' — keeping the full list.")
+                country = ""
+
+    # ── still too many: narrow by HS chapter ─────────────────
+    if len(company_list) > NARROW_THRESHOLD:
+        hs2 = input("Enter an HS code to narrow further, first 2 digits used "
+                    "(Enter to skip): ").strip()
+        if hs2:
+            filtered = companies_list(company_name, limit=500,
+                                      country=country or None, hs2=hs2)
+            if filtered:
+                company_list = filtered
+                print(f"{len(company_list)} companies under HS {hs2[:2]}.")
+            else:
+                print(f"Nothing matched under HS {hs2[:2]} — keeping the previous list.")
+
+    # ── show whatever is left ────────────────────────────────
+    if len(company_list) > NARROW_THRESHOLD:
+        print(f"Showing all {len(company_list)} matches.")
 
     for i, company in enumerate(company_list, start=1):
         print(f"{i}. {company}")
@@ -26,7 +60,7 @@ def resolve_in_db(company_name):
         print("Invalid input.")
         return None
 
-    idx = int(choice) - 1                 # display is 1-based, list is 0-based
+    idx = int(choice) - 1
     if not 0 <= idx < len(company_list):
         print("No such option.")
         return None
@@ -272,5 +306,7 @@ def run_pipeline(text="", urls="", max_attempts=3):
 
 
 if __name__ == "__main__":
-    result = run_pipeline(text="", urls="https://kis.ai/")
-    print("\nFinal Result:\n", result)
+    # result = run_pipeline(text="", urls="https://kis.ai/")
+    # print("\nFinal Result:\n", result)
+
+    resolve_in_db("tata")
