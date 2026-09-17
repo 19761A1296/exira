@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = os.getenv("OPENROUTER_MODEL_MEMORY_ANSWER", "anthropic/claude-haiku-4.5")
+MODEL = os.getenv("OPENROUTER_MODEL_MEMORY_ANSWER")
 
 PROMPT_MEMORY_ANSWER = """You answer questions about the user, using only what is
 stored in memory. You have no access to shipment data and must never pretend otherwise.

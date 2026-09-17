@@ -9,7 +9,7 @@ from summarizer.summarizer_prompts.summarizer_prompts import PROMPT_USER_SUMMARY
 load_dotenv()
 
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
-OPENROUTER_MODEL   = os.getenv("OPENROUTER_MODEL_USER_SUMMARY", "anthropic/claude-haiku-4.5")
+OPENROUTER_MODEL   = os.getenv("OPENROUTER_MODEL_USER_SUMMARY")
 OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
 
 EMPTY_CARD = {

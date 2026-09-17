@@ -52,7 +52,7 @@ def _get_conn():
     )
 
 
-def companies_list(company_name, limit=50, country=None, hs2=None):
+def companies_list(company_name, limit=500, country=None, hs2=None):
     
     q = (company_name or "").strip().upper()
     if not q:
@@ -148,17 +148,17 @@ def run_query(query):
 
 if __name__ == "__main__":
 
-    # q = "ALLENBERG"
-    # result = companies_list(q, limit=10)
-    # print(f"Companies matching '{q}':", result)
+    q = "AB"
+    result = companies_list(q, limit=10)
+    print(f"Companies matching '{q}':", result)
 
     # query = build_query("ALLENBERG COTTON CO")
     # print("QUERY:", query)
-    query = f"SELECT {SELECTED_COLUMNS_STR} FROM {TABLE_NAME} LIMIT 100"
-    df = run_query(query)
-    #print(df.columns.tolist())
-    # print("Row count:", df.shape)
-    print(df.to_string(index=False))
+    # query = f"SELECT {SELECTED_COLUMNS_STR} FROM {TABLE_NAME} LIMIT 100"
+    # df = run_query(query)
+    # #print(df.columns.tolist())
+    # # print("Row count:", df.shape)
+    # print(df.to_string(index=False))
 
 
 

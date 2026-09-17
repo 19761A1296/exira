@@ -7,14 +7,15 @@ from summarizer.user_summary import build_user_summary
 MAX_ATTEMPTS= 3
 COMPANY_FIELDS = ("company_name", "company_info")
 
-NARROW_THRESHOLD = 40
+NARROW_THRESHOLD = 30
+LOOKUP_LIMIT = 500
 
 
 def resolve_in_db(company_name):
     if not company_name:
         return None
 
-    company_list = companies_list(company_name, limit=40)
+    company_list = companies_list(company_name, limit=LOOKUP_LIMIT)
     if not company_list:
         print("No company found in DB for:", company_name)
         return None
@@ -27,7 +28,8 @@ def resolve_in_db(company_name):
         print(f"{len(company_list)} companies matched '{company_name}'.")
         country = input("Enter a country to narrow it down (Enter to skip): ").strip()
         if country:
-            filtered = companies_list(company_name, limit=500, country=country)
+            filtered = companies_list(company_name, limit=LOOKUP_LIMIT,
+                                      country=country)
             if filtered:
                 company_list = filtered
                 print(f"{len(company_list)} companies in {country}.")
@@ -40,13 +42,14 @@ def resolve_in_db(company_name):
         hs2 = input("Enter an HS code to narrow further, first 2 digits used "
                     "(Enter to skip): ").strip()
         if hs2:
-            filtered = companies_list(company_name, limit=500,
+            filtered = companies_list(company_name, limit=LOOKUP_LIMIT,
                                       country=country or None, hs2=hs2)
             if filtered:
                 company_list = filtered
                 print(f"{len(company_list)} companies under HS {hs2[:2]}.")
             else:
-                print(f"Nothing matched under HS {hs2[:2]} — keeping the previous list.")
+                print(f"Nothing matched under HS {hs2[:2]} — "
+                      "keeping the previous list.")
 
     # ── show whatever is left ────────────────────────────────
     if len(company_list) > NARROW_THRESHOLD:
@@ -66,7 +69,6 @@ def resolve_in_db(company_name):
         return None
 
     return company_list[idx]
-
 def _ask(prompt):
     return input(prompt).strip()
 def ask_for_urls(reason):

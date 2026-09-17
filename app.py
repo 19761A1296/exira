@@ -5,8 +5,8 @@
 # The CLI modules (src/router.py, src/run_pipeline.py) use input(), which
 # Streamlit cannot drive. This file reimplements those two loops as UI steps
 # while calling the same backend functions. The onboarding wizard follows
-# run_pipeline's flow exactly: DB lookup -> pick from list -> scrape ->
-# approve each field -> resolve again -> build profile, with 3 attempts.
+# run_pipeline's flow exactly: DB lookup -> narrow -> pick from list -> scrape
+# -> approve each field -> resolve again -> build profile, with 3 attempts.
 
 import json
 import re
@@ -26,11 +26,14 @@ from reporting.report_generator import init_report, update_report, log_report
 from persona.tweaked_exira import build_and_save_persona, load_persona, persona_to_text
 from summarizer.session_summarizer import query_summary, session_summary
 from summarizer.classifier import classify_query
+from summarizer.analyzer import resolve_query
+from summarizer.web_search import web_search, as_context
 from summarizer.memory_answer import answer_from_memory
 from summarizer.user_summary import build_user_summary
 
 MAX_SESSION_QUERIES = 5
 MAX_ATTEMPTS = 3
+NARROW_THRESHOLD = 30
 
 st.set_page_config(page_title="Trade Intelligence", page_icon="🌐", layout="wide")
 
@@ -86,6 +89,9 @@ def init_state():
     d.setdefault("candidates", [])
     d.setdefault("show_hs_panel", False)
     d.setdefault("session_notes", "")
+    d.setdefault("last_resolution", None)
+    d.setdefault("last_route", "")
+    d.setdefault("pending_input", None)     # (text, from_list) awaiting work
 
     # onboarding wizard
     d.setdefault("onb_step", "input")
@@ -99,6 +105,11 @@ def init_state():
     d.setdefault("onb_scraped_name", "")
     d.setdefault("onb_pending", {})
     d.setdefault("onb_after_urls", "")
+    # narrowing
+    d.setdefault("onb_search_name", "")      # the name the matches came from
+    d.setdefault("onb_country", "")
+    d.setdefault("onb_hs2", "")
+    d.setdefault("onb_next_after_pick", "")
 
 
 init_state()
@@ -123,14 +134,27 @@ def onb_reset_for_retry():
     S.onb_scraped_name = ""
     S.onb_pending = {}
     S.onb_scrape_attempt = 0
+    S.onb_country = ""
+    S.onb_hs2 = ""
 
 
-def onb_lookup(name: str) -> list:
+def onb_lookup(name: str, country: str = "", hs2: str = "") -> list:
     """companies_list wrapper — the DB half of resolve_in_db."""
     if not name:
         return []
     try:
-        return companies_list(name) or []
+        return companies_list(name, limit=500,
+                              country=country or None,
+                              hs2=hs2 or None) or []
+    except TypeError:
+        # snowflake_db not yet updated with the filter arguments
+        if country or hs2:
+            st.warning("companies_list does not support country/HS filters yet.")
+        try:
+            return companies_list(name) or []
+        except Exception as exc:
+            st.error(f"Company lookup failed: {exc}")
+            return []
     except Exception as exc:
         st.error(f"Company lookup failed: {exc}")
         return []
@@ -204,6 +228,14 @@ def onb_fail_or_retry(reason: str):
         st.rerun()
 
 
+def enter_pick(matches: list, search_name: str, next_step: str):
+    """Route to the narrow step when the list is long, else straight to picking."""
+    S.onb_matches = matches
+    S.onb_search_name = search_name
+    S.onb_next_after_pick = next_step
+    S.onb_step = "narrow" if len(matches) > NARROW_THRESHOLD else next_step
+
+
 # ── step: initial input ───────────────────────────────────────────
 
 def step_input():
@@ -231,9 +263,9 @@ def step_input():
 
     # resolve_from_text -> resolve_in_db
     if text:
-        S.onb_matches = onb_lookup(text)
-        if S.onb_matches:
-            S.onb_step = "pick_text"
+        matches = onb_lookup(text)
+        if matches:
+            enter_pick(matches, text, "pick_text")
             st.rerun()
 
     # no DB hit from text -> URL path
@@ -245,11 +277,55 @@ def step_input():
     st.rerun()
 
 
+# ── step: narrow a long list by country, then HS chapter ──────────
+
+def step_narrow():
+    st.subheader("Too many matches — narrow it down")
+    st.caption(f"{len(S.onb_matches)} companies matched “{S.onb_search_name}”.")
+
+    active = []
+    if S.onb_country:
+        active.append(f"country = {S.onb_country}")
+    if S.onb_hs2:
+        active.append(f"HS {S.onb_hs2}")
+    if active:
+        st.caption("Filters applied: " + ", ".join(active))
+
+    country = st.text_input("Country (leave blank to skip)",
+                            value=S.onb_country, key="nw_country").strip()
+
+    hs2 = ""
+    if S.onb_country or country:
+        hs2 = st.text_input("HS code — first 2 digits are used (leave blank to skip)",
+                            value=S.onb_hs2, key="nw_hs2").strip()
+
+    c1, c2 = st.columns(2)
+
+    if c1.button("Apply filter", type="primary", use_container_width=True):
+        filtered = onb_lookup(S.onb_search_name, country=country, hs2=hs2)
+        if filtered:
+            S.onb_matches = filtered
+            S.onb_country, S.onb_hs2 = country, hs2
+            if len(filtered) <= NARROW_THRESHOLD:
+                S.onb_step = S.onb_next_after_pick
+            st.rerun()
+        else:
+            st.warning("Nothing matched those filters — the previous list is kept.")
+
+    if c2.button(f"Show all {len(S.onb_matches)} anyway", use_container_width=True):
+        S.onb_step = S.onb_next_after_pick
+        st.rerun()
+
+
 # ── step: pick a company matched from the typed text ──────────────
 
 def step_pick_text():
     st.subheader("Step 2 — which company is yours?")
-    st.caption(f"Matches for “{S.onb_text}” in the trade database:")
+    st.caption(f"Matches for “{S.onb_search_name or S.onb_text}” in the trade database:")
+
+    if len(S.onb_matches) > NARROW_THRESHOLD and st.button("🔎 Narrow this list"):
+        S.onb_step = "narrow"
+        st.rerun()
 
     for i, name in enumerate(S.onb_matches, 1):
         if st.button(f"{i}. {name}", key=f"pt_{i}", use_container_width=True):
@@ -354,7 +430,7 @@ def step_review_urls():
     name = S.onb_pending.get("company_name") or ""
     info = S.onb_pending.get("company_info") or ""
     st.caption(f"Attempt {S.onb_scrape_attempt} of {MAX_ATTEMPTS}")
-    
+
     st.markdown("**company_name**")
     if name:
         st.code(name)
@@ -381,9 +457,9 @@ def step_review_urls():
             update_report(S.report, scraped_info=S.onb_scraped_info)
 
         if S.onb_scraped_name:
-            S.onb_matches = onb_lookup(S.onb_scraped_name)
-            if S.onb_matches:
-                S.onb_step = "pick_url"
+            matches = onb_lookup(S.onb_scraped_name)
+            if matches:
+                enter_pick(matches, S.onb_scraped_name, "pick_url")
                 st.rerun()
 
         if S.onb_scraped_info:
@@ -415,6 +491,10 @@ def step_pick_url():
     st.subheader("Found in the database")
     st.caption(f"Matches for “{S.onb_scraped_name}”:")
 
+    if len(S.onb_matches) > NARROW_THRESHOLD and st.button("🔎 Narrow this list"):
+        S.onb_step = "narrow"
+        st.rerun()
+
     for i, name in enumerate(S.onb_matches, 1):
         if st.button(f"{i}. {name}", key=f"pu_{i}", use_container_width=True):
             update_report(S.report, company_name=name,
@@ -435,6 +515,7 @@ def step_pick_url():
 
 ONB_STEPS = {
     "input": step_input,
+    "narrow": step_narrow,
     "pick_text": step_pick_text,
     "ask_urls": step_ask_urls,
     "scrape_known": step_scrape_known,
@@ -499,6 +580,7 @@ def sync_scope(announce: bool = True):
         note = f"Scope: {label}" if not previous else f"Scope changed: {previous} → {label}"
         push_turn("system", note)
 
+
 def apply_engine_response(resp: dict):
     parsed = consume(resp)
     for t in parsed["texts"]:
@@ -528,12 +610,83 @@ def record_query(text: str):
             st.warning(f"Persona update failed: {exc}")
 
 
+def attach_meta():
+    """Put the routing and resolution on the newest assistant turn."""
+    if not S.turns or S.turns[-1]["role"] != "assistant":
+        return
+    tr = S.turns[-1].get("trace") or {}
+    tr["route"] = S.last_route
+    if S.last_resolution:
+        tr["resolution"] = S.last_resolution
+    S.turns[-1]["trace"] = tr
+
+
+def trade_succeeded() -> bool:
+    """True only when the engine actually returned rows."""
+    if not S.turns or S.turns[-1]["role"] != "assistant":
+        return False
+    trace = S.turns[-1].get("trace") or {}
+    stage = (trace.get("meta") or {}).get("stage")
+    if stage and stage != "success":
+        return False
+    if trace.get("error"):
+        return False
+    if "rows" in trace:
+        return bool(trace.get("rows"))
+    return True
+
+
+def maybe_web(query: str, memory: dict, route: str):
+    """Run sonar-pro when the route asked for it, or when the data came back
+    empty or errored. The heading tells the user which case it is."""
+    data_ok = trade_succeeded()
+    if route != "WEB" and data_ok:
+        return
+
+    if data_ok:
+        heading = "Additional context from the web"
+    else:
+        heading = ("Your trade records had nothing to answer this, "
+                   "so here is what the web says")
+
+    with st.spinner("Looking this up on the web..."):
+        result = web_search(query, memory)
+
+    block = as_context(result, heading)
+    if not block:
+        if not data_ok:
+            push_turn("assistant",
+                      "Nothing came back from your trade records or the web "
+                      "for that. Try rephrasing it.",
+                      {"route": route, "web": result})
+        return
+
+    push_turn("assistant", block,
+              {"route": "WEB", "web": result, "data_ok": data_ok,
+               "resolution": S.last_resolution})
+
+
+def chat_history() -> list:
+    """S.turns -> the USER/EXIRA history the analyzer expects."""
+    out = []
+    for t in S.turns:
+        if t["role"] == "user":
+            out.append({"role": "USER", "content": t["content"]})
+        elif t["role"] == "assistant":
+            out.append({"role": "EXIRA", "content": t["content"]})
+    return out[-12:]
+
+
 def handle_message(text: str, from_list: bool = False):
     text = (text or "").strip()
     if not text:
         return
 
-    push_turn("user", text)
+    # the user turn is already on screen; drop it from the history we analyse
+    history = chat_history()
+    while history and history[-1]["role"] == "USER":
+        history.pop()
+
     ENGINE.inject_memory(S.sid, build_memory())
 
     if S.selecting:
@@ -544,24 +697,37 @@ def handle_message(text: str, from_list: bool = False):
         return
 
     memory = build_memory()
-    try:
-        route = "TRADE" if from_list else classify_query(text, memory)
-    except Exception:
+
+    # ---- resolve the message against what is still pending ----
+    if from_list:
+        sent = text                       # a suggested question stands alone
+        S.last_resolution = None
         route = "TRADE"
+    else:
+        S.last_resolution = resolve_query(text, history, memory)
+        sent = S.last_resolution["resolved_query"] or text
+        try:
+            route = classify_query(sent, memory)
+        except Exception:
+            route = "TRADE"
+    S.last_route = route
 
     try:
         if route == "PERSONAL":
-            push_turn("assistant", answer_from_memory(text, memory),
-                      {"route": "PERSONAL"})
+            push_turn("assistant", answer_from_memory(sent, memory),
+                      {"route": "PERSONAL", "resolution": S.last_resolution})
         else:
+            # TRADE and WEB both run the engine first
             parsed = apply_engine_response(
-                ENGINE.send(S.sid, text, source="followup" if from_list else None)
+                ENGINE.send(S.sid, sent, source="followup" if from_list else None)
             )
+            attach_meta()
             if S.selecting:
                 return
             if parsed["confirm"]:
-                run_confirm("proceed")
+                run_confirm("proceed", sent, memory, route)
                 return
+            maybe_web(sent, memory, route)
     except Exception as exc:
         push_turn("assistant", f"Error: {exc}")
         return
@@ -569,7 +735,8 @@ def handle_message(text: str, from_list: bool = False):
     record_query(text)
 
 
-def run_confirm(decision: str):
+def run_confirm(decision: str, sent: str = "", memory: dict = None,
+                route: str = "TRADE"):
     S.pending_confirm = None
     try:
         apply_engine_response(ENGINE.confirm(S.sid, decision))
@@ -577,6 +744,9 @@ def run_confirm(decision: str):
         push_turn("assistant", f"Error: {exc}")
         return
     if decision == "proceed":
+        attach_meta()
+        if sent:
+            maybe_web(sent, memory or build_memory(), route)
         last_user = next((t["content"] for t in reversed(S.turns)
                           if t["role"] == "user"), "")
         if last_user:
@@ -599,7 +769,6 @@ def switch_scope(choice: str):
     if re.fullmatch(r"\d{2,10}", code):
         S.hs_code = code
         S.scope_label = f"HS {code}"
-        push_turn("assistant", f"Scope switched to HS {code}.")
         remember_hs(code)
         ENGINE.set_hs(S.sid, code)
         S.selecting = False
@@ -608,7 +777,7 @@ def switch_scope(choice: str):
             f"Which countries are showing increasing demand for HS {code} in the last 24 months?",
             f"Which month does demand for HS {code} usually peak over the last 36 months?",
         ]
-        push_turn("assistant", f"Scope switched to HS {code}.")
+        push_turn("system", f"Scope changed to HS {code}")
     else:
         S.hs_code = None
         S.scope_label = choice
@@ -630,7 +799,7 @@ def start_engine_session(opening: str):
 
 
 # ───────────────────────── pages ─────────────────────────
-     
+
 def page_login():
     st.title("🌐 Trade Intelligence")
     st.caption("Enter your user id to begin.")
@@ -666,7 +835,6 @@ def page_login():
 
 
 def begin_with(choice: str):
-    
     code = re.sub(r"[.\-\s]", "", choice)
     if re.fullmatch(r"\d{2,10}", code):
         S.hs_code = code
@@ -680,7 +848,6 @@ def begin_with(choice: str):
     S.stage = "chat"
     start_engine_session(opening)
     S.scope_history = [S.scope_label] if S.scope_label else []
-    
 
 
 def page_scope():
@@ -758,8 +925,6 @@ def sidebar():
             st.rerun()
 
 
-
-
 def render_visual(trace: dict):
     """Draw the chart Prompt C asked for, using the returned rows."""
     if not trace:
@@ -827,8 +992,46 @@ def render_visual(trace: dict):
         st.dataframe(df, use_container_width=True)
 
 
+def render_resolution(trace: dict):
+    """How the analyzer rewrote the message, and where it was routed."""
+    res = (trace or {}).get("resolution")
+    route = (trace or {}).get("route") or ""
+    if not res and not route:
+        return
+    label = "query resolution"
+    if res:
+        label += f" — {res['relation']} ({res['confidence']})"
+    if route:
+        label += f" → {route}"
+    with st.expander(label):
+        if res:
+            st.markdown("**Sent to Exira**")
+            st.write(res["resolved_query"])
+            carried = res.get("carried_context") or {}
+            if carried.get("original_ask"):
+                st.markdown("**Carried forward**")
+                st.write(carried["original_ask"])
+            if carried.get("entities"):
+                st.caption("entities: " + ", ".join(carried["entities"]))
+            if carried.get("filters"):
+                st.caption("filters: " + ", ".join(carried["filters"]))
+            if res.get("unresolved_slots"):
+                st.warning("Still open: " + ", ".join(res["unresolved_slots"]))
+            if res.get("notes"):
+                st.caption(res["notes"])
+        web = (trace or {}).get("web") or {}
+        if web.get("citations"):
+            st.markdown("**Web sources**")
+            for url in web["citations"]:
+                st.write(url)
+        if web.get("error"):
+            st.caption(f"web lookup: {web['error']}")
+
+
 def render_trace(trace: dict):
     if not trace:
+        return
+    if trace.get("route") == "WEB" and "sql" not in trace:
         return
     if trace.get("route") == "PERSONAL":
         with st.expander("details — answered from your memory"):
@@ -874,17 +1077,16 @@ def page_chat():
             st.write(turn["content"])
             if turn["role"] == "assistant":
                 render_visual(turn.get("trace"))
+                render_resolution(turn.get("trace"))
                 render_trace(turn.get("trace"))
-
-    
 
     if S.options:
         st.caption("Select an HS domain:" if S.selecting else "Suggested questions:")
         st.markdown("<div class='suggest-zone'>", unsafe_allow_html=True)
         for i, opt in enumerate(S.options):
             if st.button(opt, key=f"opt_{len(S.turns)}_{i}", use_container_width=True):
-                with st.spinner("Working..."):
-                    handle_message(opt, from_list=not S.selecting)
+                push_turn("user", opt)
+                S.pending_input = (opt, not S.selecting)
                 st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -892,8 +1094,16 @@ def page_chat():
         else "Ask a trade question..."
     typed = st.chat_input(placeholder)
     if typed:
+        push_turn("user", typed)
+        S.pending_input = (typed, False)
+        st.rerun()
+
+    # ---- the question is on screen now; do the work ----
+    if S.pending_input:
+        text, from_list = S.pending_input
+        S.pending_input = None
         with st.spinner("Working..."):
-            handle_message(typed)
+            handle_message(text, from_list=from_list)
         st.rerun()
 
 

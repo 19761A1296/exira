@@ -6,9 +6,12 @@ from hs_memory import collect_hs_from_memory
 from persona.tweaked_exira import build_and_save_persona, load_persona, persona_to_text
 from summarizer.session_summarizer import query_summary
 from summarizer.classifier import classify_query
+from summarizer.analyzer import resolve_query
+from summarizer.web_search import web_search, as_context
 from summarizer.memory_answer import answer_from_memory
 
 MAX_SESSION_QUERIES = 5
+HISTORY_LIMIT = 12
 EXIT_WORDS = {"exit", "quit"}
 YES = {"y", "yes", "ok", "proceed", "run"}
 
@@ -25,6 +28,30 @@ def build_memory(user_product_info, old_session, append_queries, persona) -> dic
 
 
 # ───────────────────────── console io ─────────────────────────
+
+def collect_text(resp: dict) -> str:
+    """Everything Exira said in one response, as plain text for the history."""
+    return "\n".join(
+        m["content"] for m in resp.get("messages", [])
+        if m.get("type") in ("answer", "clarification") and m.get("content")
+    ).strip()
+
+
+def trade_succeeded(resp: dict) -> bool:
+    """True only when the engine actually returned rows."""
+    for m in resp.get("messages", []):
+        if m.get("type") != "answer":
+            continue
+        data = m.get("data") or {}
+        stage = (data.get("meta") or {}).get("stage")
+        if stage and stage != "success":
+            return False
+        if data.get("error"):
+            return False
+        if "rows" in data:
+            return bool(data.get("rows"))
+    return True
+
 
 def render(resp: dict) -> list[str]:
     """Print engine messages, return the selectable options it offered."""
@@ -150,6 +177,7 @@ def begin_session(old_session_memory: str = "", user_product_info: str = "",
 
     append_queries: list[str] = []
     persona_turns: list[dict] = []
+    history: list[dict] = []          # [{"role": "USER"|"EXIRA", "content": ...}]
     persona = load_persona(user_id) if user_id else None
 
     memory = build_memory(user_product_info, old_session_memory, append_queries, persona)
@@ -193,25 +221,68 @@ def begin_session(old_session_memory: str = "", user_product_info: str = "",
                 selecting = ENGINE.scope_pending(sid)
                 continue
 
-            if not from_list and classify_query(text, memory) == "PERSONAL":
-                print(f"\n{answer_from_memory(text, memory)}\n")
+            # ---- resolve the message against what is still pending ----
+            if from_list:
+                sent = text                   # a suggested question stands alone
+                route = "TRADE"
             else:
-                resp = ENGINE.send(sid, text, source="followup" if from_list else None)
+                sent = resolve_query(text, history, memory)["resolved_query"] or text
+                route = classify_query(sent, memory)
+
+            history.append({"role": "USER", "content": text})
+
+            if route == "PERSONAL":
+                answer = answer_from_memory(sent, memory)
+                print(f"\n{answer}\n")
+                history.append({"role": "EXIRA", "content": answer})
+
+            else:
+                # TRADE and WEB both run the engine first
+                resp = ENGINE.send(sid, sent,
+                                   source="followup" if from_list else None)
                 options = render(resp)
                 selecting = ENGINE.scope_pending(sid)
+                said = collect_text(resp)
+                last_resp = resp
 
                 if selecting:
                     # the question introduced a new product needing an HS pick
+                    if said:
+                        history.append({"role": "EXIRA", "content": said})
                     continue
 
                 if resp.get("state") == "AWAITING_CONFIRMATION":
                     if input("Proceed? (y/n): ").strip().lower() in YES:
-                        options = render(ENGINE.confirm(sid, "proceed"))
+                        done = ENGINE.confirm(sid, "proceed")
                     else:
-                        render(ENGINE.confirm(sid, "cancel"))
+                        done = ENGINE.confirm(sid, "cancel")
+                    options = render(done) or options
+                    said = collect_text(done) or said
+                    last_resp = done
+
+                # ---- web: on a WEB route, or whenever the data came back
+                #      empty or errored ----
+                data_ok = trade_succeeded(last_resp)
+                if route == "WEB" or not data_ok:
+                    heading = ("Additional context from the web" if data_ok else
+                               "Your trade records had nothing to answer this, "
+                               "so here is what the web says")
+                    print("\nLooking this up on the web...")
+                    block = as_context(web_search(sent, memory), heading)
+                    if block:
+                        print(f"\n{block}\n")
+                        said = f"{said}\n\n{block}".strip() if said else block
+                    elif not data_ok:
+                        print("\nNothing came back from your trade records or "
+                              "the web for that. Try rephrasing it.\n")
+
+                if said:
+                    history.append({"role": "EXIRA", "content": said})
         except Exception as exc:
             print(f"  error: {exc}\n")
             continue
+
+        history = history[-HISTORY_LIMIT:]
 
         # ---- memory upkeep, only after a completed question ----
         append_queries.append(text)
