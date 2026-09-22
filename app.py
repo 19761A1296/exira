@@ -705,6 +705,10 @@ def handle_message(text: str, from_list: bool = False):
         route = "TRADE"
     else:
         S.last_resolution = resolve_query(text, history, memory)
+        if S.last_resolution["blocked"]:
+            push_turn("assistant", S.last_resolution["message"],
+                      {"route": "BLOCKED", "resolution": S.last_resolution})
+            return 
         sent = S.last_resolution["resolved_query"] or text
         try:
             route = classify_query(sent, memory)

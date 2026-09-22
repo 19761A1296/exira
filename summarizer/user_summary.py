@@ -85,6 +85,11 @@ def _call_llm(prompt, user_content, temperature=0.2, timeout=120):
         },
         timeout=timeout,
     )
+    print("STATUS:", resp.status_code)
+    if not resp.ok:
+        print("OPENROUTER ERROR:")
+        print(resp.text)
+        
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"]
 
@@ -98,7 +103,8 @@ def build_user_summary(company_name, data=None):
 
     body = _as_text(data)
     user_content = f"company_name: {company_name}\n\n{body if body else 'data: (none)'}"
-
+    print("DEBUG: ",body,type(body),len(body),len(body[0]),len(body[1]))
+    print("DEBUG: ",company_name)
     try:
         raw = _call_llm(PROMPT_USER_SUMMARY, user_content)
         card = json.loads(_strip_fences(raw))

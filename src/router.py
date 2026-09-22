@@ -226,6 +226,10 @@ def begin_session(old_session_memory: str = "", user_product_info: str = "",
                 sent = text                   # a suggested question stands alone
                 route = "TRADE"
             else:
+                resolution = resolve_query(text, history, memory)
+                if resolution["blocked"]:
+                    print(f"\n{resolution['message']}\n")
+                    continue  
                 sent = resolve_query(text, history, memory)["resolved_query"] or text
                 route = classify_query(sent, memory)
 
