@@ -7,3 +7,6 @@ __pycache__/
 *.db
 *.json
 *.db
+
+# Untracking files 
+database/sandbox_fetch_data.py
