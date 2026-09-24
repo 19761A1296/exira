@@ -31,7 +31,7 @@ load_dotenv()
 
 URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = os.getenv("OPENROUTER_MODEL_ANALYZER")
-MAX_TOKENS = int(os.getenv("ANALYZER_MAX_TOKENS", "1200"))
+MAX_TOKENS = int(os.getenv("ANALYZER_MAX_TOKENS", "3000"))
 HISTORY_TURNS = int(os.getenv("ANALYZER_HISTORY_TURNS", "8"))
 TURN_CHARS = int(os.getenv("ANALYZER_TURN_CHARS", "1200"))
 PRINT_ANALYZER = (os.getenv("PRINT_ANALYZER", "1") or "").strip() not in {"0", "false", "False", ""}
@@ -42,6 +42,10 @@ DEFAULT_BLOCK_MESSAGE = (
     "That one is outside what I cover. I work on trade: buyers and suppliers, "
     "products and HS codes, demand, prices, ports, routes and markets. Ask me "
     "something along those lines and I'll dig in."
+)
+
+DEFAULT_DROPPED_NOTE = (
+    "I've skipped the parts of that which aren't about trade, and answered the rest."
 )
 
 
@@ -86,6 +90,7 @@ Return strict JSON only. No markdown fences, no prose before or after.
   }},
   "resolved_query": "One self-contained instruction for Exira, or empty when OFF_TOPIC.",
   "message": "Only for OFF_TOPIC: one or two lines to show the user. Empty otherwise.",
+  "dropped_note": "Only when you dropped part of a multi-part message: one short line naming what you skipped. Empty otherwise.",
   "unresolved_slots": ["Anything still genuinely missing, or empty array"],
   "notes": "One short line of reasoning. Internal only."
 }}
@@ -125,6 +130,33 @@ WHEN YOU SET OFF_TOPIC
   the user directly as "you". Be brief and friendly, never preachy, never
   apologetic at length. Do not answer the off-topic question, not even partly.
 - carried_context stays empty, unresolved_slots stays empty
+
+MULTI-PART MESSAGES
+
+A single message can hold several asks: "who are my top buyers, then book me a
+flight, and what tariff would those buyers pay". Judge each part separately.
+
+- Every part in scope   -> normal relation, resolved_query holds them all, in
+                           the user's own order.
+- Every part off-topic  -> OFF_TOPIC, the usual full block.
+- Some parts off-topic  -> NOT OFF_TOPIC. Use the normal relation. Put only the
+                           surviving parts into resolved_query, and write one
+                           short line into dropped_note saying what you skipped.
+
+A part is dropped when either is true:
+  - the part is itself off-topic, or
+  - the part depends on a dropped part, so it cannot be answered without it.
+
+A part that merely comes after a dropped part is NOT dropped. Only a real
+dependency removes it. "What are my top buyers, book me a flight, and what do
+those buyers usually pay" keeps parts one and three: part three depends on part
+one, not on the flight.
+
+When you drop parts:
+- keep resolved_query as flowing prose covering the survivors, not a list
+- do not mention the dropped parts inside resolved_query
+- dropped_note is addressed to the user, one line, no apology
+- blocked stays false, because there is still work to do
 
 BORDERLINE CASES
 - Context can bring a vague message into scope. "What about Vietnam" in a
@@ -207,6 +239,52 @@ CORE PRINCIPLES
 12. Do not stall the user with a fresh clarifying question when a sensible
     default exists. State the default inside resolved_query and record the gap in
     unresolved_slots.
+
+    
+0. DIRECT SELF-CONTAINED QUERY PRESERVATION — CRITICAL
+ 
+If the current message is already a complete, self-contained trade question
+and it does not answer an open clarification, refine the immediately previous
+answer, or rely on anaphora such as "it", "those", "same", "that one", etc.,
+classify it as NEW_INTENT.
+ 
+For NEW_INTENT, preserve the user's current message exactly except for trivial
+whitespace cleanup.
+ 
+DO NOT add:
+- metrics the user did not request
+- shipment value
+- quantity / volume
+- value and volume
+- time granularity such as monthly / quarterly
+- ranking method
+- top-N limits
+- HS codes
+- products
+- countries
+- statistical methodology
+- trend methodology
+- filters
+- aggregation logic
+- comparison dimensions
+ 
+Those decisions belong to the downstream Trade Agent / Text-to-SQL layer.
+Example:
+ 
+Current message:
+"show me the trend of cotton exports from india in 2025"
+ 
+GOOD:
+relation = NEW_INTENT
+resolved_query = "show me the trend of cotton exports from india in 2025"
+ 
+BAD:
+resolved_query = "Show monthly cotton exports from India in 2025 by volume
+and value."
+ 
+Why BAD:
+The Analyzer invented metric and time-granularity requirements that belong to
+the downstream analytical layer.
 
 EXAMPLES
 
@@ -454,6 +532,46 @@ GOOD
   "unresolved_slots": [],
   "notes": "A geographic fragment inside a live sourcing thread. In scope."}}
 
+Example 12 — one part off-topic, the rest survives (dependency does not cascade)
+
+Current message: "who are my top buyers for HS 610910, also book me a flight to
+Milan, and what price do those buyers usually pay"
+
+GOOD
+{{"relation": "NEW_INTENT",
+  "confidence": "high",
+  "carried_context": {{"original_ask": null, "entities": ["HS 610910"], "filters": [], "resolved_by_this_turn": null}},
+  "resolved_query": "Who are the user's top buyers for HS 610910 in the last 24 months, and what average price do those buyers usually pay?",
+  "message": "",
+  "dropped_note": "I've skipped the flight booking — that's outside what I cover.",
+  "unresolved_slots": [],
+  "notes": "Part two is off-topic. Part three depends on part one, not part two, so it survives."}}
+
+BAD
+{{"relation": "OFF_TOPIC", "resolved_query": ""}}
+Why wrong: two good trade questions were thrown away because one part was
+off-topic.
+
+ALSO BAD
+{{"resolved_query": "Who are the user's top buyers for HS 610910?"}}
+Why wrong: part three was dropped as well. It depends on part one, which
+survived, so it should have been kept.
+
+Example 13 — a dropped part takes its dependant with it
+
+Current message: "what's the weather in Mumbai this week, and should I delay my
+shipments because of it"
+
+GOOD
+{{"relation": "OFF_TOPIC",
+  "confidence": "medium",
+  "carried_context": {{"original_ask": null, "entities": [], "filters": [], "resolved_by_this_turn": null}},
+  "resolved_query": "",
+  "message": "I can't check the weather. I can look at your shipping routes, port activity and lead times if that helps.",
+  "dropped_note": "",
+  "unresolved_slots": [],
+  "notes": "Part two depends entirely on part one, which is off-topic, so nothing survives."}}
+
 FAILURE MODES TO AVOID
 
 Amnesia            — treating a fragment as a fresh question and answering only it.
@@ -544,6 +662,7 @@ def passthrough(message: str, reason: str = "") -> dict:
         },
         "resolved_query": (message or "").strip(),
         "message": "",
+        "dropped_note": "",
         "blocked": False,
         "unresolved_slots": [],
         "notes": reason or "passthrough",
@@ -560,15 +679,25 @@ def _normalize(parsed: dict, message: str) -> dict:
     resolved = str(parsed.get("resolved_query") or "").strip()
     block_msg = str(parsed.get("message") or "").strip()
 
+    dropped_note = str(parsed.get("dropped_note") or "").strip()
+
     if blocked:
         resolved = ""
+ 
         if not block_msg:
             block_msg = DEFAULT_BLOCK_MESSAGE
+ 
     else:
         block_msg = ""
-        if not resolved:
-            resolved = (message or "").strip()
-
+ 
+        # HARD GUARDRAIL:
+        # NEW_INTENT must preserve the user's direct query.
+        # Analyzer should not invent metrics, time granularity,
+        # HS codes, products, countries, or analytical logic.
+        if relation == "NEW_INTENT":
+            resolved = " ".join(
+                (message or "").strip().split()
+            )
     carried = parsed.get("carried_context")
     if not isinstance(carried, dict) or blocked:
         carried = {}
@@ -595,6 +724,7 @@ def _normalize(parsed: dict, message: str) -> dict:
         },
         "resolved_query": resolved,
         "message": block_msg,
+        "dropped_note": dropped_note,
         "blocked": blocked,
         "unresolved_slots": [] if blocked else as_list(parsed.get("unresolved_slots")),
         "notes": str(parsed.get("notes") or "").strip(),
@@ -604,11 +734,13 @@ def _normalize(parsed: dict, message: str) -> dict:
 def _log(message: str, result: dict) -> dict:
     if PRINT_ANALYZER:
         print(f"\n--- ANALYZER {result['relation']} "
-              f"({result['confidence']}) | {message[:70]}")
+              f"({result['confidence']}) | {message[:]}")
         if result["blocked"]:
-            print(f"    BLOCKED: {result['message'][:200]}")
+            print(f"    BLOCKED: {result['message'][:]}")
         else:
-            print(f"    resolved: {result['resolved_query'][:300]}")
+            print(f"    resolved: {result['resolved_query'][:]}")
+            if result["dropped_note"]:
+                print(f"    dropped : {result['dropped_note']}")
         if result["notes"]:
             print(f"    notes   : {result['notes']}")
         if result["unresolved_slots"]:

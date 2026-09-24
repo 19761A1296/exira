@@ -32,7 +32,7 @@ load_dotenv()
 
 URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = os.getenv("OPENROUTER_MODEL_WEB", "perplexity/sonar-pro")
-MAX_TOKENS = int(os.getenv("WEB_MAX_TOKENS", "1200"))
+MAX_TOKENS = int(os.getenv("WEB_MAX_TOKENS", "2000"))
 TIMEOUT = int(os.getenv("WEB_TIMEOUT", "120"))
 MAX_CITATIONS = int(os.getenv("WEB_MAX_CITATIONS", "6"))
 PRINT_WEB = (os.getenv("PRINT_WEB", "1") or "").strip() not in {"0", "false", "False", ""}

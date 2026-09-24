@@ -5,8 +5,10 @@ from engine_adapter import ENGINE, HS2_DOMAIN_MAP
 from hs_memory import collect_hs_from_memory
 from persona.tweaked_exira import build_and_save_persona, load_persona, persona_to_text
 from summarizer.session_summarizer import query_summary
-from summarizer.classifier import classify_query
+from summarizer.classifier import classify_query, tag_flow
 from summarizer.analyzer import resolve_query
+from summarizer.question_flow_builder import build_flow
+from summarizer.connector import FlowRun
 from summarizer.web_search import web_search, as_context
 from summarizer.memory_answer import answer_from_memory
 
@@ -25,6 +27,28 @@ def build_memory(user_product_info, old_session, append_queries, persona) -> dic
         "current_session_queries": append_queries[-MAX_SESSION_QUERIES:],
         "persona": persona_to_text(persona) if persona else "",
     }
+
+
+MULTI_MARKERS = (" and also", " also ", " then ", " as well as",
+                 " additionally", " besides that", " after that")
+
+
+def looks_multi(text: str) -> bool:
+    """Cheap guard: does this resolved query hold more than one ask?"""
+    low = f" {(text or '').lower()} "
+    if any(m in low for m in MULTI_MARKERS):
+        return True
+    if low.count("?") > 1:
+        return True
+    return len([s for s in low.split(".") if s.strip()]) > 2
+
+
+RESOLVED_CHARS = 600
+
+
+def memory_entry(text: str, sent: str) -> str:
+    """What goes into current_session_queries: the user's own words only."""
+    return (text or "").strip()
 
 
 # ───────────────────────── console io ─────────────────────────
@@ -199,9 +223,76 @@ def begin_session(old_session_memory: str = "", user_product_info: str = "",
     options = render(ENGINE.send(sid, scope_label if hs_code else choice))
     selecting = ENGINE.scope_pending(sid)
 
+    # the handlers below write back here, so the loop keeps its state
+    state = {"options": options, "selecting": selecting, "memory": memory}
+
+    # ─────────────── handlers the connector calls ───────────────
+
+    def personal_handler(question: str) -> str:
+        return answer_from_memory(question, state["memory"])
+
+    def web_handler(question: str) -> str:
+        print("\nLooking this up on the web...")
+        return as_context(web_search(question, state["memory"]),
+                          "From the web")
+
+    def trade_handler(question: str) -> dict:
+        """Drive the engine for one sub-question.
+
+        Returns {"text", "ok", "pending"}. pending means the engine wants an
+        HS domain pick before it can go any further.
+        """
+        resp = ENGINE.send(sid, question)
+        state["options"] = render(resp) or state["options"]
+        state["selecting"] = ENGINE.scope_pending(sid)
+
+        if state["selecting"]:
+            return {"text": collect_text(resp), "ok": False, "pending": True}
+
+        said = collect_text(resp)
+        last = resp
+
+        if resp.get("state") == "AWAITING_CONFIRMATION":
+            if input("Proceed? (y/n): ").strip().lower() in YES:
+                done = ENGINE.confirm(sid, "proceed")
+            else:
+                done = ENGINE.confirm(sid, "cancel")
+            state["options"] = render(done) or state["options"]
+            said = collect_text(done) or said
+            last = done
+
+        return {"text": said, "ok": trade_succeeded(last), "pending": False}
+
+    handlers = {"personal": personal_handler,
+                "trade": trade_handler,
+                "web": web_handler}
+
+    def run_flow(question: str) -> str:
+        """Build, tag and walk the flow, pausing for HS picks. Returns the answer."""
+        flow = tag_flow(build_flow(question, state["memory"]), state["memory"])
+        run = FlowRun(flow, state["memory"], handlers, original_question=question)
+        out = run.start()
+
+        while out["status"] == "needs_hs_pick":
+            pick, _ = read_input(state["options"], True)
+            if not pick or pick.lower() in EXIT_WORDS:
+                return "Stopped there — no HS scope was chosen."
+
+            resp = ENGINE.send(sid, pick)
+            state["options"] = render(resp) or state["options"]
+            state["selecting"] = ENGINE.scope_pending(sid)
+
+            if state["selecting"]:
+                continue                      # still asking, loop round again
+            out = run.resume()
+
+        return out["answer"]
+
+    # ─────────────── the loop ───────────────
+
     while True:
         try:
-            text, from_list = read_input(options, selecting)
+            text, from_list = read_input(state["options"], state["selecting"])
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -209,49 +300,33 @@ def begin_session(old_session_memory: str = "", user_product_info: str = "",
         if not text or text.lower() in EXIT_WORDS:
             break
 
-        memory = build_memory(user_product_info, old_session_memory, append_queries, persona)
-        ENGINE.inject_memory(sid, memory)
+        state["memory"] = build_memory(user_product_info, old_session_memory,
+                                       append_queries, persona)
+        ENGINE.inject_memory(sid, state["memory"])
 
-        was_selecting = selecting
+        if state["selecting"]:
+            # this turn is an HS domain pick, not a question
+            try:
+                resp = ENGINE.send(sid, text)
+                state["options"] = render(resp) or state["options"]
+                state["selecting"] = ENGINE.scope_pending(sid)
+            except Exception as exc:
+                print(f"  error: {exc}\n")
+            continue
 
         try:
-            if was_selecting:
-                # this turn is an HS domain pick, not a question
-                options = render(ENGINE.send(sid, text))
-                selecting = ENGINE.scope_pending(sid)
-                continue
-
-            # ---- resolve the message against what is still pending ----
             if from_list:
-                sent = text                   # a suggested question stands alone
-                route = "TRADE"
-            else:
-                resolution = resolve_query(text, history, memory)
-                if resolution["blocked"]:
-                    print(f"\n{resolution['message']}\n")
-                    continue  
-                sent = resolve_query(text, history, memory)["resolved_query"] or text
-                route = classify_query(sent, memory)
-
-            history.append({"role": "USER", "content": text})
-
-            if route == "PERSONAL":
-                answer = answer_from_memory(sent, memory)
-                print(f"\n{answer}\n")
-                history.append({"role": "EXIRA", "content": answer})
-
-            else:
-                # TRADE and WEB both run the engine first
-                resp = ENGINE.send(sid, sent,
-                                   source="followup" if from_list else None)
-                options = render(resp)
-                selecting = ENGINE.scope_pending(sid)
+                # a suggested question is already standalone: today's path
+                sent = text
+                resp = ENGINE.send(sid, sent, source="followup")
+                state["options"] = render(resp) or state["options"]
+                state["selecting"] = ENGINE.scope_pending(sid)
                 said = collect_text(resp)
-                last_resp = resp
+                last = resp
 
-                if selecting:
-                    # the question introduced a new product needing an HS pick
+                if state["selecting"]:
                     if said:
+                        history.append({"role": "USER", "content": text})
                         history.append({"role": "EXIRA", "content": said})
                     continue
 
@@ -260,28 +335,57 @@ def begin_session(old_session_memory: str = "", user_product_info: str = "",
                         done = ENGINE.confirm(sid, "proceed")
                     else:
                         done = ENGINE.confirm(sid, "cancel")
-                    options = render(done) or options
+                    state["options"] = render(done) or state["options"]
                     said = collect_text(done) or said
-                    last_resp = done
+                    last = done
 
-                # ---- web: on a WEB route, or whenever the data came back
-                #      empty or errored ----
-                data_ok = trade_succeeded(last_resp)
-                if route == "WEB" or not data_ok:
-                    heading = ("Additional context from the web" if data_ok else
-                               "Your trade records had nothing to answer this, "
-                               "so here is what the web says")
-                    print("\nLooking this up on the web...")
-                    block = as_context(web_search(sent, memory), heading)
+                if not trade_succeeded(last):
+                    block = as_context(web_search(sent, state["memory"]),
+                                       "Your trade records had nothing to answer "
+                                       "this, so here is what the web says")
                     if block:
                         print(f"\n{block}\n")
                         said = f"{said}\n\n{block}".strip() if said else block
-                    elif not data_ok:
-                        print("\nNothing came back from your trade records or "
-                              "the web for that. Try rephrasing it.\n")
 
-                if said:
-                    history.append({"role": "EXIRA", "content": said})
+                answer = said
+
+            else:
+                # ---- resolve, then split, tag and walk ----
+                resolution = resolve_query(text, history, state["memory"])
+
+                if resolution["blocked"]:
+                    print(f"\n{resolution['message']}\n")
+                    continue
+
+                if resolution["dropped_note"]:
+                    print(f"\n{resolution['dropped_note']}")
+
+                sent = resolution["resolved_query"] or text
+
+                route = classify_query(sent, state["memory"])
+                if route == "PERSONAL" and not looks_multi(sent):
+                    answer = answer_from_memory(sent, state["memory"])
+                    print(f"\n{answer}\n")
+                else:
+                    answer = run_flow(sent)
+
+                    if state["selecting"]:
+                        history.append({"role": "USER", "content": text})
+                        continue
+
+                    print(f"\n{answer}\n")
+
+                if state["selecting"]:
+                    # the flow ended waiting on a pick
+                    history.append({"role": "USER", "content": text})
+                    continue
+
+                print(f"\n{answer}\n")
+
+            history.append({"role": "USER", "content": text})
+            if answer:
+                history.append({"role": "EXIRA", "content": answer})
+
         except Exception as exc:
             print(f"  error: {exc}\n")
             continue
@@ -289,7 +393,7 @@ def begin_session(old_session_memory: str = "", user_product_info: str = "",
         history = history[-HISTORY_LIMIT:]
 
         # ---- memory upkeep, only after a completed question ----
-        append_queries.append(text)
+        append_queries.append(memory_entry(text, sent))
         if len(append_queries) > MAX_SESSION_QUERIES:
             append_queries = [query_summary(append_queries)[0]]
 
@@ -311,18 +415,45 @@ def begin_session(old_session_memory: str = "", user_product_info: str = "",
                 scope_label = f"HS {hs_code}"
                 remember_hs(candidates, hs_code)
                 ENGINE.set_hs(sid, hs_code)
-                options = starter_followups(hs_code)
-                selecting = False
+                state["options"] = starter_followups(hs_code)
+                state["selecting"] = False
                 print(f"\nSwitched to HS {hs_code}. Try:")
-                for i, q in enumerate(options, 1):
+                for i, q in enumerate(state["options"], 1):
                     print(f"  {i}. {q}")
             else:
                 hs_code = None
                 scope_label = new_choice
                 print(f"\nSwitching to {new_choice}...")
-                options = render(ENGINE.send(sid, new_choice))
-                selecting = ENGINE.scope_pending(sid)
+                resp = ENGINE.send(sid, new_choice)
+                state["options"] = render(resp) or state["options"]
+                state["selecting"] = ENGINE.scope_pending(sid)
 
     if not append_queries:
         return None
     return query_summary(append_queries)[0]
+
+
+# ───────────────────────── run directly ─────────────────────────
+#
+#   python router.py
+#
+# Prints the session summary instead of saving it, so you can run it freely.
+
+if __name__ == "__main__":
+    USER_PRODUCT_INFO = ""      # paste a company card here
+    OLD_SESSION_INFO = ""       # paste a previous session summary here
+    USER_ID = ""                # "" skips persona load and save
+
+    summary = begin_session(
+        old_session_memory=OLD_SESSION_INFO,
+        user_product_info=USER_PRODUCT_INFO,
+        user_id=USER_ID,
+    )
+
+    print("\n" + "=" * 60)
+    if summary:
+        print("SESSION SUMMARY (not saved):\n")
+        print(summary)
+    else:
+        print("No questions were asked, so there is no summary.")
+    print("=" * 60)

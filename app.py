@@ -25,7 +25,9 @@ from extraction.extracting_urls import get_company_information_links
 from reporting.report_generator import init_report, update_report, log_report
 from persona.tweaked_exira import build_and_save_persona, load_persona, persona_to_text
 from summarizer.session_summarizer import query_summary, session_summary
-from summarizer.classifier import classify_query
+from summarizer.classifier import classify_query, tag_flow
+from summarizer.question_flow_builder import build_flow
+from summarizer.connector import FlowRun
 from summarizer.analyzer import resolve_query
 from summarizer.web_search import web_search, as_context
 from summarizer.memory_answer import answer_from_memory
@@ -92,6 +94,13 @@ def init_state():
     d.setdefault("last_resolution", None)
     d.setdefault("last_route", "")
     d.setdefault("pending_input", None)     # (text, from_list) awaiting work
+
+    d.setdefault("flow_run", None)          # a FlowRun paused on an HS pick
+    d.setdefault("last_flow", None)
+    d.setdefault("flow_text", "")           # what the user typed
+    d.setdefault("flow_sent", "")           # the resolved query that ran
+    d.setdefault("last_trade_trace", None)
+    d.setdefault("last_web", None)
 
     # onboarding wizard
     d.setdefault("onb_step", "input")
@@ -677,6 +686,117 @@ def chat_history() -> list:
     return out[-12:]
 
 
+
+RESOLVED_CHARS = 600
+
+
+def memory_entry(text: str, sent: str) -> str:
+    """What goes into current_session_queries: the user's own words only."""
+    return (text or "").strip()
+
+
+def trace_ok(trace: dict) -> bool:
+    """True only when the engine actually returned rows."""
+    trace = trace or {}
+    stage = (trace.get("meta") or {}).get("stage")
+    if stage and stage != "success":
+        return False
+    if trace.get("error"):
+        return False
+    if "rows" in trace:
+        return bool(trace.get("rows"))
+    return True
+
+
+# ─────────────── handlers the connector calls ───────────────
+
+def ui_personal(question: str) -> str:
+    return answer_from_memory(question, build_memory())
+
+
+def ui_web(question: str) -> str:
+    with st.spinner("Looking this up on the web..."):
+        result = web_search(question, build_memory())
+    S.last_web = result
+    return as_context(result, "From the web")
+
+
+def ui_trade(question: str) -> dict:
+    """One sub-question through the engine. Auto-proceeds past the confirm gate.
+
+    Returns {"text", "ok", "pending"}. pending means the engine wants an HS
+    domain pick before it can go any further.
+    """
+    resp = ENGINE.send(S.sid, question)
+    parsed = consume(resp)
+
+    if parsed["options"]:
+        S.options = parsed["options"]
+    S.selecting = ENGINE.scope_pending(S.sid)
+    sync_scope()
+
+    if S.selecting:
+        # show the domain question so the user knows what is being asked
+        for t in parsed["texts"]:
+            push_turn("assistant", t)
+        return {"text": "", "ok": False, "pending": True}
+
+    trace = parsed["trace"]
+
+    if parsed["confirm"]:
+        done = ENGINE.confirm(S.sid, "proceed")
+        parsed = consume(done)
+        if parsed["options"]:
+            S.options = parsed["options"]
+        sync_scope()
+        trace = parsed["trace"] or trace
+
+    if trace:
+        S.last_trade_trace = trace
+
+    text = "\n".join(t for t in parsed["texts"] if t).strip()
+    return {"text": text, "ok": trace_ok(trace), "pending": False}
+
+
+FLOW_HANDLERS = {"personal": ui_personal, "trade": ui_trade, "web": ui_web}
+
+
+# ─────────────── the flow ───────────────
+
+def finish_flow(out: dict):
+    """Called with a FlowRun result. Pushes the answer, or waits for a pick."""
+    if out["status"] == "needs_hs_pick":
+        # ui_trade already showed the question and the options; S.selecting is on
+        return
+
+    S.flow_run = None
+    trace = dict(S.last_trade_trace or {})
+    trace["route"] = S.last_route
+    trace["resolution"] = S.last_resolution
+    trace["flow"] = S.last_flow
+    trace["parts"] = out.get("answers") or {}
+    trace["asked"] = out.get("asked") or {}
+    if S.last_web:
+        trace["web"] = S.last_web
+
+    push_turn("assistant", out["answer"], trace)
+    record_query(memory_entry(S.flow_text, S.flow_sent))
+
+
+def start_flow(text: str, sent: str, memory: dict):
+    """Build, tag and start a flow for one resolved query."""
+    flow = tag_flow(build_flow(sent, memory), memory)
+    S.last_flow = flow
+    S.last_route = (flow["questions"][0].get("route", "TRADE")
+                    if len(flow["questions"]) == 1 else "FLOW")
+    S.flow_text, S.flow_sent = text, sent
+    S.last_trade_trace = None
+    S.last_web = None
+
+    S.flow_run = FlowRun(flow, memory, FLOW_HANDLERS, original_question=sent)
+    finish_flow(S.flow_run.start())
+
+
 def handle_message(text: str, from_list: bool = False):
     text = (text or "").strip()
     if not text:
@@ -689,55 +809,63 @@ def handle_message(text: str, from_list: bool = False):
 
     ENGINE.inject_memory(S.sid, build_memory())
 
+    # ---- an HS domain pick, possibly in the middle of a flow ----
     if S.selecting:
         try:
             apply_engine_response(ENGINE.send(S.sid, text))
         except Exception as exc:
             push_turn("assistant", f"Error: {exc}")
+            return
+        if not S.selecting and S.flow_run is not None:
+            try:
+                finish_flow(S.flow_run.resume())
+            except Exception as exc:
+                S.flow_run = None
+                push_turn("assistant", f"Error: {exc}")
         return
 
     memory = build_memory()
 
-    # ---- resolve the message against what is still pending ----
+    # ---- a suggested question is already standalone: today's path ----
     if from_list:
-        sent = text                       # a suggested question stands alone
         S.last_resolution = None
-        route = "TRADE"
-    else:
-        S.last_resolution = resolve_query(text, history, memory)
-        if S.last_resolution["blocked"]:
-            push_turn("assistant", S.last_resolution["message"],
-                      {"route": "BLOCKED", "resolution": S.last_resolution})
-            return 
-        sent = S.last_resolution["resolved_query"] or text
+        S.last_route = "TRADE"
+        sent = text
         try:
-            route = classify_query(sent, memory)
-        except Exception:
-            route = "TRADE"
-    S.last_route = route
-
-    try:
-        if route == "PERSONAL":
-            push_turn("assistant", answer_from_memory(sent, memory),
-                      {"route": "PERSONAL", "resolution": S.last_resolution})
-        else:
-            # TRADE and WEB both run the engine first
             parsed = apply_engine_response(
-                ENGINE.send(S.sid, sent, source="followup" if from_list else None)
+                ENGINE.send(S.sid, sent, source="followup")
             )
             attach_meta()
             if S.selecting:
                 return
             if parsed["confirm"]:
-                run_confirm("proceed", sent, memory, route)
+                run_confirm("proceed", sent, memory, "TRADE")
                 return
-            maybe_web(sent, memory, route)
-    except Exception as exc:
-        push_turn("assistant", f"Error: {exc}")
+            maybe_web(sent, memory, "TRADE")
+        except Exception as exc:
+            push_turn("assistant", f"Error: {exc}")
+            return
+        record_query(memory_entry(text, sent))
         return
 
-    record_query(text)
+    # ---- resolve, then split, tag and walk ----
+    S.last_resolution = resolve_query(text, history, memory)
 
+    if S.last_resolution["blocked"]:
+        push_turn("assistant", S.last_resolution["message"],
+                  {"route": "BLOCKED", "resolution": S.last_resolution})
+        return
+
+    if S.last_resolution["dropped_note"]:
+        push_turn("system", S.last_resolution["dropped_note"])
+
+    sent = S.last_resolution["resolved_query"] or text
+
+    try:
+        start_flow(text, sent, memory)
+    except Exception as exc:
+        S.flow_run = None
+        push_turn("assistant", f"Error: {exc}")
 
 def run_confirm(decision: str, sent: str = "", memory: dict = None,
                 route: str = "TRADE"):
@@ -997,40 +1125,45 @@ def render_visual(trace: dict):
 
 
 def render_resolution(trace: dict):
-    """How the analyzer rewrote the message, and where it was routed."""
-    res = (trace or {}).get("resolution")
-    route = (trace or {}).get("route") or ""
-    if not res and not route:
+    """One collapsed expander under the answer: what was sent, and how it split."""
+    trace = trace or {}
+    res = trace.get("resolution")
+    flow = trace.get("flow") or {}
+    route = trace.get("route") or ""
+    if not res and not flow and not route:
         return
-    label = "query resolution"
-    if res:
-        label += f" — {res['relation']} ({res['confidence']})"
-    if route:
-        label += f" → {route}"
-    with st.expander(label):
-        if res:
-            st.markdown("**Sent to Exira**")
-            st.write(res["resolved_query"])
-            carried = res.get("carried_context") or {}
-            if carried.get("original_ask"):
-                st.markdown("**Carried forward**")
-                st.write(carried["original_ask"])
-            if carried.get("entities"):
-                st.caption("entities: " + ", ".join(carried["entities"]))
-            if carried.get("filters"):
-                st.caption("filters: " + ", ".join(carried["filters"]))
-            if res.get("unresolved_slots"):
-                st.warning("Still open: " + ", ".join(res["unresolved_slots"]))
-            if res.get("notes"):
-                st.caption(res["notes"])
-        web = (trace or {}).get("web") or {}
-        if web.get("citations"):
-            st.markdown("**Web sources**")
-            for url in web["citations"]:
-                st.write(url)
-        if web.get("error"):
-            st.caption(f"web lookup: {web['error']}")
 
+    bits = []
+    if res:
+        bits.append(f"{res['relation']} ({res['confidence']})")
+    shape = flow.get("flow") if flow else ""
+    bits.append(shape or route or "")
+    label = "details — " + " → ".join(b for b in bits if b)
+
+    with st.expander(label):
+        if res and res.get("resolved_query"):
+            st.markdown("**Resolved query**")
+            st.write(res["resolved_query"])
+
+        questions = flow.get("questions") or []
+        if questions:
+            st.markdown(f"**Flow** &nbsp; `{shape}`", unsafe_allow_html=True)
+            for q in questions:
+                deps = q.get("depends_on") or []
+                tail = f" &nbsp;·&nbsp; needs {', '.join(deps)}" if deps else ""
+                st.markdown(
+                    f"`{q['id']}` &nbsp;**{q.get('route', '?')}**{tail}<br>"
+                    f"<span style='color:#5a6b7d'>{q['text']}</span>",
+                    unsafe_allow_html=True,
+                )
+        elif route:
+            st.caption(f"Route: {route}")
+
+        if res and res.get("unresolved_slots"):
+            st.warning("Still open: " + ", ".join(res["unresolved_slots"]))
+
+        if res and res.get("dropped_note"):
+            st.caption(res["dropped_note"])
 
 def render_trace(trace: dict):
     if not trace:
