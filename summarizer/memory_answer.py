@@ -55,7 +55,7 @@ def answer_from_memory(question: str, memory: dict, timeout: int = 60) -> str:
             json={
                 "model": MODEL,
                 "temperature": 0.2,
-                "max_tokens": 600,
+                "max_tokens": 1500,
                 "messages": [{"role": "user", "content": prompt}],
             },
             timeout=timeout,

@@ -728,6 +728,7 @@ def ui_trade(question: str) -> dict:
     domain pick before it can go any further.
     """
     resp = ENGINE.send(S.sid, question)
+    print("RAW ENGINE RESP:", json.dumps(resp, default=str)[:])
     parsed = consume(resp)
 
     if parsed["options"]:
@@ -1124,6 +1125,63 @@ def render_visual(trace: dict):
         st.dataframe(df, use_container_width=True)
 
 
+ROUTE_COLOURS = {
+    "PERSONAL": "#2e7d32",
+    "TRADE": "#1565c0",
+    "WEB": "#ef6c00",
+}
+
+
+def _flow_ascii(flow: dict) -> str:
+    """Fallback when graphviz is unavailable: one line per level."""
+    lines = []
+    for level in flow.get("order") or []:
+        row = "  ".join(
+            f"[{qid} {next((q.get('route', '?') for q in flow['questions'] if q['id'] == qid), '?')}]"
+            for qid in level
+        )
+        lines.append(row)
+    return "\n   |\n   v\n".join(lines)
+
+
+def render_flow_diagram(flow: dict):
+    """Small boxes-and-arrows view of the flow. Silent when there is nothing."""
+    questions = (flow or {}).get("questions") or []
+    if len(questions) < 2:
+        return
+
+    dot = ["digraph {",
+           "rankdir=LR;",
+           "size=\"5,1.4!\";",          # inches, ! forces the scale
+           "ratio=compress;",
+           "nodesep=0.18;",             # gap between siblings
+           "ranksep=0.35;",             # gap between levels
+           "bgcolor=\"transparent\";",
+           "node [shape=box, style=\"rounded,filled\", fontname=\"Helvetica\","
+           " fontsize=9, fillcolor=\"#ffffff\", penwidth=1.2,"
+           " width=0.9, height=0.34, margin=\"0.06,0.03\"];",
+           "edge [color=\"#9aa7b4\", arrowsize=0.55, penwidth=0.9];"]
+
+    for q in questions:
+        colour = ROUTE_COLOURS.get(q.get("route", ""), "#607d8b")
+        dot.append(
+            f'{q["id"]} [label="{q["id"]}\\n{q.get("route", "?")}", '
+            f'color="{colour}", fontcolor="{colour}"];'
+        )
+
+    for q in questions:
+        for dep in q.get("depends_on") or []:
+            dot.append(f'{dep} -> {q["id"]};')
+
+    dot.append("}")
+
+    try:
+        st.graphviz_chart("\n".join(dot), use_container_width=False)
+    except Exception:
+        st.code(_flow_ascii(flow))
+
+
+
 def render_resolution(trace: dict):
     """One collapsed expander under the answer: what was sent, and how it split."""
     trace = trace or {}
@@ -1148,6 +1206,7 @@ def render_resolution(trace: dict):
         questions = flow.get("questions") or []
         if questions:
             st.markdown(f"**Flow** &nbsp; `{shape}`", unsafe_allow_html=True)
+            render_flow_diagram(flow)
             for q in questions:
                 deps = q.get("depends_on") or []
                 tail = f" &nbsp;·&nbsp; needs {', '.join(deps)}" if deps else ""

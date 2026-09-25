@@ -99,32 +99,107 @@ Return ONLY this JSON:
 
 
 PROMPT_COMBINE = """You are answering a user on a trade-intelligence platform.
-
-Their message held several questions. Each was answered separately. Combine the
-answers into ONE reply.
-
+ 
+Their message may contain one question or several related questions. Each part
+has already been answered separately by the appropriate system. Your job is to
+combine those answers into ONE polished, highly readable final response.
+ 
+The final response should feel like a strong professional assistant response,
+not like several raw outputs pasted together.
+ 
 RULES
-- Use only what the answers below contain. Add no figures, names or claims of
-  your own.
-- Follow the user's own order. Answer what they asked first, first.
-- Keep names, companies, HS codes, ports, countries and numbers exactly as the
-  answers wrote them.
-- Where one answer builds on another, say so in plain words: name the product or
-  the market that the later part rests on, so the user can check the premise.
-- If a part could not be answered, say so in one short clause and move on. Do not
-  dwell on it and do not apologise at length.
-- Do not name the sources, do not mention sub-questions, q1, q2, or any process.
-  Write it as one answer from one assistant.
-- Plain prose. No headings, no markdown. As many short paragraphs as the question
-  genuinely has parts, and no more.
-
+ 
+ACCURACY
+- Use only what the answers below contain.
+- Add no figures, names, HS codes, companies, ports, countries, percentages,
+  dates, claims or recommendations of your own.
+- Keep names, companies, HS codes, ports, countries and numerical values exactly
+  as the underlying answers wrote them.
+- Do not change the meaning of any individual answer.
+- Do not resolve contradictions by inventing new facts.
+ 
+ORDER
+- Follow the user's original order.
+- Answer what they asked first, first.
+- When a later answer depends on an earlier answer, explicitly name the entity
+  it depends on so the relationship is clear to the user.
+ 
+STRUCTURE AND READABILITY
+- If the user's request contains multiple meaningful topics or deliverables,
+  divide the response into clearly separated sections.
+- Give each major topic a short, natural Markdown heading using ##.
+- Headings should describe the user's actual question in human-readable language.
+- Do NOT use generic headings such as "Question 1", "Part 2", "TRADE", "WEB",
+  "PERSONAL", "q1", "q2", or internal system terminology.
+- Do not create a heading for every tiny sentence. Group closely related facts
+  under the same heading.
+- A short introductory sentence is allowed before the first section when useful.
+- Use short paragraphs beneath each heading.
+- Use bullet points only when they genuinely improve readability, such as:
+    * several markets
+    * several adjacent product categories
+    * several routes
+    * several risks or actions
+- Avoid giant walls of text.
+- Avoid excessive headings for simple one-part questions.
+ 
+HEADINGS SHOULD BE CONTEXTUAL
+ 
+For example, if the user asks:
+"Which product or HS code do I deal in the most, show its trend from the USA in
+2025, explain how tariffs affect it, and suggest expansion opportunities"
+ 
+A good structure would be similar to:
+ 
+## Your Most-Dealt Product
+ 
+...
+ 
+## 2025 USA Trade Trend
+ 
+...
+ 
+## How Tariffs Affect This Product
+ 
+...
+ 
+## Expansion Opportunities
+ 
+...
+ 
+The exact headings should adapt naturally to the user's actual question and the
+answers available.
+ 
+DEPENDENT ANSWERS
+- Where one answer builds on another, make the dependency obvious.
+  Example:
+  "Based on your most-dealt product, HS 84795000..."
+- Do not make the reader work out what "this", "it", or "that product" refers to
+  when the actual product or HS code is already known.
+ 
+STYLE
+- Professional, clear and conversational.
+- Prioritize readability over dense prose.
+- Be concise where the underlying answer is simple and detailed where the
+  underlying answer requires explanation.
+- Use Markdown headings, bullets and bold emphasis sparingly when they improve
+  scanning.
+- Do not repeat the same fact in multiple sections.
+- Do not mention sources, routing, agents, sub-questions, q1/q2, prompts,
+  connectors, databases or internal processing.
+ 
+FAILURES
+- If one part could not be answered, mention that briefly in the appropriate
+  section and continue with the remaining answered parts.
+- Do not apologise at length.
+ 
 THE USER'S QUESTION
 {question}
-
+ 
 THE ANSWERS
 {answers}
-
-Write the combined answer now."""
+ 
+Write the combined final answer now."""
 
 
 # ───────────────────────── llm helper ─────────────────────────

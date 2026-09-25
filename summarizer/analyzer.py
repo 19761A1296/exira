@@ -88,7 +88,7 @@ Return strict JSON only. No markdown fences, no prose before or after.
     "filters": ["time period, trade direction, port, mode, value band, etc."],
     "resolved_by_this_turn": "What the current message supplied, or null"
   }},
-  "resolved_query": "One self-contained instruction for Exira, or empty when OFF_TOPIC.",
+  "resolved_query": "One self-contained instruction for Exira, with every dropped part removed. Empty when OFF_TOPIC.",
   "message": "Only for OFF_TOPIC: one or two lines to show the user. Empty otherwise.",
   "dropped_note": "Only when you dropped part of a multi-part message: one short line naming what you skipped. Empty otherwise.",
   "unresolved_slots": ["Anything still genuinely missing, or empty array"],
@@ -157,6 +157,9 @@ When you drop parts:
 - do not mention the dropped parts inside resolved_query
 - dropped_note is addressed to the user, one line, no apology
 - blocked stays false, because there is still work to do
+- CHECK BEFORE YOU ANSWER: read resolved_query back. If any dropped part is
+  still in it, you have not dropped anything. Rewrite it with those parts
+  removed. Writing dropped_note is not dropping; removing the text is.
 
 BORDERLINE CASES
 - Context can bring a vague message into scope. "What about Vietnam" in a
@@ -557,6 +560,14 @@ ALSO BAD
 Why wrong: part three was dropped as well. It depends on part one, which
 survived, so it should have been kept.
 
+ALSO BAD2
+{{"resolved_query": "who are my top buyers for HS 610910, also book me a flight
+   to Milan, and what price do those buyers usually pay",
+  "dropped_note": "I've skipped the flight booking."}}
+Why wrong: the note says the flight was dropped but the text still contains it.
+Downstream this becomes a real sub-question and gets answered. The note
+describes the removal; it does not perform it.
+
 Example 13 — a dropped part takes its dependant with it
 
 Current message: "what's the weather in Mumbai this week, and should I delay my
@@ -682,22 +693,32 @@ def _normalize(parsed: dict, message: str) -> dict:
     dropped_note = str(parsed.get("dropped_note") or "").strip()
 
     if blocked:
-        resolved = ""
- 
-        if not block_msg:
-            block_msg = DEFAULT_BLOCK_MESSAGE
+      resolved = ""
+      dropped_note = ""          # a full block is not a partial drop
+
+      if not block_msg:
+          block_msg = DEFAULT_BLOCK_MESSAGE
  
     else:
-        block_msg = ""
- 
-        # HARD GUARDRAIL:
-        # NEW_INTENT must preserve the user's direct query.
-        # Analyzer should not invent metrics, time granularity,
-        # HS codes, products, countries, or analytical logic.
-        if relation == "NEW_INTENT":
-            resolved = " ".join(
-                (message or "").strip().split()
-            )
+      block_msg = ""
+
+      # HARD GUARDRAIL:
+      # NEW_INTENT must preserve the user's direct query — but only when
+      # nothing was dropped. If a part was removed, the model's trimmed
+      # version is the one to keep, or the dropped part comes straight back.
+      if relation == "NEW_INTENT" and not dropped_note:
+          resolved = " ".join((message or "").strip().split())
+
+      if not resolved:
+          resolved = " ".join((message or "").strip().split())
+          dropped_note = ""       # nothing was dropped if nothing changed
+
+      # the note claims a removal that never happened
+      if dropped_note and resolved == " ".join((message or "").strip().split()):
+          print("resolve_query: dropped_note set but resolved_query unchanged")
+          dropped_note = ""
+
+
     carried = parsed.get("carried_context")
     if not isinstance(carried, dict) or blocked:
         carried = {}

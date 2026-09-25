@@ -261,7 +261,7 @@ def classify_query(question: str, memory: dict) -> str:
             return "TRADE"
 
         route = str(json.loads(content).get("route") or "").upper().strip()
-        print(f"--- ROUTE {route or '?'} | {question[:70]}")
+        print(f"--- ROUTE {route or '?'} | {question[:]}")
         return route if route in ROUTES else "TRADE"
 
     except Exception as exc:
@@ -440,7 +440,7 @@ if __name__ == "__main__":
             "value, and which new markets should they enter?",
         ]
         for query in QUERIES:
-            print(f"\n=== {query[:80]}")
+            print(f"\n=== {query[:]}")
             tag_flow(build_flow(query, MEMORY), MEMORY)
 
     else:
