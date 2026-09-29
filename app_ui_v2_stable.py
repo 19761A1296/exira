@@ -754,6 +754,7 @@ def init_state():
         None
     )
 
+    d.setdefault("flow_traces", [])        # [{"question","trace"}] per TRADE node
     d.setdefault("flow_run", None)          # a FlowRun paused on an HS pick
     d.setdefault("last_flow", None)
     d.setdefault("flow_text", "")           # what the user typed
@@ -2558,6 +2559,7 @@ def ui_trade(question: str) -> dict:
 
     if trace:
         S.last_trade_trace = trace
+        S.flow_traces.append({"question": question, "trace": trace})
 
     text = "\n".join(t for t in parsed["texts"] if t).strip()
     return {"text": text, "ok": trace_ok(trace), "pending": False}
@@ -2581,6 +2583,18 @@ def finish_flow(out: dict):
     trace["flow"] = S.last_flow
     trace["parts"] = out.get("answers") or {}
     trace["asked"] = out.get("asked") or {}
+
+    # one entry per TRADE node, matched back to its question id
+    asked = out.get("asked") or {}
+    by_question = {v: k for k, v in asked.items()}
+    charts = []
+    for item in S.flow_traces:
+        qid = by_question.get(item["question"])
+        if qid:
+            charts.append({"qid": qid, "trace": item["trace"]})
+    charts.sort(key=lambda c: c["qid"])
+    if len(charts) > 1:
+        trace["charts"] = charts
     if S.last_web:
         trace["web"] = S.last_web
 
@@ -2596,6 +2610,7 @@ def start_flow(text: str, sent: str, memory: dict):
                     if len(flow["questions"]) == 1 else "FLOW")
     S.flow_text, S.flow_sent = text, sent
     S.last_trade_trace = None
+    S.flow_traces = []
     S.last_web = None
 
     S.flow_run = FlowRun(flow, memory, FLOW_HANDLERS, original_question=sent)
@@ -3305,747 +3320,265 @@ def sidebar():
 # PREMIUM CHART RENDERER
 # =========================================================
 
-def render_visual(
-    trace: dict
-):
+def _draw_chart(spec: dict, rows: list):
+
+    """Draw one chart from a Prompt C spec and its rows."""
+
+    spec = spec or {}
+
+    rows = rows or []
+
+    vtype = spec.get("type", "none")
+
+    if vtype == "none" or not rows:
+
+        return
+
+
+
+    df = pd.DataFrame(rows)
+
+    title = spec.get("title")
+
+    x, y = spec.get("x_column"), spec.get("y_column")
+
+    series, trend = spec.get("series_column"), spec.get("trendline_column")
+
+
+
+    if title:
+
+        st.markdown(f"**{title}**")
+
+
+
+    try:
+
+        if vtype == "structured_table":
+
+            cols = [c for c in (spec.get("columns") or []) if c in df.columns]
+
+            st.dataframe(df[cols] if cols else df, use_container_width=True)
+
+            return
+
+
+
+        if not x or not y or x not in df.columns or y not in df.columns:
+
+            st.dataframe(df, use_container_width=True)
+
+            return
+
+
+
+        if vtype == "bar_chart":
+
+            if series and series in df.columns:
+
+                st.bar_chart(df.pivot_table(index=x, columns=series,
+
+                                            values=y, aggfunc="sum"))
+
+            else:
+
+                st.bar_chart(df.set_index(x)[y])
+
+
+
+        elif vtype == "line_chart":
+
+            ycols = [y]
+
+            if trend and trend in df.columns:
+
+                ycols.append(trend)
+
+            if series and series in df.columns and not trend:
+
+                st.line_chart(df.pivot_table(index=x, columns=series,
+
+                                             values=y, aggfunc="sum"))
+
+            else:
+
+                st.line_chart(df.set_index(x)[ycols])
+
+
+
+        elif vtype == "scatter_chart":
+
+            st.scatter_chart(df, x=x, y=y,
+
+                             color=series if series in df.columns else None)
+
+
+
+        elif vtype == "pie_chart":
+
+            chart = (
+
+                alt.Chart(df).mark_arc()
+
+                .encode(theta=alt.Theta(f"{y}:Q"),
+
+                        color=alt.Color(f"{x}:N"),
+
+                        tooltip=[x, y])
+
+            )
+
+            st.altair_chart(chart, use_container_width=True)
+
+
+
+        else:
+
+            st.dataframe(df, use_container_width=True)
+
+
+
+    except Exception as exc:
+
+        st.caption(f"Could not draw the chart ({exc}) — showing the data instead.")
+
+        st.dataframe(df, use_container_width=True)
+
+
+
+
+
+def _chartable(trace: dict) -> list:
+
+    """[(qid, trace)] for every node that produced rows, in node order."""
+
+    out = []
+
+    for item in (trace or {}).get("charts") or []:
+
+        node = item.get("trace") or {}
+
+        if node.get("rows"):
+
+            out.append((item.get("qid") or "?", node))
+
+    return out
+
+
+
+
+
+def render_visual(trace: dict):
+
+    """One chart per TRADE node, two per row. Falls back to the single chart."""
 
     if not trace:
 
         return
 
-    spec = (
-        trace.get(
-            "visualization"
-        )
-        or {}
-    )
 
-    rows = (
-        trace.get(
-            "rows"
-        )
-        or []
-    )
 
-    vtype = spec.get(
-        "type",
-        "none"
-    )
+    pairs = _chartable(trace)
 
-    if (
-        vtype == "none"
-        or not rows
-    ):
+
+
+    if pairs:
+
+        for start in range(0, len(pairs), 2):
+
+            row = pairs[start:start + 2]
+
+            cols = st.columns(len(row))
+
+            for col, (qid, node) in zip(cols, row):
+
+                with col:
+
+                    st.caption(qid)
+
+                    _draw_chart(node.get("visualization"), node.get("rows"))
 
         return
 
-    df = pd.DataFrame(
-        rows
-    )
-
-    title = (
-        spec.get(
-            "title"
-        )
-        or "Trade analysis"
-    )
-
-    x = spec.get(
-        "x_column"
-    )
-
-    y = spec.get(
-        "y_column"
-    )
-
-    series = spec.get(
-        "series_column"
-    )
-
-    trend = spec.get(
-        "trendline_column"
-    )
-    st.markdown(
-        '<div class="exira-chart-card">'
-        f'<div class="exira-chart-title">{html.escape(str(title))}</div>'
-        '<div class="exira-chart-sub">Interactive view generated from the returned trade data</div>'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-
-    try:
-
-        if (
-            vtype
-            == "structured_table"
-        ):
-
-            cols = [
-                c
-                for c in (
-                    spec.get(
-                        "columns"
-                    )
-                    or []
-                )
-                if c
-                in df.columns
-            ]
-
-            view = (
-                df[cols]
-                if cols
-                else df
-            )
-
-            st.dataframe(
-                view,
-                use_container_width=True,
-                hide_index=True,
-                height=min(
-                    520,
-                    42
-                    + 35
-                    * min(
-                        len(view),
-                        14
-                    )
-                )
-            )
-
-            return
-
-        if (
-            not x
-            or not y
-            or x not in df.columns
-            or y not in df.columns
-        ):
-
-            st.dataframe(
-                df,
-                use_container_width=True,
-                hide_index=True
-            )
-
-            return
-
-        plot_df = (
-            df.copy()
-        )
-
-        plot_df[
-            y
-        ] = pd.to_numeric(
-            plot_df[y],
-            errors="coerce"
-        )
-
-        if (
-            series
-            and series
-            in plot_df.columns
-        ):
-
-            plot_df[
-                series
-            ] = (
-                plot_df[
-                    series
-                ].astype(
-                    str
-                )
-            )
-
-        if (
-            plot_df[y]
-            .notna()
-            .sum()
-            == 0
-        ):
-
-            st.dataframe(
-                df,
-                use_container_width=True,
-                hide_index=True
-            )
-
-            return
-
-        prefix = _number_prefix(
-            y,
-            title
-        )
-
-        label_map = {
-            x:
-                x.replace(
-                    "_",
-                    " "
-                ).title(),
-
-            y:
-                y.replace(
-                    "_",
-                    " "
-                ).title()
-        }
-
-        if PLOTLY_AVAILABLE:
-
-            fig = None
-
-            # BAR CHART
-
-            if (
-                vtype
-                == "bar_chart"
-            ):
-
-                labels = (
-                    plot_df[
-                        x
-                    ].astype(
-                        str
-                    )
-                )
-
-                horizontal = (
-                    len(plot_df) >= 6
-                    or labels
-                    .str
-                    .len()
-                    .mean()
-                    > 13
-                )
-
-                if horizontal:
-
-                    fig = px.bar(
-                        plot_df,
-                        x=y,
-                        y=x,
-
-                        color=(
-                            series
-                            if (
-                                series
-                                and series
-                                in plot_df.columns
-                            )
-                            else None
-                        ),
-
-                        orientation="h",
-
-                        labels=
-                            label_map,
-
-                        color_discrete_sequence=
-                            EXIRA_PALETTE,
-
-                        barmode=
-                            "group",
-                    )
-
-                    fig.update_yaxes(
-                        categoryorder=
-                            "array",
-
-                        categoryarray=
-                            list(
-                                reversed(
-                                    labels.tolist()
-                                )
-                            )
-                    )
-
-                    fig.update_traces(
-                        texttemplate=
-                            "%{x:.3s}",
-
-                        textposition=
-                            "outside",
-
-                        cliponaxis=
-                            False
-                    )
-
-                else:
-
-                    fig = px.bar(
-                        plot_df,
-                        x=x,
-                        y=y,
-
-                        color=(
-                            series
-                            if (
-                                series
-                                and series
-                                in plot_df.columns
-                            )
-                            else None
-                        ),
-
-                        labels=
-                            label_map,
-
-                        color_discrete_sequence=
-                            EXIRA_PALETTE,
-
-                        barmode=
-                            "group",
-                    )
-
-                    fig.update_traces(
-                        texttemplate=
-                            "%{y:.3s}",
-
-                        textposition=
-                            "outside",
-
-                        cliponaxis=
-                            False
-                    )
-
-                fig = _plotly_layout(
-                    fig,
-                    title,
-                    horizontal=
-                        horizontal
-                )
-
-            # LINE CHART
-
-            elif (
-                vtype
-                == "line_chart"
-            ):
-
-                if (
-                    trend
-                    and trend
-                    in plot_df.columns
-                ):
-
-                    plot_df[
-                        trend
-                    ] = pd.to_numeric(
-                        plot_df[trend],
-                        errors="coerce"
-                    )
-
-                    fig = go.Figure()
-
-                    fig.add_trace(
-                        go.Scatter(
-                            x=
-                                plot_df[x],
-
-                            y=
-                                plot_df[y],
-
-                            mode=
-                                "lines+markers",
-
-                            name=
-                                y.replace(
-                                    "_",
-                                    " "
-                                ).title(),
-
-                            line=dict(
-                                color=
-                                    EXIRA_PALETTE[0],
-
-                                width=3
-                            ),
-
-                            marker=dict(
-                                size=7
-                            ),
-
-                            fill=
-                                "tozeroy",
-
-                            fillcolor=
-                                "rgba(91,140,255,.09)",
-                        )
-                    )
-
-                    fig.add_trace(
-                        go.Scatter(
-                            x=
-                                plot_df[x],
-
-                            y=
-                                plot_df[trend],
-
-                            mode=
-                                "lines",
-
-                            name=
-                                trend.replace(
-                                    "_",
-                                    " "
-                                ).title(),
-
-                            line=dict(
-                                color=
-                                    EXIRA_PALETTE[1],
-
-                                width=2,
-
-                                dash=
-                                    "dot"
-                            ),
-                        )
-                    )
-
-                else:
-
-                    fig = px.line(
-                        plot_df,
-                        x=x,
-                        y=y,
-
-                        color=(
-                            series
-                            if (
-                                series
-                                and series
-                                in plot_df.columns
-                            )
-                            else None
-                        ),
-
-                        markers=True,
-
-                        labels=
-                            label_map,
-
-                        color_discrete_sequence=
-                            EXIRA_PALETTE,
-                    )
-
-                    fig.update_traces(
-                        line=dict(
-                            width=3
-                        ),
-
-                        marker=dict(
-                            size=7
-                        )
-                    )
-
-                fig = _plotly_layout(
-                    fig,
-                    title
-                )
-
-            # SCATTER CHART
-
-            elif (
-                vtype
-                == "scatter_chart"
-            ):
-
-                fig = px.scatter(
-                    plot_df,
-                    x=x,
-                    y=y,
-
-                    color=(
-                        series
-                        if (
-                            series
-                            and series
-                            in plot_df.columns
-                        )
-                        else None
-                    ),
-
-                    labels=
-                        label_map,
-
-                    color_discrete_sequence=
-                        EXIRA_PALETTE,
-
-                    size_max=18,
-                )
-
-                fig.update_traces(
-                    marker=dict(
-                        size=10,
-                        opacity=.82,
-
-                        line=dict(
-                            width=1,
-
-                            color=
-                                "rgba(255,255,255,.25)"
-                        )
-                    )
-                )
-
-                fig = _plotly_layout(
-                    fig,
-                    title
-                )
-
-            # PIE / DONUT
-
-            elif (
-                vtype
-                == "pie_chart"
-            ):
-
-                fig = px.pie(
-                    plot_df,
-
-                    names=x,
-                    values=y,
-
-                    hole=.58,
-
-                    color_discrete_sequence=
-                        EXIRA_PALETTE,
-                )
-
-                fig.update_traces(
-                    textposition=
-                        "inside",
-
-                    textinfo=
-                        "percent",
-
-                    hovertemplate=
-                        "<b>%{label}</b>"
-                        "<br>%{value:,.2f}"
-                        "<br>%{percent}"
-                        "<extra></extra>",
-
-                    marker=dict(
-                        line=dict(
-                            color=
-                                "#0b1727",
-
-                            width=2
-                        )
-                    ),
-                )
-
-                fig = _plotly_layout(
-                    fig,
-                    title
-                )
-
-            if fig is not None:
-
-                if prefix:
-
-                    if (
-                        vtype
-                        == "bar_chart"
-                    ):
-
-                        if (
-                            getattr(
-                                fig.layout,
-                                "xaxis",
-                                None
-                            )
-                            and len(plot_df)
-                            >= 6
-                        ):
-
-                            fig.update_xaxes(
-                                tickprefix=
-                                    prefix
-                            )
-
-                        else:
-
-                            fig.update_yaxes(
-                                tickprefix=
-                                    prefix
-                            )
-
-                    elif vtype in (
-                        "line_chart",
-                        "scatter_chart"
-                    ):
-
-                        fig.update_yaxes(
-                            tickprefix=
-                                prefix
-                        )
-
-                st.plotly_chart(
-                    fig,
-                    use_container_width=True,
-
-                    config={
-                        "displaylogo":
-                            False,
-
-                        "responsive":
-                            True
-                    }
-                )
-
-                return
-
-        # ---------------------------------------------
-        # SAFE FALLBACK IF PLOTLY IS NOT INSTALLED
-        # ---------------------------------------------
-
-        if (
-            vtype
-            == "bar_chart"
-        ):
-
-            if (
-                series
-                and series
-                in df.columns
-            ):
-
-                st.bar_chart(
-                    df.pivot_table(
-                        index=x,
-                        columns=series,
-                        values=y,
-                        aggfunc="sum"
-                    )
-                )
-
-            else:
-
-                st.bar_chart(
-                    df.set_index(
-                        x
-                    )[y]
-                )
-
-        elif (
-            vtype
-            == "line_chart"
-        ):
-
-            ycols = [y]
-
-            if (
-                trend
-                and trend
-                in df.columns
-            ):
-
-                ycols.append(
-                    trend
-                )
-
-            if (
-                series
-                and series
-                in df.columns
-                and not trend
-            ):
-
-                st.line_chart(
-                    df.pivot_table(
-                        index=x,
-                        columns=series,
-                        values=y,
-                        aggfunc="sum"
-                    )
-                )
-
-            else:
-
-                st.line_chart(
-                    df.set_index(
-                        x
-                    )[ycols]
-                )
-
-        elif (
-            vtype
-            == "scatter_chart"
-        ):
-
-            st.scatter_chart(
-                df,
-                x=x,
-                y=y,
-
-                color=(
-                    series
-                    if (
-                        series
-                        in df.columns
-                    )
-                    else None
-                )
-            )
-
-        elif (
-            vtype
-            == "pie_chart"
-        ):
-
-            chart = (
-                alt.Chart(
-                    df
-                )
-                .mark_arc(
-                    innerRadius=70
-                )
-                .encode(
-                    theta=
-                        alt.Theta(
-                            f"{y}:Q"
-                        ),
-
-                    color=
-                        alt.Color(
-                            f"{x}:N"
-                        ),
-
-                    tooltip=[
-                        x,
-                        y
-                    ]
-                )
-            )
-
-            st.altair_chart(
-                chart,
-                use_container_width=True
-            )
-
-        else:
-
-            st.dataframe(
-                df,
-                use_container_width=True,
-                hide_index=True
-            )
-
-    except Exception as exc:
-
-        st.caption(
-            f"Could not draw the chart "
-            f"({exc}) — showing the "
-            f"data instead."
-        )
-
-        st.dataframe(
-            df,
-            use_container_width=True,
-            hide_index=True
-        )
+
+
+    _draw_chart(trace.get("visualization"), trace.get("rows"))
+
+
+
+
+
+def render_node_details(trace: dict):
+
+    """One tab per TRADE node: its question, SQL and rows. Multi-node only."""
+
+    pairs = _chartable(trace)
+
+    if len(pairs) < 2:
+
+        return
+
+
+
+    asked = (trace or {}).get("asked") or {}
+
+
+
+    with st.expander(f"Developer details · {len(pairs)} trade questions"):
+
+        tabs = st.tabs([qid for qid, _ in pairs])
+
+        for tab, (qid, node) in zip(tabs, pairs):
+
+            with tab:
+
+                question = asked.get(qid) or ""
+
+                if question:
+
+                    st.markdown("**Question sent**")
+
+                    st.write(question)
+
+
+
+                stage = (node.get("meta") or {}).get("stage", "")
+
+                if stage:
+
+                    st.caption(f"stage: {stage}")
+
+
+
+                if node.get("sql"):
+
+                    st.markdown("**SQL**")
+
+                    st.code(node["sql"], language="sql")
+
+
+
+                rows = node.get("rows") or []
+
+                if rows:
+
+                    st.markdown(f"**Rows ({len(rows)})**")
+
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+
+
+                if node.get("visualization"):
+
+                    st.markdown("**Visualization spec**")
+
+                    st.json(node["visualization"])
+
+
+
+                if node.get("error"):
+
+                    st.error(node["error"])
 
 
 # =========================================================
@@ -4174,6 +3707,9 @@ def render_trace(trace: dict):
     if not trace:
         return
 
+    if len(_chartable(trace)) > 1:
+        return          # each node has its own section instead
+
     if trace.get("route") == "WEB" and "sql" not in trace:
         return
 
@@ -4270,6 +3806,7 @@ def page_chat():
             if turn["role"] == "assistant":
                 st.markdown(turn["content"])
                 render_visual(turn.get("trace"))
+                render_node_details(turn.get("trace"))
                 render_resolution(turn.get("trace"))
                 render_trace(turn.get("trace"))
             else:
