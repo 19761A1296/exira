@@ -25,7 +25,6 @@ SELECTED_COLUMNS_STR = ", ".join(SELECTED_COLUMNS)
 COL_S_COMPANY = "S_COMPANY"
 COL_B_COMPANY = "B_COMPANY"
 COL_D_FLAG    = "D_FLAG"
-ACTIVE_ROWS = f"({COL_D_FLAG} IS NULL OR {COL_D_FLAG} = 0)"
 
 
 
@@ -34,10 +33,8 @@ import snowflake.connector
 import re 
 
 TABLE_NAME    = os.getenv("TRADE_TABLE_NAME")
-COL_S_COMPANY = "S_COMPANY"
-COL_B_COMPANY = "B_COMPANY"
-COL_D_FLAG    = "D_FLAG"
-ACTIVE_ROWS   = f"({COL_D_FLAG} IS NULL OR {COL_D_FLAG} = 0)"
+COL_S_COMPANY = "SELLER_COMPANY"
+COL_B_COMPANY = "BUYER_COMPANY"
 
 
 def _get_conn():
@@ -86,24 +83,21 @@ def companies_list(company_name, limit=500, country=None, hs2=None):
         SELECT name FROM (
             SELECT DISTINCT {COL_S_COMPANY} AS name
             FROM {TABLE_NAME}
-            WHERE {ACTIVE_ROWS}
-              AND {COL_S_COMPANY} IS NOT NULL
-              AND UPPER({COL_S_COMPANY}) LIKE %(company)s ESCAPE '\\\\'
-              {seller_extra}
+            WHERE {COL_S_COMPANY} IS NOT NULL
+            AND UPPER({COL_S_COMPANY}) LIKE %(company)s ESCAPE '\\\\'
+            {seller_extra}
 
             UNION
 
             SELECT DISTINCT {COL_B_COMPANY} AS name
             FROM {TABLE_NAME}
-            WHERE {ACTIVE_ROWS}
-              AND {COL_B_COMPANY} IS NOT NULL
-              AND UPPER({COL_B_COMPANY}) LIKE %(company)s ESCAPE '\\\\'
-              {buyer_extra}
+            WHERE {COL_B_COMPANY} IS NOT NULL
+            AND UPPER({COL_B_COMPANY}) LIKE %(company)s ESCAPE '\\\\'
+            {buyer_extra}
         )
         ORDER BY name
         LIMIT {limit}
     """
-
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
@@ -118,12 +112,12 @@ def build_query(company_name=""):
 
     company = (company_name or "").strip()
 
-    sql = f"SELECT {SELECTED_COLUMNS_STR} FROM {TABLE_NAME} WHERE {ACTIVE_ROWS}"
+    sql = f"SELECT {SELECTED_COLUMNS_STR} FROM {TABLE_NAME}"
 
     if company:
         sql += (
-            f" AND ({COL_S_COMPANY} = '{company}'"
-            f" OR {COL_B_COMPANY} = '{company}')"
+            f" WHERE ({COL_S_COMPANY} = '{company}')"
+            f" AND ({COL_B_COMPANY} = '{company}')"
         )
 
     return sql
@@ -148,16 +142,16 @@ def run_query(query):
 
 if __name__ == "__main__":
 
-    q = "AB"
-    result = companies_list(q, limit=10)
-    print(f"Companies matching '{q}':", result)
+    # q = "AB"
+    # result = companies_list(q, limit=10)
+    # print(f"Companies matching '{q}':", result)
 
-    # query = build_query("ALLENBERG COTTON CO")
-    # print("QUERY:", query)
+    query = build_query("SHAHI EXPORTS PVT LTD")
+    print("QUERY:", query)
     # query = f"SELECT {SELECTED_COLUMNS_STR} FROM {TABLE_NAME} LIMIT 100"
-    # df = run_query(query)
+    df = run_query(query)
     # #print(df.columns.tolist())
-    # # print("Row count:", df.shape)
+    print("Row count:", df.shape)
     # print(df.to_string(index=False))
 
 
