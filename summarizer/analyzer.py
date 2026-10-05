@@ -23,6 +23,7 @@ degrades to plain routing rather than breaking the chat.
 
 import json
 import os
+import re
 
 import requests
 from dotenv import load_dotenv
@@ -47,6 +48,22 @@ DEFAULT_BLOCK_MESSAGE = (
 DEFAULT_DROPPED_NOTE = (
     "I've skipped the parts of that which aren't about trade, and answered the rest."
 )
+
+BUSINESS_SELF_REFERENCE_RE = re.compile(
+    r"\b(?:my|our)\s+"
+    r"(?:company|business|buyers?|suppliers?|customers?|imports?|exports?|"
+    r"shipments?|transactions?|trade|sales?|purchases?|products?|hs\s*codes?|ports?)\b"
+    r"|\bbuyers?\s+of\s+mine\b"
+    r"|\bsuppliers?\s+of\s+mine\b"
+    r"|\bcustomers?\s+of\s+mine\b"
+    r"|\b(?:from|to)\s+(?:me|us)\b"
+    r"|\b(?:i|we)\s+(?:import|export|ship|sell|buy|source|trade)\b",
+    re.IGNORECASE,
+)
+
+
+def _needs_business_identity_resolution(message: str) -> bool:
+    return bool(BUSINESS_SELF_REFERENCE_RE.search(message or ""))
 
 
 PROMPT_ANALYZER = """ROLE
@@ -243,6 +260,105 @@ CORE PRINCIPLES
     default exists. State the default inside resolved_query and record the gap in
     unresolved_slots.
 
+13. USER / COMPANY IDENTITY IS GLOBAL STICKY CONTEXT — CRITICAL
+
+The user's own company identity is different from ordinary conversational
+context and different from product/HS/country filters.
+
+When the current trade/business question refers to the user's business using
+first-person language, resolve that reference to the canonical company name
+whenever the company name is available in <user_memory> or has been explicitly
+established in <conversation_history>.
+
+First-person BUSINESS references include, but are not limited to:
+
+- "my company"
+- "our company"
+- "my business"
+- "our business"
+- "my buyers"
+- "buyers of mine"
+- "my suppliers"
+- "my customers"
+- "my imports"
+- "my exports"
+- "my shipments"
+- "my transactions"
+- "my trade"
+- "from me"
+- "to me"
+- "from us"
+- "to us"
+- "what I import"
+- "what I export"
+- "where I sell"
+- "where we buy"
+- "where we ship"
+
+If the canonical company is SHAHI EXPORTS PVT LTD:
+
+Current message:
+"what was my company most recent trade transaction"
+
+GOOD resolved_query:
+"What was SHAHI EXPORTS PVT LTD's most recent trade transaction?"
+
+BAD resolved_query:
+"What was the user's most recent trade transaction?"
+
+ALSO BAD:
+"What was the most recent trade transaction for the user's current HS code?"
+
+The company identity is known, so "my company" must be resolved explicitly.
+Do not substitute an unrelated product or HS-code scope.
+
+Current message:
+"which buyer of mine shows decreasing imports from me"
+
+GOOD resolved_query:
+"Which buyer of SHAHI EXPORTS PVT LTD shows a decreasing trend in purchases or
+imports from SHAHI EXPORTS PVT LTD?"
+
+BAD resolved_query:
+"Which buyer of the user shows decreasing imports from the user?"
+
+ALSO BAD:
+"Which buyer shows decreasing imports from me?"
+
+The downstream system must never have to guess who "me", "mine", "my company",
+"our company" or "us" means when the company identity is already known.
+
+COMPANY IDENTITY IS STICKY ACROSS INTENTS.
+
+A new question may be NEW_INTENT while still referring to the same user's
+company. NEW_INTENT means "new deliverable"; it does NOT mean "forget who the
+user's company is".
+
+Company identity therefore survives:
+- NEW_INTENT
+- CONTINUATION
+- REFINEMENT
+- MIXED
+
+However, company identity must NOT make unrelated analytical scope sticky.
+
+For example, if the previous question concerned HS 73269099 and the user then
+asks:
+
+"what was my company's most recent trade transaction"
+
+resolve the company identity, but DO NOT automatically carry HS 73269099 into
+the new query unless the current message explicitly refers back to that product
+or HS code.
+
+IDENTITY IS STICKY.
+PRODUCT / HS / COUNTRY / PERIOD SCOPE IS STICKY ONLY WHEN THE current question
+actually inherits or refers to it.
+
+If no canonical company identity exists in memory or established conversation
+history, never invent one. Leave the identity unresolved and include
+"company identity" in unresolved_slots.   
+
     
 0. DIRECT SELF-CONTAINED QUERY PRESERVATION — CRITICAL
  
@@ -252,7 +368,27 @@ answer, or rely on anaphora such as "it", "those", "same", "that one", etc.,
 classify it as NEW_INTENT.
  
 For NEW_INTENT, preserve the user's current message exactly except for trivial
-whitespace cleanup.
+whitespace cleanup AND necessary resolution of known business identity.
+
+Known first-person business references such as "my company", "my buyers",
+"buyer of mine", "my imports", "from me", "our business" or "we export"
+MUST be replaced with the canonical company identity when that identity is
+available in user_memory or established conversation history.
+
+Identity grounding is NOT scope expansion.
+
+When grounding the company identity, do not add:
+- metrics
+- products
+- HS codes
+- countries
+- time periods
+- rankings
+- aggregation methods
+- filters
+- analytical dimensions
+
+that the user did not request.
  
 DO NOT add:
 - metrics the user did not request
@@ -706,8 +842,12 @@ def _normalize(parsed: dict, message: str) -> dict:
       # NEW_INTENT must preserve the user's direct query — but only when
       # nothing was dropped. If a part was removed, the model's trimmed
       # version is the one to keep, or the dropped part comes straight back.
-      if relation == "NEW_INTENT" and not dropped_note:
-          resolved = " ".join((message or "").strip().split())
+      if (
+           relation == "NEW_INTENT"
+           and not dropped_note
+           and not _needs_business_identity_resolution(message)
+       ):
+           resolved = " ".join((message or "").strip().split())
 
       if not resolved:
           resolved = " ".join((message or "").strip().split())
