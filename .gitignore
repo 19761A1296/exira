@@ -10,3 +10,5 @@ __pycache__/
 
 # Untracking files 
 database/sandbox_fetch_data.py
+
+zzy/
