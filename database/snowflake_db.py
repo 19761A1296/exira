@@ -115,7 +115,7 @@ def build_query(company_name=""):
     if company:
         sql += (
             f" WHERE ({COL_S_COMPANY} = '{company}')"
-            f" AND ({COL_B_COMPANY} = '{company}')"
+            f" OR ({COL_B_COMPANY} = '{company}')"
         )
 
     return sql
@@ -150,6 +150,8 @@ if __name__ == "__main__":
     df = run_query(query)
     # #print(df.columns.tolist())
     print("Row count:", df.shape)
+    # output_path = "C:\\Users\\TDB\\Desktop\\shahi_imports_exports.xlsx"
+    # df.to_excel(output_path, index=False)
     # print(df.to_string(index=False))
 
 
