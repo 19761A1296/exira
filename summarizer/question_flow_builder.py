@@ -40,7 +40,7 @@ URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = (os.getenv("MODEL_QUESTION_FLOW_BUILDER"))
 MAX_TOKENS = int(os.getenv("FLOW_MAX_TOKENS", "2500"))
 MAX_QUESTIONS = int(os.getenv("FLOW_MAX_QUESTIONS", "10"))
-MEMORY_CHARS = int(os.getenv("FLOW_MEMORY_CHARS", "2000"))
+MEMORY_CHARS = int(os.getenv("FLOW_MEMORY_CHARS", "5000"))
 PRINT_FLOW = (os.getenv("PRINT_FLOW", "1") or "").strip() not in {"0", "false", "False", ""}
 
 

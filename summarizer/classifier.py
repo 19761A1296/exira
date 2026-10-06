@@ -472,7 +472,7 @@ Return ONLY a JSON object mapping every id to its route, and nothing else:
 
 URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = os.getenv("OPENROUTER_MODEL_CLASSIFIER")
-MAX_TOKENS = int(os.getenv("CLASSIFIER_MAX_TOKENS", "300"))
+MAX_TOKENS = int(os.getenv("CLASSIFIER_MAX_TOKENS", "1000"))
 MEMORY_CHARS = int(os.getenv("CLASSIFIER_MEMORY_CHARS", "2000"))
 ROUTES = {"TRADE", "PERSONAL", "WEB"}
 PRINT_TAGS = (os.getenv("PRINT_TAGS", "1") or "").strip() not in {"0", "false", "False", ""}
