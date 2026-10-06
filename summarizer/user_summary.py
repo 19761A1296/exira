@@ -1,7 +1,6 @@
 import os
 import json
 import requests
-import pandas as pd
 from dotenv import load_dotenv
 
 from summarizer.summarizer_prompts.summarizer_prompts import PROMPT_USER_SUMMARY
@@ -27,32 +26,30 @@ EMPTY_CARD = {
 }
 
 
-def _table_to_text(df):
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return ""
-    return df.to_markdown(index=False)
 
 
 def _as_text(data):
-    """data: list holding a DataFrame and/or scraped text. Both optional.
-    Order inside the list does not matter."""
+    """data: list holding the facts block and/or scraped text. Both optional.
+    Order inside the list does not matter: the facts block is recognised by its
+    COMPANY: header."""
     if data is None:
         return ""
     if not isinstance(data, (list, tuple)):
         data = [data]
 
-    tables, texts = [], []
+    facts, texts = [], []
     for item in data:
-        if isinstance(item, pd.DataFrame):
-            t = _table_to_text(item)
-            if t:
-                tables.append(t)
-        elif isinstance(item, str) and item.strip():
-            texts.append(item.strip())
+        if not isinstance(item, str) or not item.strip():
+            continue
+        block = item.strip()
+        if block.startswith("COMPANY:") or "\nEXPORTS - " in block or "\nIMPORTS - " in block:
+            facts.append(block)
+        else:
+            texts.append(block)
 
     parts = []
-    if tables:
-        parts.append("SHIPMENT RECORDS:\n" + "\n\n".join(tables))
+    if facts:
+        parts.append("SHIPMENT FACTS:\n" + "\n\n".join(facts))
     if texts:
         parts.append("COMPANY INFORMATION (from web):\n" + "\n\n".join(texts))
 
@@ -60,7 +57,7 @@ def _as_text(data):
 
 
 def _strip_fences(text):
-    text = text.strip()
+    text = (text or "").strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[-1]
         text = text.rsplit("```", 1)[0]
@@ -78,6 +75,7 @@ def _call_llm(prompt, user_content, temperature=0.2, timeout=120):
             "model": OPENROUTER_MODEL,
             "temperature": temperature,
             "response_format": {"type": "json_object"},
+            "max_tokens": 8000,
             "messages": [
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": user_content},
@@ -85,31 +83,37 @@ def _call_llm(prompt, user_content, temperature=0.2, timeout=120):
         },
         timeout=timeout,
     )
-    print("STATUS:", resp.status_code)
+    #print("STATUS:", resp.status_code)
     if not resp.ok:
-        print("OPENROUTER ERROR:")
-        print(resp.text)
-        
+        #print("OPENROUTER ERROR:")
+        #print(resp.text)
+        pass
+
     resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+    payload = resp.json()
+    choice = payload["choices"][0]
+    #print("finish_reason:", choice.get("finish_reason"), "| usage:", payload.get("usage"))
+    return choice["message"].get("content")
 
 
 def build_user_summary(company_name, data=None):
     """company_name: str.
-    data: list holding a DataFrame and/or scraped info string. Both optional.
+    data: list holding the facts block and/or scraped text. Both optional.
     Returns a dict in card format."""
     company_name = (company_name or "").strip()
  
 
     body = _as_text(data)
     user_content = f"company_name: {company_name}\n\n{body if body else 'data: (none)'}"
-    print("DEBUG: ",body,type(body),len(body),len(body[0]),len(body[1]))
-    print("DEBUG: ",company_name)
+    #print(f"{company_name} | body {len(body)} chars")
+    #print()
     try:
         raw = _call_llm(PROMPT_USER_SUMMARY, user_content)
+        if not raw:
+            raise ValueError("model returned no content")
         card = json.loads(_strip_fences(raw))
-    except (requests.RequestException, json.JSONDecodeError, KeyError) as e:
-        print(f"card build failed for {company_name}: {e}")
+    except (requests.RequestException, json.JSONDecodeError, KeyError, ValueError) as e:
+        #print(f"card build failed for {company_name}: {e}")
         card = dict(EMPTY_CARD)
 
     card["memory_version"] = "v1"

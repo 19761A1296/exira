@@ -39,7 +39,7 @@ MAX_COUNTRY_ROWS = 10        # countries in the "by country" line
 
 def _norm(series: pd.Series) -> pd.Series:
     """Trim and upper-case, so 'Zara Trading ' and 'ZARA TRADING' are one thing."""
-    return series.dropna().astype(str).str.strip().str.upper()
+    return series.fillna("").astype(str).str.strip().str.upper()
 
 
 def _has(frame: pd.DataFrame, *cols) -> bool:

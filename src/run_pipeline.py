@@ -3,6 +3,7 @@ from reporting.report_generator import init_report,update_report,log_report
 from database.snowflake_db import companies_list,build_query,run_query
 from extraction.extracting_urls import get_company_information_links
 from summarizer.user_summary import build_user_summary
+from summarizer.user_summary_aggregate import aggregate
 
 MAX_ATTEMPTS= 3
 COMPANY_FIELDS = ("company_name", "company_info")
@@ -154,9 +155,18 @@ def run_db_pipeline(company_name="", scraped_info=""):
         print("Queries:", queries)
     
         df = run_query(queries)
-        df.to_string(index=False)
-        print("DB Results:\n", df)
-        data.append(df)
+        
+        aggregated_data=""
+        if df is not None and not df.empty:
+            print("DB Results:\n", df.shape)
+            agg_data = aggregate(df, company_name)
+            aggregated_data = agg_data.get("text", "") if agg_data else ""
+        else:
+            print("No DB results found")
+            aggregated_data = None
+       
+       
+        data.append(aggregated_data)
     if scraped_info:
         print("Scraped info:\n", scraped_info)
         data.append(scraped_info)

@@ -45,6 +45,7 @@ from summarizer.analyzer import resolve_query
 from summarizer.web_search import web_search, as_context
 from summarizer.memory_answer import answer_from_memory
 from summarizer.user_summary import build_user_summary
+from summarizer.user_summary_aggregate import aggregate
 
 MAX_SESSION_QUERIES = 5
 MAX_ATTEMPTS = 3
@@ -981,12 +982,19 @@ def onb_build_profile(
                 and not df.empty
             ):
 
-                data.append(df)
+                agg = aggregate(df, company_name)
+                facts = agg.get("text", "") if agg else ""
+                if facts:
+                    data.append(facts)
+                    st.caption(
+                        f"Pulled {len(df)} shipment rows "
+                        f"for {company_name}."
+                    )
+                else:
+                    st.caption(
+                        f"No rows matched {company_name} on either side."
+                    )
 
-                st.caption(
-                    f"Pulled {len(df)} shipment rows "
-                    f"for {company_name}."
-                )
 
             else:
 
