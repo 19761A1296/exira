@@ -60,7 +60,7 @@ load_dotenv()
 
 URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = os.getenv("MODEL_CONNECTOR")
-REWRITE_MAX_TOKENS = int(os.getenv("CONNECTOR_REWRITE_MAX_TOKENS", "400"))
+REWRITE_MAX_TOKENS = int(os.getenv("CONNECTOR_REWRITE_MAX_TOKENS", "1000"))
 COMBINE_MAX_TOKENS = int(os.getenv("CONNECTOR_COMBINE_MAX_TOKENS", "3000"))
 ANSWER_CHARS = int(os.getenv("CONNECTOR_ANSWER_CHARS", "3000"))
 PRINT_CONNECTOR = (os.getenv("PRINT_CONNECTOR", "1") or "").strip() not in {"0", "false", "False", ""}
