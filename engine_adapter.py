@@ -46,6 +46,15 @@ class Engine:
         s = engine.SESSIONS.get(sid)
         return bool(s and s["active_focus"].get("pending_domain_disambiguation"))
 
+    def clarification_pending(self, sid: str) -> bool:
+        """True when the Trade Agent asked a question — not the HS domain pick."""
+        s = engine.SESSIONS.get(sid)
+        if not s:
+            return False
+        if s["active_focus"].get("pending_domain_disambiguation"):
+            return False                  # that is the HS pick, handled elsewhere
+        return s.get("state") == "AWAITING_CLARIFICATION"
+
 
     def current_scope(self, sid: str) -> dict:
         """What the engine is actually focused on right now."""

@@ -11,6 +11,7 @@ from summarizer.question_flow_builder import build_flow
 from summarizer.connector import FlowRun
 from summarizer.web_search import web_search, as_context
 from summarizer.memory_answer import answer_from_memory
+from summarizer.clarify import options_from, answers_question, rejection_message
 
 MAX_SESSION_QUERIES = 5
 HISTORY_LIMIT = 12
@@ -249,6 +250,43 @@ def begin_session(old_session_memory: str = "", user_product_info: str = "",
         if state["selecting"]:
             return {"text": collect_text(resp), "ok": False, "pending": True}
 
+        # the Trade Agent asked a question it needs answered before it can run
+        if ENGINE.clarification_pending(sid):
+            asked = collect_text(resp)
+            opts = options_from(asked) or state["options"][:3]
+
+            if opts:
+                print(f"\n{asked}\n")
+                for i, o in enumerate(opts, 1):
+                    print(f"  {i}. {o}")
+                print("  or type your own answer")
+
+                try:
+                    reply = input("Answer> ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    reply = ""
+
+                if reply.isdigit() and 1 <= int(reply) <= len(opts):
+                    chosen = opts[int(reply) - 1]
+                elif reply:
+                    verdict = answers_question(asked, reply)
+                    if verdict["ok"]:
+                        chosen = reply
+                    else:
+                        chosen = opts[0]
+                        print(rejection_message(verdict["reason"], chosen))
+                else:
+                    chosen = opts[0]
+
+                print(f"-> {chosen}")
+                resp = ENGINE.send(sid, chosen)
+                state["options"] = render(resp) or state["options"]
+                state["selecting"] = ENGINE.scope_pending(sid)
+
+                if state["selecting"]:
+                    return {"text": collect_text(resp), "ok": False, "pending": True}
+
+
         said = collect_text(resp)
         last = resp
 
@@ -365,20 +403,11 @@ def begin_session(old_session_memory: str = "", user_product_info: str = "",
                 route = classify_query(sent, state["memory"])
                 if route == "PERSONAL" and not looks_multi(sent):
                     answer = answer_from_memory(sent, state["memory"])
-                    print(f"\n{answer}\n")
                 else:
                     answer = run_flow(sent)
-
                     if state["selecting"]:
                         history.append({"role": "USER", "content": text})
                         continue
-
-                    print(f"\n{answer}\n")
-
-                if state["selecting"]:
-                    # the flow ended waiting on a pick
-                    history.append({"role": "USER", "content": text})
-                    continue
 
                 print(f"\n{answer}\n")
 

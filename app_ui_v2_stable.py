@@ -46,6 +46,7 @@ from summarizer.web_search import web_search, as_context
 from summarizer.memory_answer import answer_from_memory
 from summarizer.user_summary import build_user_summary
 from summarizer.user_summary_aggregate import aggregate
+from summarizer.clarify import options_from, answers_question, rejection_message
 
 MAX_SESSION_QUERIES = 5
 MAX_ATTEMPTS = 3
@@ -330,6 +331,26 @@ section.main > div.block-container ~ div {
 
 /* ---------- suggested questions ---------- */
 .suggest-title { color:#91a6bf !important; font-size:.78rem; font-weight:700; margin:.8rem 0 .48rem 0; }
+/* ---------- clarification choices ---------- */
+div[data-testid="stVerticalBlock"] div.clarify-zone + div button,
+div.clarify-zone ~ div [data-testid="stButton"] button {
+  background:transparent !important;
+  color:#c7d4e0 !important;
+  border:1px solid rgba(91,140,255,.28) !important;
+  text-align:left !important;
+  font-weight:400 !important;
+  padding:.55rem .9rem !important;
+  margin-bottom:.32rem !important;
+  transition:background .15s ease, border-color .15s ease, color .15s ease;
+}
+div[data-testid="stVerticalBlock"] div.clarify-zone + div button:hover,
+div.clarify-zone ~ div [data-testid="stButton"] button:hover {
+  background:rgba(91,140,255,.16) !important;
+  border-color:rgba(91,140,255,.55) !important;
+  color:#fff !important;
+}
+
+
 
 /* ---------- custom analysis card ---------- */
 .exira-analysis-card {
@@ -756,7 +777,8 @@ def init_state():
     )
 
     d.setdefault("flow_traces", [])        # [{"question","trace"}] per TRADE node
-    d.setdefault("flow_run", None)          # a FlowRun paused on an HS pick
+    d.setdefault("flow_run", None)  
+    d.setdefault("pending_clarify", None)         # {"qid","question","options"} while open
     d.setdefault("last_flow", None)
     d.setdefault("flow_text", "")           # what the user typed
     d.setdefault("flow_sent", "")           # the resolved query that ran
@@ -2555,6 +2577,22 @@ def ui_trade(question: str) -> dict:
             push_turn("assistant", t)
         return {"text": "", "ok": False, "pending": True}
 
+    if ENGINE.clarification_pending(S.sid):
+        asked = "\n".join(t for t in parsed["texts"] if t).strip()
+        for t in parsed["texts"]:
+            push_turn("assistant", t)
+
+        opts = options_from(asked)
+        if not opts:
+            opts = (parsed["options"] or S.options)[:3]   # engine followups
+
+        if not opts:
+            return {"text": asked, "ok": False, "pending": False}
+
+        S.pending_clarify = {"qid": "", "question": asked, "options": opts}
+        # qid is filled in by finish_flow when the run reports the pause
+        return {"text": "", "ok": False, "pending": False, "needs_answer": True}
+
     trace = parsed["trace"]
 
     if parsed["confirm"]:
@@ -2583,6 +2621,10 @@ def finish_flow(out: dict):
     if out["status"] == "needs_hs_pick":
         # ui_trade already showed the question and the options; S.selecting is on
         return
+    if out["status"] == "needs_answer":
+        if S.pending_clarify:
+            S.pending_clarify["qid"] = out.get("qid", "")
+        return
 
     S.flow_run = None
     trace = dict(S.last_trade_trace or {})
@@ -2609,6 +2651,68 @@ def finish_flow(out: dict):
     push_turn("assistant", out["answer"], trace)
     record_query(memory_entry(S.flow_text, S.flow_sent))
 
+def resume_clarification(reply: str):
+    """Send the user's clarification answer back into the paused node."""
+    pending = S.pending_clarify
+    if not pending:
+        return
+
+    options = pending["options"]
+    chosen = ""
+
+    if reply.strip().isdigit() and 1 <= int(reply) <= len(options):
+        chosen = options[int(reply) - 1]
+    else:
+        verdict = answers_question(pending["question"], reply)
+        if verdict["ok"]:
+            chosen = reply.strip()
+        else:
+            chosen = options[0]
+            push_turn("system", rejection_message(verdict["reason"], chosen))
+
+    S.pending_clarify = None
+    push_turn("user", chosen)
+
+    try:
+        resp = ENGINE.send(S.sid, chosen)
+        parsed = consume(resp)
+        if parsed["options"]:
+            S.options = parsed["options"]
+        sync_scope()
+
+        # the answer may have named a new product, which the engine scopes first
+        S.selecting = ENGINE.scope_pending(S.sid)
+        if S.selecting:
+            for t in parsed["texts"]:
+                push_turn("assistant", t)
+            return          # the HS gate in handle_message takes it from here
+
+        # we pause once per node only, so a second question is taken as the answer
+        if ENGINE.clarification_pending(S.sid):
+            asked_again = "\n".join(t for t in parsed["texts"] if t).strip()
+            for t in parsed["texts"]:
+                push_turn("assistant", t)
+            if S.flow_run:
+                finish_flow(S.flow_run.supply_answer(asked_again))
+            return
+
+        if parsed["confirm"]:
+            done = ENGINE.confirm(S.sid, "proceed")
+            parsed = consume(done)
+            if parsed["options"]:
+                S.options = parsed["options"]
+            sync_scope()
+
+        if parsed["trace"]:
+            S.last_trade_trace = parsed["trace"]
+            S.flow_traces.append({"question": chosen, "trace": parsed["trace"]})
+
+        text = "\n".join(t for t in parsed["texts"] if t).strip()
+        if S.flow_run:
+            finish_flow(S.flow_run.supply_answer(text))
+    except Exception as exc:
+        S.flow_run = None
+        push_turn("assistant", f"Error: {exc}")
 
 def start_flow(text: str, sent: str, memory: dict):
     """Build, tag and start a flow for one resolved query."""
@@ -2638,6 +2742,9 @@ def handle_message(text: str, from_list: bool = False):
     ENGINE.inject_memory(S.sid, build_memory())
 
     # ---- an HS domain pick, possibly in the middle of a flow ----
+    if S.pending_clarify:
+        resume_clarification(text)
+        return
     if S.selecting:
         try:
             apply_engine_response(ENGINE.send(S.sid, text))
@@ -3820,7 +3927,18 @@ def page_chat():
             else:
                 st.write(turn["content"])
 
-    if S.options:
+    if S.pending_clarify:
+        with st.container(border=True):
+            st.markdown("**Pick one, or type your own answer below**")
+            st.markdown("<div class='clarify-zone'>", unsafe_allow_html=True)
+            for i, opt in enumerate(S.pending_clarify["options"], 1):
+                if st.button(f"{i}.  {opt}", key=f"clar_{len(S.turns)}_{i}",
+                             use_container_width=True):
+                    S.pending_input = (opt, False)
+                    st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    if S.options and not S.pending_clarify:
         st.markdown(
             '<div class="suggest-title">'
             + ("Select an HS domain" if S.selecting else "Suggested next questions")
@@ -3839,11 +3957,12 @@ def page_chat():
                 S.pending_input = (opt, not S.selecting)
                 st.rerun()
 
-    placeholder = (
-        "Pick a domain above, or type HS codes like: HS 52, 61"
-        if S.selecting
-        else "Ask EXIRA a trade question…"
-    )
+    if S.selecting:
+        placeholder = "Pick a domain above, or type HS codes like: HS 52, 61"
+    elif S.pending_clarify:
+        placeholder = "Pick an option above, or type your own answer…"
+    else:
+        placeholder = "Ask EXIRA a trade question…"
 
     typed = st.chat_input(placeholder)
 

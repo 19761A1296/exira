@@ -11,20 +11,36 @@
         # to the engine itself, then:
         out = run.resume()
 
+    while out["status"] == "needs_answer":
+        # the caller shows the engine's clarifying question as a short list,
+        # takes the user's reply, then:
+        out = run.supply_answer(text_the_engine_returned)
+
     out["status"] == "done"     -> out["answer"] is the combined reply
     out["status"] == "stopped"  -> out["answer"] explains why it stopped
 
-FlowRun is resumable on purpose. The engine can interrupt a node to ask which
-HS industry a product belongs to, and in Streamlit that pause has to survive a
-rerun, so the object is kept in session state rather than the call stack.
+FlowRun is resumable on purpose. The engine can interrupt a node twice over -
+once to ask which HS industry a product belongs to, once to ask what an
+ambiguous question actually means - and in Streamlit those pauses have to
+survive a rerun, so the object is kept in session state rather than the call
+stack.
+
+The two pauses differ in who resolves them:
+
+    needs_hs_pick   the CALLER sends the pick to the engine and calls resume(),
+                    which retries the same node from the top.
+    needs_answer    the CALLER sends the clarification answer to the engine,
+                    gets the real reply back, and hands that text to
+                    supply_answer(), which records it and moves on.
 
 HANDLERS — injected by the caller, so this module imports no engine and no web.
 
     personal(question) -> str
 
-    trade(question)    -> {"text": str,        what to show and pass on
-                           "ok": bool,         True only if data came back
-                           "pending": bool}    True if the engine wants an HS pick
+    trade(question)    -> {"text": str,          what to show and pass on
+                           "ok": bool,           True only if data came back
+                           "pending": bool,      True if the engine wants an HS pick
+                           "needs_answer": bool} True if the engine asked a question
 
     web(question)      -> str
 
@@ -260,6 +276,7 @@ class FlowRun:
         self.answers = {}          # qid -> text shown to the user
         self.asked = {}            # qid -> the question actually sent
         self.failed = []           # qids that produced nothing
+        self.clarified = set()     # qids that already paused for a clarification
         self.position = 0          # index into self.queue
         self.stopped_reason = ""
 
@@ -269,7 +286,39 @@ class FlowRun:
         return self._walk()
 
     def resume(self) -> dict:
-        """Call after the caller has handled a pause. Retries the same node."""
+        """Call after an HS domain pick. Retries the same node from the top."""
+        return self._walk()
+
+    def supply_answer(self, text: str) -> dict:
+        """Record the paused node's answer and carry on.
+
+        Call this after a clarification: the caller sent the user's reply to the
+        engine, got the real answer back, and passes that text in here. An empty
+        text means the node produced nothing, which follows the usual
+        empty-node rules.
+        """
+        if self.position >= len(self.queue):
+            return self._done()
+
+        qid = self.queue[self.position]
+        text = (text or "").strip()
+
+        if text:
+            self.answers[qid] = text
+            _log(f"{qid} answered after a clarification")
+        else:
+            self.failed.append(qid)
+            blocked = dependants_of(self.flow, qid)
+            if blocked:
+                self.stopped_reason = (
+                    "Nothing came back for that part, and the rest of your "
+                    "question depends on it, so I stopped there."
+                )
+                _log(f"{qid} empty after a clarification and {blocked} depend on it")
+                return self._stopped()
+            _log(f"{qid} empty after a clarification, nothing depends on it")
+
+        self.position += 1
         return self._walk()
 
     # ---- the walk -----------------------------------------------
@@ -287,6 +336,14 @@ class FlowRun:
             if outcome["pending"]:
                 _log(f"{qid} paused for an HS domain pick")
                 return {"status": "needs_hs_pick", "qid": qid,
+                        "question": question, "answer": "",
+                        "answers": dict(self.answers)}
+
+            if outcome.get("needs_answer"):
+                # one clarification per node; a second one is treated as the answer
+                self.clarified.add(qid)
+                _log(f"{qid} paused for a clarification")
+                return {"status": "needs_answer", "qid": qid,
                         "question": question, "answer": "",
                         "answers": dict(self.answers)}
 
@@ -336,7 +393,7 @@ class FlowRun:
         return node["text"]
 
     def _run_node(self, node: dict, question: str) -> dict:
-        """Dispatch one node. Returns {'text', 'pending'}."""
+        """Dispatch one node. Returns {'text', 'pending', 'needs_answer'}."""
         route = node.get("route", "TRADE")
         _log(f"{node['id']} {route}", question)
 
@@ -344,19 +401,26 @@ class FlowRun:
             if route == "PERSONAL":
                 fn = self.handlers.get("personal")
                 return {"text": (fn(question) if fn else "").strip(),
-                        "pending": False}
+                        "pending": False, "needs_answer": False}
 
             if route == "WEB" and self.multi:
                 # grounding comes from the TRADE nodes this one depends on
                 fn = self.handlers.get("web")
                 return {"text": (fn(question) if fn else "").strip(),
-                        "pending": False}
+                        "pending": False, "needs_answer": False}
 
             # TRADE, and a single-node WEB flow: the engine runs first
             fn = self.handlers.get("trade")
-            result = fn(question) if fn else {"text": "", "ok": False, "pending": False}
+            result = fn(question) if fn else {"text": "", "ok": False,
+                                              "pending": False}
             if result.get("pending"):
-                return {"text": "", "pending": True}
+                return {"text": "", "pending": True, "needs_answer": False}
+
+            # the engine asked a question back. Pause once per node; if it asks
+            # again after the user answered, take the question as the answer and
+            # let the flow finish rather than looping.
+            if result.get("needs_answer") and node["id"] not in self.clarified:
+                return {"text": "", "pending": False, "needs_answer": True}
 
             text = (result.get("text") or "").strip()
 
@@ -366,12 +430,12 @@ class FlowRun:
                 if extra:
                     text = f"{text}\n\n{extra}".strip() if text else extra
 
-            return {"text": text, "pending": False}
+            return {"text": text, "pending": False, "needs_answer": False}
 
         except Exception as exc:
             print(f"connector: {node['id']} handler failed:",
                   type(exc).__name__, exc)
-            return {"text": "", "pending": False}
+            return {"text": "", "pending": False, "needs_answer": False}
 
     # ---- finishing ----------------------------------------------
 
@@ -435,7 +499,8 @@ class FlowRun:
 #   python -m summarizer.connector
 #
 # Stub handlers, so the real classifier, builder, rewrite and combine all run
-# without touching Snowflake or sonar. Watch the rewritten questions.
+# without touching Snowflake or sonar. Watch the rewritten questions, and the
+# third query exercises the clarification pause.
 
 if __name__ == "__main__":
     from summarizer.question_flow_builder import build_flow
@@ -459,10 +524,9 @@ if __name__ == "__main__":
 
     def stub_trade(q):
         print(f"      [trade]    <- {q}")
-        # pretend the engine found the top import
         return {"text": "The user's largest import is polyester fabric, HS 540752, "
                         "from Ningbo, China.",
-                "ok": True, "pending": False}
+                "ok": True, "pending": False, "needs_answer": False}
 
     def stub_web(q):
         print(f"      [web]      <- {q}")
@@ -484,3 +548,35 @@ if __name__ == "__main__":
         out = run.start()
         print(f"\n  status: {out['status']}")
         print(f"\n  ANSWER:\n{out['answer']}\n")
+
+    # ---- the clarification pause, with a trade stub that asks once ----
+    print(f"\n{'='*70}\nCLARIFICATION PAUSE\n{'='*70}")
+
+    state = {"asked": False}
+
+    def stub_trade_asks(q):
+        print(f"      [trade]    <- {q}")
+        if not state["asked"]:
+            state["asked"] = True
+            print("      [trade]    -> asks a clarifying question")
+            return {"text": "", "ok": False, "pending": False, "needs_answer": True}
+        return {"text": "Germany, Netherlands and Canada show the strongest demand.",
+                "ok": True, "pending": False, "needs_answer": False}
+
+    flow = tag_flow(build_flow("Show me the best markets for cotton", MEMORY), MEMORY)
+    run = FlowRun(flow, MEMORY,
+                  {**HANDLERS, "trade": stub_trade_asks},
+                  original_question="Show me the best markets for cotton")
+
+    out = run.start()
+    print(f"\n  status: {out['status']}  (expected needs_answer)")
+
+    if out["status"] == "needs_answer":
+        # the caller would show options, take the reply, send it to the engine,
+        # and pass the engine's real answer back in
+        out = run.supply_answer(
+            "Germany, Netherlands and Canada show the strongest demand."
+        )
+
+    print(f"  status: {out['status']}  (expected done)")
+    print(f"\n  ANSWER:\n{out['answer']}\n")
