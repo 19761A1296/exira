@@ -12,6 +12,7 @@ from summarizer.connector import FlowRun
 from summarizer.web_search import web_search, as_context
 from summarizer.memory_answer import answer_from_memory
 from summarizer.clarify import options_from, answers_question, rejection_message
+from summarizer.answer_recall import summarise_answers, capture
 
 MAX_SESSION_QUERIES = 5
 HISTORY_LIMIT = 12
@@ -203,6 +204,8 @@ def begin_session(old_session_memory: str = "", user_product_info: str = "",
     append_queries: list[str] = []
     persona_turns: list[dict] = []
     history: list[dict] = []          # [{"role": "USER"|"EXIRA", "content": ...}]
+    history: list[dict] = []          # [{"role": "USER"|"EXIRA", "content": ...}]
+    answers: list[dict] = []          # [{"question","answer"}] this session only
     persona = load_persona(user_id) if user_id else None
 
     memory = build_memory(user_product_info, old_session_memory, append_queries, persona)
@@ -398,6 +401,16 @@ def begin_session(old_session_memory: str = "", user_product_info: str = "",
                 if resolution["dropped_note"]:
                     print(f"\n{resolution['dropped_note']}")
 
+                # asking about an answer they already have: nothing else runs
+                if resolution.get("recall"):
+                    answer = summarise_answers(
+                        text, answers, resolution.get("recall_scope", "last"))
+                    print(f"\n{answer}\n")
+                    history.append({"role": "USER", "content": text})
+                    history.append({"role": "EXIRA", "content": answer})
+                    history = history[-HISTORY_LIMIT:]
+                    continue
+
                 sent = resolution["resolved_query"] or text
 
                 route = classify_query(sent, state["memory"])
@@ -414,6 +427,7 @@ def begin_session(old_session_memory: str = "", user_product_info: str = "",
             history.append({"role": "USER", "content": text})
             if answer:
                 history.append({"role": "EXIRA", "content": answer})
+                capture(answers, text, answer)
 
         except Exception as exc:
             print(f"  error: {exc}\n")
@@ -422,7 +436,7 @@ def begin_session(old_session_memory: str = "", user_product_info: str = "",
         history = history[-HISTORY_LIMIT:]
 
         # ---- memory upkeep, only after a completed question ----
-        append_queries.append(memory_entry(text, sent))
+        append_queries.append(memory_entry(text, ""))
         if len(append_queries) > MAX_SESSION_QUERIES:
             append_queries = [query_summary(append_queries)[0]]
 

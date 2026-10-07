@@ -37,7 +37,8 @@ HISTORY_TURNS = int(os.getenv("ANALYZER_HISTORY_TURNS", "8"))
 TURN_CHARS = int(os.getenv("ANALYZER_TURN_CHARS", "1200"))
 PRINT_ANALYZER = (os.getenv("PRINT_ANALYZER", "1") or "").strip() not in {"0", "false", "False", ""}
 
-RELATIONS = {"CONTINUATION", "REFINEMENT", "NEW_INTENT", "MIXED", "OFF_TOPIC"}
+RELATIONS = {"CONTINUATION", "REFINEMENT", "NEW_INTENT", "MIXED", "OFF_TOPIC",
+             "ANSWER_RECALL"}
 
 DEFAULT_BLOCK_MESSAGE = (
     "That one is outside what I cover. I work on trade: buyers and suppliers, "
@@ -107,6 +108,7 @@ Return strict JSON only. No markdown fences, no prose before or after.
   }},
   "resolved_query": "One self-contained instruction for Exira, with every dropped part removed. Empty when OFF_TOPIC.",
   "message": "Only for OFF_TOPIC: one or two lines to show the user. Empty otherwise.",
+  "recall_scope": "Only for ANSWER_RECALL: last | all. Empty otherwise.",
   "dropped_note": "Only when you dropped part of a multi-part message: one short line naming what you skipped. Empty otherwise.",
   "unresolved_slots": ["Anything still genuinely missing, or empty array"],
   "notes": "One short line of reasoning. Internal only."
@@ -147,6 +149,37 @@ WHEN YOU SET OFF_TOPIC
   the user directly as "you". Be brief and friendly, never preachy, never
   apologetic at length. Do not answer the off-topic question, not even partly.
 - carried_context stays empty, unresolved_slots stays empty
+
+ANSWER_RECALL
+
+The user is asking about something you already told them, not asking a new
+trade question. Set this when they want an earlier ANSWER summarised, repeated,
+shortened or recapped.
+
+  "summarise that"                     -> last
+  "what did you just say"              -> last
+  "shorten the above"                  -> last
+  "explain that again, briefly"        -> last
+  "summarise this session"             -> all
+  "recap everything so far"            -> all
+  "give me the whole conversation"     -> all
+  "what have you told me today"        -> all
+
+recall_scope is "last" when they mean the previous answer, and "all" when they
+mean the session as a whole. When it is not clear, use "last".
+
+WHEN YOU SET ANSWER_RECALL
+- relation = "ANSWER_RECALL"
+- recall_scope = "last" or "all"
+- resolved_query = ""
+- message, dropped_note, carried_context and unresolved_slots stay empty
+
+NOT ANSWER_RECALL
+- "what did I ask earlier" is about the user's own QUESTIONS, not your answers.
+- "summarise my trade profile" is about their company.
+- "summarise demand for cotton" is a new trade question.
+Those three stay NEW_INTENT. The test is whether they are asking you to go back
+over something you already said.
 
 MULTI-PART MESSAGES
 
@@ -719,6 +752,30 @@ GOOD
   "unresolved_slots": [],
   "notes": "Part two depends entirely on part one, which is off-topic, so nothing survives."}}
 
+Example 14 — asking about an earlier answer (ANSWER_RECALL)
+
+History
+USER: "Who are the top buyers of HS 610910?"
+EXIRA: "Over the last 24 months the top buyers were ..."
+Current message: "shorten that for me"
+
+GOOD
+{{"relation": "ANSWER_RECALL",
+  "confidence": "high",
+  "carried_context": {{"original_ask": null, "entities": [], "filters": [], "resolved_by_this_turn": null}},
+  "resolved_query": "",
+  "message": "",
+  "recall_scope": "last",
+  "dropped_note": "",
+  "unresolved_slots": [],
+  "notes": "Asks for the previous answer to be condensed, not for new data."}}
+
+BAD
+{{"relation": "REFINEMENT",
+  "resolved_query": "Who are the top buyers of HS 610910, briefly?"}}
+Why wrong: this would run the whole query again to produce something the user
+has already been told.
+
 FAILURE MODES TO AVOID
 
 Amnesia            — treating a fragment as a fresh question and answering only it.
@@ -811,6 +868,8 @@ def passthrough(message: str, reason: str = "") -> dict:
         "message": "",
         "dropped_note": "",
         "blocked": False,
+        "recall": False,
+        "recall_scope": "",
         "unresolved_slots": [],
         "notes": reason or "passthrough",
     }
@@ -822,13 +881,26 @@ def _normalize(parsed: dict, message: str) -> dict:
         relation = "NEW_INTENT"
 
     blocked = relation == "OFF_TOPIC"
+    recall = relation == "ANSWER_RECALL"
+
+    recall_scope = str(parsed.get("recall_scope") or "").lower().strip()
+    if recall and recall_scope not in {"last", "all"}:
+        recall_scope = "last"            # the safer default
+    if not recall:
+        recall_scope = ""
 
     resolved = str(parsed.get("resolved_query") or "").strip()
     block_msg = str(parsed.get("message") or "").strip()
 
     dropped_note = str(parsed.get("dropped_note") or "").strip()
 
-    if blocked:
+    if recall:
+        # nothing downstream runs, so everything else is cleared
+        resolved = ""
+        block_msg = ""
+        dropped_note = ""
+
+    elif blocked:
       resolved = ""
       dropped_note = ""          # a full block is not a partial drop
 
@@ -860,7 +932,7 @@ def _normalize(parsed: dict, message: str) -> dict:
 
 
     carried = parsed.get("carried_context")
-    if not isinstance(carried, dict) or blocked:
+    if not isinstance(carried, dict) or blocked or recall:
         carried = {}
 
     def as_list(value):
@@ -887,7 +959,10 @@ def _normalize(parsed: dict, message: str) -> dict:
         "message": block_msg,
         "dropped_note": dropped_note,
         "blocked": blocked,
-        "unresolved_slots": [] if blocked else as_list(parsed.get("unresolved_slots")),
+        "recall": recall,
+        "recall_scope": recall_scope,
+        "unresolved_slots": [] if (blocked or recall)
+                            else as_list(parsed.get("unresolved_slots")),
         "notes": str(parsed.get("notes") or "").strip(),
     }
 
@@ -898,6 +973,8 @@ def _log(message: str, result: dict) -> dict:
               f"({result['confidence']}) | {message[:]}")
         if result["blocked"]:
             print(f"    BLOCKED: {result['message'][:]}")
+        elif result["recall"]:
+            print(f"    RECALL  : scope={result['recall_scope']}")
         else:
             print(f"    resolved: {result['resolved_query'][:]}")
             if result["dropped_note"]:

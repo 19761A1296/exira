@@ -47,6 +47,7 @@ from summarizer.memory_answer import answer_from_memory
 from summarizer.user_summary import build_user_summary
 from summarizer.user_summary_aggregate import aggregate
 from summarizer.clarify import options_from, answers_question, rejection_message
+from summarizer.answer_recall import summarise_answers, capture, preview
 
 MAX_SESSION_QUERIES = 5
 MAX_ATTEMPTS = 3
@@ -422,6 +423,19 @@ div.clarify-zone ~ div [data-testid="stButton"] button:hover {
   border-radius:6px; background:rgba(91,140,255,.22); color:#dbeafe !important; font-size:.67rem; font-weight:800;
 }
 
+.exira-answer-card {
+  background:#081522; border:1px solid rgba(148,163,184,.14); border-radius:9px;
+  padding:.6rem .68rem; margin-bottom:.42rem;
+}
+.exira-answer-q {
+  color:#bfd2e8 !important; font-size:.74rem; font-weight:700;
+  line-height:1.4; margin-bottom:.3rem;
+}
+.exira-answer-a {
+  color:#9db0c6 !important; font-size:.72rem; line-height:1.52;
+  overflow-wrap:anywhere;
+}
+
 /* ---------- tabs/debug blocks ---------- */
 [data-baseweb="tab-list"] { background:transparent !important; gap:.15rem !important; }
 button[role="tab"] { background:transparent !important; color:#aebed1 !important; }
@@ -784,6 +798,7 @@ def init_state():
     d.setdefault("flow_sent", "")           # the resolved query that ran
     d.setdefault("last_trade_trace", None)
     d.setdefault("last_web", None)
+    d.setdefault("answers", [])             # [{"question","answer"}] this session only
 
     # onboarding wizard
 
@@ -2616,6 +2631,12 @@ FLOW_HANDLERS = {"personal": ui_personal, "trade": ui_trade, "web": ui_web}
 
 # ─────────────── the flow ───────────────
 
+def last_assistant_text() -> str:
+    """The newest assistant turn, for capturing the button path."""
+    return next((t["content"] for t in reversed(S.turns)
+                 if t["role"] == "assistant" and t["content"]), "")
+
+
 def finish_flow(out: dict):
     """Called with a FlowRun result. Pushes the answer, or waits for a pick."""
     if out["status"] == "needs_hs_pick":
@@ -2650,6 +2671,7 @@ def finish_flow(out: dict):
 
     push_turn("assistant", out["answer"], trace)
     record_query(memory_entry(S.flow_text, S.flow_sent))
+    capture(S.answers, S.flow_text, out["answer"])
 
 def resume_clarification(reply: str):
     """Send the user's clarification answer back into the paused node."""
@@ -2781,6 +2803,7 @@ def handle_message(text: str, from_list: bool = False):
             push_turn("assistant", f"Error: {exc}")
             return
         record_query(memory_entry(text, sent))
+        capture(S.answers, text, last_assistant_text())
         return
 
     # ---- resolve, then split, tag and walk ----
@@ -2789,6 +2812,16 @@ def handle_message(text: str, from_list: bool = False):
     if S.last_resolution["blocked"]:
         push_turn("assistant", S.last_resolution["message"],
                   {"route": "BLOCKED", "resolution": S.last_resolution})
+        return
+
+    # asking about an answer they already have: nothing downstream runs
+    if S.last_resolution.get("recall"):
+        S.last_route = "ANSWER_RECALL"
+        S.last_flow = None
+        answer = summarise_answers(text, S.answers,
+                                   S.last_resolution.get("recall_scope", "last"))
+        push_turn("assistant", answer,
+                  {"route": "ANSWER_RECALL", "resolution": S.last_resolution})
         return
 
     if S.last_resolution["dropped_note"]:
@@ -2857,6 +2890,12 @@ def run_confirm(
 
             record_query(
                 last_user
+            )
+
+            capture(
+                S.answers,
+                last_user,
+                last_assistant_text()
             )
 
 
@@ -3423,6 +3462,21 @@ def sidebar():
                 )
             else:
                 st.caption("No onboarding report for this user.")
+
+        with st.expander(f"💬 Captured responses ({len(S.answers)})"):
+            if S.answers:
+                for item in reversed(S.answers):
+                    question = html.escape(str(item.get("question") or "(this session)"))
+                    answer = html.escape(preview(item.get("answer", ""), 300))
+                    st.markdown(
+                        '<div class="exira-answer-card">'
+                        f'<div class="exira-answer-q">{question}</div>'
+                        f'<div class="exira-answer-a">{answer}</div>'
+                        '</div>',
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.caption("No responses captured yet.")
 
         st.divider()
 
