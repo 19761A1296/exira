@@ -3286,6 +3286,32 @@ def page_company_picker():
                     S.companies = db.list_companies(S.userid)
                     st.rerun()
 
+            # the onboarding report is written once and lives with the company
+            report = db.get_onboarding_report(company["company_id"])
+            with st.expander("📋 Onboarding report"):
+                if report:
+                    text = json.dumps(report, indent=2, ensure_ascii=False,
+                                      default=str) if isinstance(report, (dict, list)) \
+                        else str(report)
+                    st.markdown(
+                        '<div class="exira-debug-block">'
+                        f'{html.escape(text)}'
+                        '</div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.caption("No report was stored for this company.")
+
+                profile = company.get("company_profile")
+                if profile:
+                    st.markdown("**Company profile**")
+                    st.markdown(
+                        '<div class="exira-dev-content">'
+                        f'{html.escape(str(profile))}'
+                        '</div>',
+                        unsafe_allow_html=True,
+                    )
+
     st.divider()
 
     if free > 0:
@@ -3611,17 +3637,7 @@ def sidebar():
             else:
                 st.caption("No persona loaded.")
 
-        with st.expander("📋 Onboarding report"):
-            if S.report:
-                report_text = json.dumps(S.report, indent=2, ensure_ascii=False, default=str)
-                st.markdown(
-                    '<div class="exira-debug-block">'
-                    f'{html.escape(report_text)}'
-                    '</div>',
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.caption("No onboarding report for this user.")
+        # the onboarding report lives on the company picker, not here
 
         with st.expander(f"💬 Captured responses ({len(S.answers)})"):
             if S.answers:

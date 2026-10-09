@@ -2,6 +2,7 @@
 
     users      one row per person
       └─ companies   up to 5 per user      slot 1..5    the company card
+           ├─ onboarding_reports   exactly one per company, written once
            └─ sessions   up to 10 per company  slot 1..10   summary, persona, scope
                 └─ answers   newest 20 per session         question + answer
 
@@ -112,6 +113,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     UNIQUE (company_id, slot)
 );
 
+CREATE TABLE IF NOT EXISTS onboarding_reports (
+    company_id INTEGER PRIMARY KEY REFERENCES companies(company_id) ON DELETE CASCADE,
+    report     TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS answers (
     answer_id   INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id  INTEGER NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
@@ -186,13 +193,22 @@ def create_company(user_id, company_name, company_profile="",
         try:
             cur = conn.execute(
                 "INSERT INTO companies (user_id, slot, company_name, company_profile,"
-                " onboarding_report, created_at, last_used_at)"
-                " VALUES (?,?,?,?,?,?,?)",
-                (user_id, slot, str(company_name),
-                 _to_text(company_profile), _to_text(onboarding_report), now, now))
+                " created_at, last_used_at) VALUES (?,?,?,?,?,?)",
+                (user_id, slot, str(company_name), _to_text(company_profile),
+                 now, now))
         except sqlite3.IntegrityError:
             return None                 # same company name for this user
-        return cur.lastrowid
+
+        company_id = cur.lastrowid
+
+        if onboarding_report:
+            # written once, at onboarding, and never touched again
+            conn.execute(
+                "INSERT OR IGNORE INTO onboarding_reports"
+                " (company_id, report, created_at) VALUES (?,?,?)",
+                (company_id, _to_text(onboarding_report), now))
+
+        return company_id
 
 
 def list_companies(user_id) -> list:
@@ -231,7 +247,7 @@ def get_company(company_id) -> dict | None:
         "slot": row["slot"],
         "company_name": row["company_name"],
         "company_profile": _from_text(row["company_profile"]),
-        "onboarding_report": _from_text(row["onboarding_report"]),
+        "onboarding_report": get_onboarding_report(row["company_id"]),
         "created_at": row["created_at"],
         "last_used_at": row["last_used_at"],
     }
@@ -262,6 +278,28 @@ def delete_company(company_id) -> bool:
     with get_conn() as conn:
         cur = conn.execute("DELETE FROM companies WHERE company_id = ?", (company_id,))
     return cur.rowcount > 0
+
+
+def save_onboarding_report(company_id, report) -> bool:
+    """Write the report once. Later calls are ignored, so it cannot be lost."""
+    if not report:
+        return False
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO onboarding_reports (company_id, report, created_at)"
+            " VALUES (?,?,?)",
+            (company_id, _to_text(report), _now()))
+    return cur.rowcount > 0
+
+
+def get_onboarding_report(company_id):
+    """The report as stored, or None when the company never had one."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT report FROM onboarding_reports WHERE company_id = ?",
+            (company_id,)
+        ).fetchone()
+    return _from_text(row["report"]) if row else None
 
 
 def company_slots_free(user_id) -> int:
