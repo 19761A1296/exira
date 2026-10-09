@@ -798,6 +798,13 @@ def init_state():
     d.setdefault("flow_sent", "")           # the resolved query that ran
     d.setdefault("last_trade_trace", None)
     d.setdefault("last_web", None)
+    d.setdefault("company_id", None)
+    d.setdefault("session_id", None)
+    d.setdefault("company_slot", None)
+    d.setdefault("session_slot", None)
+    d.setdefault("company_name", "")
+    d.setdefault("companies", [])
+    d.setdefault("sessions", [])
     d.setdefault("answers", [])             # [{"question","answer"}] this session only
 
     # onboarding wizard
@@ -1082,23 +1089,30 @@ def onb_build_profile(
         tag="ui-onboarding"
     )
 
-    S.user_product_info = (
-        summary
-        or ""
+    # the profile belongs to a company now, not to the user
+    name = (company_name or S.onb_text or "Company").strip()
+    cid = db.create_company(
+        S.userid,
+        company_name=name,
+        company_profile=summary or "",
+        onboarding_report=S.report or {},
     )
 
+    if cid is None:
+        st.error(
+            "That company could not be added — you may already have 5, "
+            "or a company with that name."
+        )
+        return
+
+    S.company_id = cid
+    S.company_name = name
+    S.user_product_info = summary or ""
     S.old_session = ""
+    S.persona = None
 
-    S.persona = load_persona(
-        S.userid
-    )
-
-    S.candidates = collect_hs_from_memory(
-        build_memory(),
-        HS2_DOMAIN_MAP
-    )
-
-    S.stage = "scope"
+    # a brand new company has no sessions, so pick or create one next
+    S.stage = "session_picker"
 
 
 def onb_fail_or_retry(
@@ -1131,16 +1145,13 @@ def onb_fail_or_retry(
             "Continue without a profile"
         ):
 
+            # no profile was built, so there is no company to attach it to
             S.user_product_info = ""
             S.old_session = ""
-
-            S.persona = load_persona(
-                S.userid
-            )
-
+            S.persona = None
             S.candidates = []
-
-            S.stage = "scope"
+            S.companies = db.list_companies(S.userid)
+            S.stage = "company_picker" if S.companies else "login"
 
             st.rerun()
 
@@ -2293,7 +2304,7 @@ def record_query(
                 f"{exc}"
             )
 
-    if S.userid:
+    if S.session_id is not None:
 
         S.persona_turns.append(
             {
@@ -2309,7 +2320,7 @@ def record_query(
 
             S.persona = (
                 build_and_save_persona(
-                    S.userid,
+                    S.session_id,
                     S.persona_turns,
                     recent_turns=1,
                     persona=S.persona
@@ -2672,6 +2683,8 @@ def finish_flow(out: dict):
     push_turn("assistant", out["answer"], trace)
     record_query(memory_entry(S.flow_text, S.flow_sent))
     capture(S.answers, S.flow_text, out["answer"])
+    if S.session_id is not None:
+        db.save_answer(S.session_id, S.flow_text, out["answer"])
 
 def resume_clarification(reply: str):
     """Send the user's clarification answer back into the paused node."""
@@ -2803,7 +2816,10 @@ def handle_message(text: str, from_list: bool = False):
             push_turn("assistant", f"Error: {exc}")
             return
         record_query(memory_entry(text, sent))
-        capture(S.answers, text, last_assistant_text())
+        answer_text = last_assistant_text()
+        capture(S.answers, text, answer_text)
+        if S.session_id is not None:
+            db.save_answer(S.session_id, text, answer_text)
         return
 
     # ---- resolve, then split, tag and walk ----
@@ -2892,11 +2908,14 @@ def run_confirm(
                 last_user
             )
 
+            answer_text = last_assistant_text()
             capture(
                 S.answers,
                 last_user,
-                last_assistant_text()
+                answer_text
             )
+            if S.session_id is not None:
+                db.save_answer(S.session_id, last_user, answer_text)
 
 
 def remember_hs(
@@ -3055,185 +3074,310 @@ def page_login():
 
     _hero(
         "Welcome to EXIRA",
-
-        "Your trade-intelligence workspace "
-        "for products, markets, buyers, "
+        "Your trade-intelligence workspace for products, markets, buyers, "
         "suppliers and shipment analytics.",
-
         "Secure workspace",
     )
 
-    left, center, right = st.columns(
-        [1.15, 1.7, 1.15]
-    )
+    left, center, right = st.columns([1.15, 1.7, 1.15])
 
     with center:
-
-        with st.container(
-            border=True
-        ):
-
-            st.markdown(
-                "### Sign in"
-            )
-
+        with st.container(border=True):
+            st.markdown("### Sign in")
             st.caption(
-                "Enter your user ID "
-                "to load your company context "
-                "and continue."
+                "Enter your user ID to load your companies and continue."
             )
 
             try:
-
                 db.init_db()
-
             except Exception as exc:
-
-                st.error(
-                    f"Database init failed: "
-                    f"{exc}"
-                )
+                st.error(f"Database init failed: {exc}")
 
             userid = st.text_input(
                 "User ID",
                 key="login_userid",
-                placeholder=
-                    "e.g. baxter_user_001"
+                placeholder="e.g. baxter_user_001",
             ).strip()
 
-            if not st.button(
-                "Continue to EXIRA",
-                type="primary",
-                use_container_width=True
-            ):
-
+            if not st.button("Continue to EXIRA", type="primary",
+                             use_container_width=True):
                 return
 
             if not userid:
-
-                st.error(
-                    "User id cannot be empty."
-                )
-
+                st.error("User id cannot be empty.")
                 return
 
-            S.userid = (
-                userid
-            )
+            S.userid = userid
 
             try:
-
-                exists = (
-                    db.user_exists(
-                        userid
-                    )
-                )
-
+                db.ensure_user(userid)
+                S.companies = db.list_companies(userid)
             except Exception as exc:
-
-                st.error(
-                    f"Lookup failed: "
-                    f"{exc}"
-                )
-
+                st.error(f"Lookup failed: {exc}")
                 return
 
-            if exists:
-
-                S.user_product_info = (
-                    db.get_product_info(
-                        userid
-                    )
-                    or ""
-                )
-
-                S.old_session = (
-                    db.get_past_sesion_info(
-                        userid
-                    )
-                    or ""
-                )
-
-                S.persona = (
-                    load_persona(
-                        userid
-                    )
-                )
-
-                S.candidates = (
-                    collect_hs_from_memory(
-                        build_memory(),
-                        HS2_DOMAIN_MAP
-                    )
-                )
-
-                S.stage = "scope"
-
-            else:
-
-                S.stage = (
-                    "onboarding"
-                )
-
+            # a user with no company has to onboard one first
+            S.stage = "company_picker" if S.companies else "onboarding"
             st.rerun()
-
 
 # =========================================================
 # START SCOPE
 # =========================================================
 
-def begin_with(
-    choice: str
-):
+def begin_with(choice: str):
+    """Create a session for the chosen scope, then open the chat."""
+    code = re.sub(r"[.\-\s]", "", choice)
 
-    code = re.sub(
-        r"[.\-\s]",
-        "",
-        choice
-    )
-
-    if re.fullmatch(
-        r"\d{2,10}",
-        code
-    ):
-
+    if re.fullmatch(r"\d{2,10}", code):
         S.hs_code = code
-
-        S.scope_label = (
-            f"HS {code}"
-        )
-
-        remember_hs(
-            code
-        )
-
-        opening = (
-            f"HS {code}"
-        )
-
+        S.scope_label = f"HS {code}"
+        remember_hs(code)
+        opening = f"HS {code}"
     else:
-
         S.hs_code = None
+        S.scope_label = choice
+        opening = choice
 
-        S.scope_label = (
-            choice
+    if S.session_id is None:
+        sid = db.create_session(
+            S.company_id,
+            scope_label=S.scope_label,
+            hs_code=S.hs_code or "",
         )
+        if sid is None:
+            st.error("That company already has 10 sessions. Delete one first.")
+            S.stage = "session_picker"
+            return
 
-        opening = (
-            choice
-        )
+        S.session_id = sid
+        row = db.get_session(sid)
+        S.session_slot = row["slot"] if row else None
+        S.persona = load_persona(sid)
+    else:
+        db.save_session(S.session_id, scope_label=S.scope_label,
+                        hs_code=S.hs_code or "")
+
+    S.stage = "chat"
+    start_engine_session(opening)
+    S.scope_history = [S.scope_label] if S.scope_label else []
+
+# =========================================================
+# COMPANY AND SESSION PICKERS
+# =========================================================
+
+def open_company(company_id: int):
+    """Load a company and move to its session list."""
+    company = db.get_company(company_id)
+    if not company:
+        st.error("That company is no longer there.")
+        S.companies = db.list_companies(S.userid)
+        return
+
+    S.company_id = company_id
+    S.company_slot = company["slot"]
+    S.company_name = company["company_name"]
+    S.user_product_info = company["company_profile"] or ""
+
+    # a company switch resets everything below it
+    S.session_id = None
+    S.session_slot = None
+    S.old_session = ""
+    S.persona = None
+    S.answers = []
+    S.turns = []
+    S.append_queries = []
+    S.scope_label = ""
+    S.scope_history = []
+    S.hs_code = None
+    S.options = []
+    S.candidates = collect_hs_from_memory(build_memory(), HS2_DOMAIN_MAP)
+
+    db.touch_company(company_id)
+    S.sessions = db.list_sessions(company_id)
+    S.stage = "session_picker"
+
+
+def resume_session(session_id: int):
+    """Reopen a past session: summary, persona, scope, answers and chat."""
+    row = db.get_session(session_id)
+    if not row:
+        st.error("That session is no longer there.")
+        S.sessions = db.list_sessions(S.company_id)
+        return
+
+    S.session_id = session_id
+    S.session_slot = row["slot"]
+    S.old_session = row["session_summary"] or ""
+    S.persona = load_persona(session_id)
+    S.scope_label = row["scope_label"] or ""
+    S.hs_code = row["hs_code"]
+    S.scope_history = [S.scope_label] if S.scope_label else []
+
+    # rebuild the chat window from the stored question/answer pairs
+    S.answers = db.get_answers(session_id)
+    S.turns = []
+    for item in S.answers:
+        if item.get("question"):
+            push_turn("user", item["question"])
+        push_turn("assistant", item["answer"])
+
+    S.append_queries = [a["question"] for a in S.answers if a.get("question")][-MAX_SESSION_QUERIES:]
+    S.options = []
+    S.selecting = False
+    S.pending_clarify = None
+    S.pending_input = None
+    S.flow_run = None
+    S.candidates = collect_hs_from_memory(build_memory(), HS2_DOMAIN_MAP)
+
+    db.touch_session(session_id)
+
+    # the engine is process memory, so a resumed session always starts a new one
+    S.sid = ENGINE.start()
+    ENGINE.inject_memory(S.sid, build_memory())
+    if S.hs_code:
+        try:
+            ENGINE.set_hs(S.sid, S.hs_code)
+        except Exception:
+            pass
 
     S.stage = "chat"
 
-    start_engine_session(
-        opening
+
+def page_company_picker():
+    S.companies = db.list_companies(S.userid)
+    free = db.company_slots_free(S.userid)
+
+    _hero(
+        "Your companies",
+        "Each company keeps its own profile and up to 10 separate sessions. "
+        "Pick one to carry on, or add another.",
+        f"{len(S.companies)} of 5 used",
     )
 
-    S.scope_history = (
-        [S.scope_label]
-        if S.scope_label
-        else []
+    if not S.companies:
+        st.info("No companies yet. Add your first one to get started.")
+
+    for company in S.companies:
+        with st.container(border=True):
+            left, right = st.columns([4, 1])
+
+            with left:
+                st.markdown(
+                    f'<div class="exira-mini-kicker">Company {company["slot"]}</div>'
+                    f'<div class="exira-mini-value">'
+                    f'{html.escape(str(company["company_name"]))}</div>',
+                    unsafe_allow_html=True,
+                )
+                used = company["session_count"]
+                when = (company["last_used_at"] or company["created_at"] or "")[:10]
+                st.caption(
+                    f"{used} of 10 sessions · last used {when or 'never'}"
+                )
+
+            with right:
+                if st.button("Open", key=f"openco_{company['company_id']}",
+                             type="primary", use_container_width=True):
+                    open_company(company["company_id"])
+                    st.rerun()
+
+                if st.button("Delete", key=f"delco_{company['company_id']}",
+                             use_container_width=True):
+                    db.delete_company(company["company_id"])
+                    S.companies = db.list_companies(S.userid)
+                    st.rerun()
+
+    st.divider()
+
+    if free > 0:
+        if st.button(f"+ Add a company  ·  {free} slot{'s' if free != 1 else ''} free",
+                     type="primary", use_container_width=True):
+            # a fresh onboarding run
+            S.onb_step = "input"
+            S.onb_text = ""
+            S.onb_urls = ""
+            S.onb_attempt = 0
+            S.report = None
+            onb_reset_for_retry()
+            S.stage = "onboarding"
+            st.rerun()
+    else:
+        st.caption("All 5 company slots are in use. Delete one to add another.")
+
+
+def page_session_picker():
+    if S.company_id is None:
+        S.stage = "company_picker"
+        st.rerun()
+        return
+
+    S.sessions = db.list_sessions(S.company_id)
+    free = db.session_slots_free(S.company_id)
+
+    _hero(
+        S.company_name or "Sessions",
+        "Each session keeps its own scope, summary, persona and the last 20 "
+        "answers. Reopen one to carry on where you left off.",
+        f"{len(S.sessions)} of 10 used",
     )
+
+    if st.button("← Back to companies", use_container_width=False):
+        S.stage = "company_picker"
+        st.rerun()
+
+    if not S.sessions:
+        st.info("No sessions yet for this company. Start your first one below.")
+
+    for session in S.sessions:
+        with st.container(border=True):
+            left, right = st.columns([4, 1])
+
+            with left:
+                st.markdown(
+                    f'<div class="exira-mini-kicker">Session {session["slot"]}</div>'
+                    f'<div class="exira-mini-value">'
+                    f'{html.escape(str(session["scope_label"] or "no scope yet"))}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+                when = (session["last_used_at"] or session["created_at"] or "")[:10]
+                st.caption(
+                    f"{session['answer_count']} answers · last used {when or 'never'}"
+                )
+
+            with right:
+                if st.button("Resume", key=f"opense_{session['session_id']}",
+                             type="primary", use_container_width=True):
+                    resume_session(session["session_id"])
+                    st.rerun()
+
+                if st.button("Delete", key=f"delse_{session['session_id']}",
+                             use_container_width=True):
+                    db.delete_session(session["session_id"])
+                    S.sessions = db.list_sessions(S.company_id)
+                    st.rerun()
+
+    st.divider()
+
+    if free > 0:
+        if st.button(f"+ New session  ·  {free} slot{'s' if free != 1 else ''} free",
+                     type="primary", use_container_width=True):
+            # a new session picks its scope first; begin_with creates the row
+            S.session_id = None
+            S.session_slot = None
+            S.old_session = ""
+            S.persona = None
+            S.answers = []
+            S.turns = []
+            S.append_queries = []
+            S.scope_label = ""
+            S.scope_history = []
+            S.hs_code = None
+            S.options = []
+            S.candidates = collect_hs_from_memory(build_memory(), HS2_DOMAIN_MAP)
+            S.stage = "scope"
+            st.rerun()
+    else:
+        st.caption("All 10 session slots are in use. Delete one to start another.")
 
 
 def page_scope():
@@ -3351,8 +3495,19 @@ def sidebar():
 
         st.markdown(
             '<div class="exira-mini-card">'
-            '<div class="exira-mini-kicker">Active scope</div>'
-            f'<div class="exira-mini-value">{html.escape(str(S.scope_label or "—"))}</div>'
+            '<div class="exira-mini-kicker">Company</div>'
+            f'<div class="exira-mini-value">'
+            f'{html.escape(str(S.company_name or "—"))}</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(
+            '<div class="exira-mini-card">'
+            '<div class="exira-mini-kicker">Session</div>'
+            f'<div class="exira-mini-value">'
+            f'{"s" + str(S.session_slot) if S.session_slot else "—"}'
+            f'  ·  {html.escape(str(S.scope_label or "no scope"))}</div>'
             '</div>',
             unsafe_allow_html=True,
         )
@@ -3371,6 +3526,11 @@ def sidebar():
                 for i, scope_name in enumerate(S.scope_history, 1):
                     marker = " ← current" if i == len(S.scope_history) else ""
                     st.write(f"{i}. {scope_name}{marker}")
+
+        if st.button("⇄ Switch session", use_container_width=True):
+            S.sessions = db.list_sessions(S.company_id)
+            S.stage = "session_picker"
+            st.rerun()
 
         if st.button("⇄ Change HS / product scope", use_container_width=True):
             S.show_hs_panel = not S.show_hs_panel
@@ -4051,85 +4211,41 @@ def page_chat():
 # =========================================================
 
 def end_session():
-
+    """Write the session row, then show the done page."""
     current = ""
 
     if S.append_queries:
-
         try:
-
-            current = (
-                query_summary(
-                    S.append_queries
-                )[0]
-            )
-
+            current = query_summary(S.append_queries)[0]
         except Exception as exc:
+            st.warning(f"Session summary failed: {exc}")
 
-            st.warning(
-                f"Session summary failed: "
-                f"{exc}"
-            )
-
-    notes = (
-        S.old_session
-    )
+    notes = S.old_session
 
     if current:
-
         try:
-
-            notes = session_summary(
-                S.old_session,
-                current
-            )
-
+            notes = session_summary(S.old_session, current)
         except Exception as exc:
-
-            st.warning(
-                f"Session merge failed: "
-                f"{exc}"
-            )
-
+            st.warning(f"Session merge failed: {exc}")
             notes = current
 
     try:
-
-        if db.user_exists(
-            S.userid
-        ):
-
-            db.update_session_info(
-                S.userid,
-                notes
+        if S.session_id is not None:
+            db.save_session(
+                S.session_id,
+                session_summary=notes or "",
+                persona=S.persona,
+                scope_label=S.scope_label or "",
+                hs_code=S.hs_code or "",
+                ended=True,
             )
-
-        else:
-
-            db.insert_user(
-                S.userid,
-
-                user_product_info=
-                    S.user_product_info,
-
-                user_session_info=
-                    notes
-            )
-
+        if S.company_id is not None:
+            db.touch_company(S.company_id)
     except Exception as exc:
+        st.error(f"Save failed: {exc}")
 
-        st.error(
-            f"Save failed: "
-            f"{exc}"
-        )
-
-    S.session_notes = (
-        notes
-        or ""
-    )
-
+    S.session_notes = notes or ""
     S.stage = "done"
-
 
 # =========================================================
 # DONE PAGE
@@ -4163,19 +4279,17 @@ def page_done():
             or "_nothing recorded_"
         )
 
-    if st.button(
-        "Start a new session",
-        type="primary"
-    ):
+    c1, c2 = st.columns(2)
 
-        for k in list(
-            st.session_state.keys()
-        ):
+    if c1.button("Back to my companies", type="primary",
+                 use_container_width=True):
+        S.companies = db.list_companies(S.userid)
+        S.stage = "company_picker"
+        st.rerun()
 
-            del st.session_state[
-                k
-            ]
-
+    if c2.button("Sign out", use_container_width=True):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
         st.rerun()
 
 
@@ -4186,6 +4300,12 @@ def page_done():
 PAGES = {
     "login":
         page_login,
+
+    "company_picker":
+        page_company_picker,
+
+    "session_picker":
+        page_session_picker,
 
     "onboarding":
         page_onboarding,

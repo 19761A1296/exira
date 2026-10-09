@@ -11,7 +11,8 @@ Function names are unchanged from the notebook.
 
 Storage
 -------
-    persona/persona_db/<user_id>.json           # one file per user
+    the sessions.persona column, one persona per session
+    keyed on session_id, not user_id
 """
 
 import json
@@ -25,8 +26,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-PERSONA_DIR = Path(__file__).resolve().parent / "persona_db"
-PERSONA_DIR.mkdir(parents=True, exist_ok=True)
+# Personas live in the sessions table now, one per session, not in a folder.
+from database import info_database as _db
 
 DEFAULT_PERSONA_MODEL = os.getenv("PERSONA_LLM_MODEL", "google/gemma-4-31b-it")
 
@@ -51,18 +52,9 @@ _CONTEXT_SECTIONS = [
 # storage
 # -------------------------
 
-def _safe_user_id(user_id: str) -> str:
-    """Keep a user id usable as a filename."""
-    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", str(user_id or "").strip())
-    return cleaned or "anonymous"
-
-
-def persona_path(user_id: str) -> Path:
-    return PERSONA_DIR / f"{_safe_user_id(user_id)}.json"
-
-
-def persona_exists(user_id: str) -> bool:
-    return persona_path(user_id).exists()
+def persona_exists(session_id) -> bool:
+    """True when this session already has a persona stored."""
+    return bool(_db.load_persona(session_id))
 
 
 # -------------------------
@@ -139,29 +131,38 @@ def empty_persona(user_id):
     }
 
 
-def load_persona(user_id):
-    path = persona_path(user_id)
-    if path.exists():
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                persona = json.load(f)
-            if isinstance(persona, dict):
-                base = empty_persona(user_id)
-                base.update({k: v for k, v in persona.items() if k in PERSONA_KEYS})
-                base["user_id"] = user_id
-                return base
-        except Exception:
-            pass
-    return empty_persona(user_id)
+def load_persona(session_id):
+    """Read this session's persona. An empty persona when it has none yet."""
+    try:
+        stored = _db.load_persona(session_id)
+    except Exception as exc:
+        print("load_persona failed:", type(exc).__name__, exc)
+        stored = None
+
+    if isinstance(stored, dict):
+        base = empty_persona(session_id)
+        base.update({k: v for k, v in stored.items() if k in PERSONA_KEYS})
+        base["user_id"] = session_id
+        return base
+
+    return empty_persona(session_id)
 
 
-def save_persona(persona):
-    path = persona_path(persona.get("user_id", ""))
-    tmp = path.with_suffix(".json.tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(persona, f, indent=2, ensure_ascii=False)
-    tmp.replace(path)
-    return path
+def save_persona(persona, session_id=None):
+    """Write the persona onto its session row. Returns True when it landed."""
+    if not isinstance(persona, dict):
+        return False
+
+    session_id = session_id if session_id is not None else persona.get("user_id")
+    if session_id in (None, ""):
+        print("save_persona: no session_id, nothing written")
+        return False
+
+    try:
+        return _db.save_persona(session_id, persona)
+    except Exception as exc:
+        print("save_persona failed:", type(exc).__name__, exc)
+        return False
 
 
 PHASE_1_SYSTEM_PROMPT = """
@@ -709,13 +710,13 @@ def persona_to_text(persona) -> str:
     return "\n".join(lines)
 
 
-def get_persona_context(user_id) -> str:
+def get_persona_context(session_id) -> str:
     """One-liner for callers that just want the text block."""
-    return persona_to_text(load_persona(user_id))
+    return persona_to_text(load_persona(session_id))
 
 
 def build_and_save_persona(
-    user_id,
+    session_id,
     messages_for_memory,
     api_key=None,
     persona_model=None,
@@ -725,35 +726,44 @@ def build_and_save_persona(
     """Load -> Phase 1/2 -> save.
 
     Args:
-        persona: pass the in-memory persona to skip the disk read. Useful when
+        persona: pass the in-memory persona to skip the database read. Useful when
                  updating after every turn, where the caller already holds the
                  current persona from the previous turn.
         recent_turns: forwarded to update_persona_after_turn. Pass 2 for
                       per-turn updates (only the newest user+assistant pair is
                       new); leave None when updating once per session.
     """
-    persona = persona if persona is not None else load_persona(user_id)
+    persona = persona if persona is not None else load_persona(session_id)
     updated = update_persona_after_turn(
         persona=persona,
         messages_for_memory=messages_for_memory,
-        user_id=user_id,
+        user_id=session_id,
         api_key=api_key,
         persona_model=persona_model,
         recent_turns=recent_turns,
     )
-    save_persona(updated)
+    save_persona(updated, session_id)
     return updated
 
 
 if __name__ == "__main__":
-    demo_user = "demo_user"
+    # Personas are stored per session, so the demo needs a session row.
+    _db.init_db()
+    company = _db.create_company("demo_user", "Demo Company", "a demo profile of demo company for testing ")
+    session = _db.create_session(company, scope_label="HS 300490")
+
     demo_turns = [
         "Who are the active buyers for HS 300490 in Vietnam?",
         "Show me their shipment counts for the last 6 months.",
         "Which of them switched suppliers recently?",
     ]
-    result = build_and_save_persona(demo_user, demo_turns)
+
+    result = build_and_save_persona(session, demo_turns)
     print(json.dumps(result, indent=2))
-    print("\nsaved to:", persona_path(demo_user))
+
+    print("\nstored on session:", session)
+    print("reads back:", bool(_db.load_persona(session)))
     print("\nrouter context block:\n")
-    print(persona_to_text(result))
+    print(get_persona_context(session))
+
+    _db.delete_company(company)

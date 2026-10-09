@@ -13,6 +13,7 @@ from summarizer.web_search import web_search, as_context
 from summarizer.memory_answer import answer_from_memory
 from summarizer.clarify import options_from, answers_question, rejection_message
 from summarizer.answer_recall import summarise_answers, capture
+from database import info_database as db
 
 MAX_SESSION_QUERIES = 5
 HISTORY_LIMIT = 12
@@ -199,14 +200,23 @@ def starter_followups(hs_code: str) -> list[str]:
 # ───────────────────────── session ─────────────────────────
 
 def begin_session(old_session_memory: str = "", user_product_info: str = "",
-                  user_id: str = "") -> str | None:
+                  session_id=None) -> str | None:
+    """One chat session.
+
+    session_id keys the persona and the stored answers. Pass None to run
+    without any persistence, which is useful for a quick test."""
 
     append_queries: list[str] = []
     persona_turns: list[dict] = []
     history: list[dict] = []          # [{"role": "USER"|"EXIRA", "content": ...}]
-    history: list[dict] = []          # [{"role": "USER"|"EXIRA", "content": ...}]
-    answers: list[dict] = []          # [{"question","answer"}] this session only
-    persona = load_persona(user_id) if user_id else None
+    # the newest answers come back from the database, so a session resumed
+    # days later still knows what it already told the user
+    answers: list[dict] = db.get_answers(session_id) if session_id else []
+    persona = load_persona(session_id) if session_id else None
+
+    if answers:
+        print(f"\nPicking up {len(answers)} earlier answer"
+              f"{'s' if len(answers) != 1 else ''} from this session.")
 
     memory = build_memory(user_product_info, old_session_memory, append_queries, persona)
     candidates = collect_hs_from_memory(memory, HS2_DOMAIN_MAP)
@@ -219,6 +229,10 @@ def begin_session(old_session_memory: str = "", user_product_info: str = "",
     if hs_code:
         remember_hs(candidates, hs_code)
     scope_label = f"HS {hs_code}" if hs_code else choice
+
+    if session_id:
+        db.save_session(session_id, scope_label=scope_label,
+                        hs_code=hs_code or "")
 
     sid = ENGINE.start()
     ENGINE.inject_memory(sid, memory)
@@ -428,6 +442,8 @@ def begin_session(old_session_memory: str = "", user_product_info: str = "",
             if answer:
                 history.append({"role": "EXIRA", "content": answer})
                 capture(answers, text, answer)
+                if session_id:
+                    db.save_answer(session_id, text, answer)
 
         except Exception as exc:
             print(f"  error: {exc}\n")
@@ -440,10 +456,10 @@ def begin_session(old_session_memory: str = "", user_product_info: str = "",
         if len(append_queries) > MAX_SESSION_QUERIES:
             append_queries = [query_summary(append_queries)[0]]
 
-        if user_id:
+        if session_id:
             persona_turns.append({"role": "user", "content": text})
             try:
-                persona = build_and_save_persona(user_id, persona_turns,
+                persona = build_and_save_persona(session_id, persona_turns,
                                                  recent_turns=1, persona=persona)
             except Exception as exc:
                 print(f"  persona update failed: {exc}\n")
@@ -483,19 +499,41 @@ def begin_session(old_session_memory: str = "", user_product_info: str = "",
 # Prints the session summary instead of saving it, so you can run it freely.
 
 if __name__ == "__main__":
-    USER_PRODUCT_INFO = ""      # paste a company card here
-    OLD_SESSION_INFO = ""       # paste a previous session summary here
-    USER_ID = ""                # "" skips persona load and save
+    # A session row is needed, since persona and answers are keyed on it.
+    db.init_db()
+    USER_ID = "router_demo"
+
+    companies = db.list_companies(USER_ID)
+    if companies:
+        COMPANY_ID = companies[0]["company_id"]
+    else:
+        COMPANY_ID = db.create_company(USER_ID, "Demo Company", "")
+
+    sessions = db.list_sessions(COMPANY_ID)
+    SESSION_ID = sessions[0]["session_id"] if sessions \
+        else db.create_session(COMPANY_ID)
+
+    company = db.get_company(COMPANY_ID)
+    row = db.get_session(SESSION_ID)
+
+    print("=" * 60)
+    print(f"user    : {USER_ID}")
+    print(f"company : {company['company_name']} (slot {company['slot']})")
+    print(f"session : slot {row['slot']}")
+    print("=" * 60)
 
     summary = begin_session(
-        old_session_memory=OLD_SESSION_INFO,
-        user_product_info=USER_PRODUCT_INFO,
-        user_id=USER_ID,
+        old_session_memory=row["session_summary"] or "",
+        user_product_info=company["company_profile"] or "",
+        session_id=SESSION_ID,
     )
+
+    if summary:
+        db.save_session(SESSION_ID, session_summary=summary, ended=True)
 
     print("\n" + "=" * 60)
     if summary:
-        print("SESSION SUMMARY (not saved):\n")
+        print("SESSION SUMMARY (saved):\n")
         print(summary)
     else:
         print("No questions were asked, so there is no summary.")
