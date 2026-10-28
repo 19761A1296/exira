@@ -3043,6 +3043,10 @@ def start_engine_session(
         ENGINE.start()
     )
 
+    # link the engine session to this chat so a resume can reattach to it
+    if S.get("session_id") is not None:
+        db.save_session(S.session_id, engine_sid=S.sid)
+
     ENGINE.inject_memory(
         S.sid,
         build_memory()
@@ -3231,14 +3235,20 @@ def resume_session(session_id: int):
 
     db.touch_session(session_id)
 
-    # the engine is process memory, so a resumed session always starts a new one
-    S.sid = ENGINE.start()
-    ENGINE.inject_memory(S.sid, build_memory())
-    if S.hs_code:
-        try:
-            ENGINE.set_hs(S.sid, S.hs_code)
-        except Exception:
-            pass
+    # reattach to the stored engine session if it hasn't expired,
+    # otherwise start a fresh one and point it at the saved scope
+    if ENGINE.exists(row.get("engine_sid")):
+        S.sid = row["engine_sid"]
+        ENGINE.inject_memory(S.sid, build_memory())
+    else:
+        S.sid = ENGINE.start()
+        db.save_session(session_id, engine_sid=S.sid)
+        ENGINE.inject_memory(S.sid, build_memory())
+        if S.hs_code:
+            try:
+                ENGINE.set_hs(S.sid, S.hs_code)
+            except Exception:
+                pass
 
     S.stage = "chat"
 

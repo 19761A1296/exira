@@ -107,6 +107,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     persona         TEXT,
     scope_label     TEXT,
     hs_code         TEXT,
+    engine_sid      TEXT,
     created_at      TEXT NOT NULL,
     last_used_at    TEXT,
     ended_at        TEXT,
@@ -137,6 +138,14 @@ def init_db():
     """Create the tables if missing. Safe to call on every start."""
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
+
+
+def _migrate(conn):
+    """Add columns that older databases are missing. Safe to re-run."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)")}
+    if "engine_sid" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN engine_sid TEXT")
 
 
 # ───────────────────────── users ─────────────────────────
@@ -379,6 +388,7 @@ def get_session(session_id) -> dict | None:
         "persona": _from_text(row["persona"]),
         "scope_label": row["scope_label"],
         "hs_code": row["hs_code"],
+        "engine_sid": row["engine_sid"],
         "created_at": row["created_at"],
         "last_used_at": row["last_used_at"],
         "ended_at": row["ended_at"],
@@ -387,7 +397,7 @@ def get_session(session_id) -> dict | None:
 
 def save_session(session_id, session_summary=None, persona=None,
                  scope_label=None, hs_code=None, label=None,
-                 ended: bool = False) -> bool:
+                 engine_sid=None, ended: bool = False) -> bool:
     """Update whichever fields are given. None means leave that column alone."""
     sets, values = [], []
 
@@ -395,7 +405,8 @@ def save_session(session_id, session_summary=None, persona=None,
                           ("persona", persona),
                           ("scope_label", scope_label),
                           ("hs_code", hs_code),
-                          ("label", label)):
+                          ("label", label),
+                          ("engine_sid", engine_sid)):
         if value is not None:
             sets.append(f"{column} = ?")
             values.append(_to_text(value))

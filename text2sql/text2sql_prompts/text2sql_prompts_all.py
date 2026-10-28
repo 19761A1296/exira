@@ -887,6 +887,7 @@ If any of those triggers appear, do NOT use Mode A.
 - Do NOT introduce SUM/AVG/REGR/PERCENTILE/ROW_NUMBER unless explicitly requested by the user.
 - Exclude NULL/blank in the output fields.
 - Default LIMIT: if the user asks for records/list without specifying N, return 10.
+- Do NOT apply the Data Coverage Engine in Mode A; no coverage columns are returned.
 
  Mode A disambiguation guards
 - “which country is this buyer/seller from” → trade-side country field:
@@ -1890,6 +1891,9 @@ Follow Unit-Safe Average Price Engine. Return only required price fields; for gl
  Competition / margin / saturation
 Return compared entity/dimension + metric(s) needed for interpretation/visual comparison + supporting counts/values.
 
+ Data coverage columns
+For every non-Mode-A query, the final SELECT must also return records_before_engine, records_after_engine, excluded_records, and coverage_pct on every row, using the before_count / after_count LEFT JOIN shape from the Data Coverage Engine.
+
  Final rule
 If chart/table display is useful, return clean dimension + metric columns that Prompt C can map. If not useful, return the simplest correct result.
 
@@ -2272,6 +2276,46 @@ high_margin_entity_count = COUNT_IF(entity_avg_unit_price >= p90_price)
 total_value_usd = SUM(entity_total_value_usd) over retained entities (per product_dimension + unit_norm or reduced as requested).
 
 
+DATA COVERAGE ENGINE (COUNTING OVERLAY — ALL NON-MODE-A QUERIES)
+
+Purpose:
+Count how many records were available before the analytical engines ran and how many fed the final result after they finished. This engine ONLY counts. It MUST NOT filter, clean, flag, or change the data that any engine uses. Engines must be built exactly as if this engine did not exist.
+
+Trigger:
+Apply ONLY when an analytical engine is triggered (Trend, Seasonality, Demand, Competition, Market Share, Saturation, Margin, Unit-Safe Price, Growth/Comparison, New Buyers/Suppliers, Onboarding, Absence). Do not apply to simple totals, counts, rankings, or Mode A.
+
+Definitions:
+records_before_engine = number of imports_exports rows that pass the resolved question filters for the analysis period(s): time window(s), product/HS, geography, direction, port, and explicit entity filters. COUNT(*) of raw rows, before any engine logic, NULL handling, aggregation, or UNION ALL.
+records_after_engine = number of those rows that actually contributed to the metrics in the final result after the engines finished. This reflects every row the engines dropped through their own rules (e.g., blank names, invalid units, QUANTITY <= 0, P25 filter, unit eligibility, seasonal eligibility, demand qualification, anti-join). It is counted BEFORE any Top-N / LIMIT / ROW_NUMBER rn <= N / winner selection; display limits never reduce it.
+excluded_records = records_before_engine - records_after_engine
+coverage_pct = ROUND(records_after_engine / NULLIF(records_before_engine, 0) * 100, 2)
+If the engines drop no rows, records_after_engine = records_before_engine.
+
+Scope by query pattern:
+- Growth / comparison across periods: count all compared periods combined.
+- New buyers/suppliers and onboarding: count the active period only (history-check rows are never counted).
+- Absence: count baseline period + exclusion period combined.
+- Neutral Node: count each shipment once (before the UNION ALL duplication), for both counts.
+- All-time queries: no date condition in the counts.
+
+Non-interference (CRITICAL):
+- Engine CTEs read imports_exports td with their own filters and rules exactly as defined by their engine sections. They never read from the counting CTEs.
+- Do not add any filter, NULL check, or validity rule to any engine because of this engine.
+- Do not remove, reorder, or alter any engine logic.
+
+SQL shape:
+1. before_count CTE (exactly one row): COUNT(*) AS records_before_engine FROM imports_exports td WHERE <resolved question filters only>.
+2. Engine CTEs: unchanged. The engine CTE at which rows are last retained must also carry record_count = COUNT(*) at its computation grain (e.g., per market, per entity + unit, per month + unit), so retained rows can be counted without re-reading raw rows. Adding this column must not change any other column, filter, or grouping.
+3. after_count CTE (exactly one row): records_after_engine = COALESCE(SUM(record_count), 0) over the keys retained after all engine rules and BEFORE any Top-N / LIMIT / winner selection.
+4. final_result CTE: the complete engine output, including any ORDER BY and LIMIT / ROW_NUMBER filtering.
+5. Final SELECT: FROM before_count CROSS JOIN after_count LEFT JOIN final_result ON TRUE, selecting all final_result columns plus records_before_engine, records_after_engine, excluded_records (records_before_engine - records_after_engine), and coverage_pct (ROUND(records_after_engine / NULLIF(records_before_engine, 0) * 100, 2)). Repeat the final_result ordering in the outer ORDER BY. If final_result is empty, this returns one row with NULL analysis columns and the counts. These columns must not affect ORDER BY or LIMIT.
+
+Plan requirement:
+The SQL Implementation Plan must state which question filters define records_before_engine and at which engine step records_after_engine is counted.
+
+Output columns (fixed names):
+records_before_engine, records_after_engine, excluded_records, coverage_pct
+
 your task
 
 You must produce an implementation-ready intent PLUS a concrete Snowflake query that can on the imports_exports table. The output MUST follow the Core Base Prompt, and the Analytical Engine Layer. Core Base Prompt rules override any engine behavior if conflicts occur.
@@ -2318,6 +2362,8 @@ Engine logic, if applicable: if growth, comparison, trend, demand, seasonality, 
 Average price logic, if applicable: if price is triggered, state that the Unit-Safe Average Price Engine from Core Base Prompt applies and describe only the query-specific entity, unit, ranking, and output choices needed for SQL. Do not restate the full average price rules.
 
 Ordering and limiting: state the exact ordering metric, sort direction, and limit logic. ORDER BY must match the user’s wording and Core Base Prompt default N rules.
+
+Data coverage: for non-Mode-A queries, state which question filters define records_before_engine and at which engine step records_after_engine is counted (before any Top-N).
 
 Output shape: describe the final SELECT columns, including identifiers, computed metrics used for ranking/filtering, and minimum context columns required by the selected Core/Engine rules.
 
@@ -2382,6 +2428,8 @@ Use only the known columns from the resolved table schema: SHIPPING_DATE, QUANTI
 Use SHIPPING_DATE for all time filters. Ensure the generated SQL follows Snowflake-specific syntax; specifically, use DATE_TRUNC('MONTH', SHIPPING_DATE) for monthly aggregations and DATEADD for period shifts.
 
 Implement all logic exactly as described in the SQL Implementation Plan. If any described table, filter, grouping, metric, engine step, ordering, or output column is omitted, the query is WRONG.
+
+For non-Mode-A queries, include the before_count and after_count CTEs and build the final SELECT as before_count CROSS JOIN after_count LEFT JOIN final_result ON TRUE, repeating the result ordering in the outer ORDER BY. The counting CTEs must not change any engine's filters or data.
 
 Enforce universal case insensitivity for all text comparisons, joins, and grouping keys by wrapping both the column and literal in Apply UPPER(TRIM(...)) for all text equality/join/grouping keys (countries, states, cities, company names, ports) consistently across all CTEs. Do not normalize PRODUCT_DESCRIPTION beyond UPPER(...) for fuzzy matching., and apply this consistently across all CTEs so the same entity cannot split due to casing or whitespace.
 
@@ -2742,7 +2790,7 @@ Never hallucinate:
 - Do not create missing months, missing units, missing entities, or missing chart points.
 
 Respect the result:
-- Do not change, filter, regroup, reorder, or recalculate the SQL result except for purely presentational interpretation.
+- Do not change, filter, regroup, reorder, or recalculate the SQL result except for purely presentational interpretation (e.g., rounding or thousands separators for display).
 - Do not mention SQL, CTEs, database internals, or prompt names in the narrative.
 - Do not paste raw JSON rows, markdown tables, or raw rows in the narrative.
 
@@ -2752,20 +2800,40 @@ Time period:
 
 Metric naming:
 - If the metric is value_usd, total_value_usd, SHIPMENT_VALUE, or similar, mention USD.
+- Write money as "USD 236,679.08" (or abbreviated, e.g., "USD 236.7K", "USD 1.2M"). Never combine "$" with "USD", and never wrap numbers in backticks or any markdown.
 - If quantity and unit are present, mention both.
 - For average price, mention unit-safe context when relevant.
 
 Insight completeness:
 - If result set includes decision-support fields such as slope, r2, periods, demand_classification, avg_value_per_seller, best_buyer_country, month_of_year, unit_norm, avg_unit_price, total_value_usd, total_qty, market_share_pct, p90_price, buyer_seller_ratio, shipment_count, or rank, include the important ones in the narrative when they help answer the query.
 - If the Interpretation Summary implies such metrics but the result set does not contain them, mention that those details were not returned.
+- Data coverage columns (records_before_engine, records_after_engine, excluded_records, coverage_pct) are handled ONLY by the Data Coverage Narrative Rule; do not discuss them elsewhere in the narrative.
 
-Empty result:
-- If row_count == 0, narrative_answer must say: “There are no recorded shipments matching those criteria in the selected period, so the requested metric cannot be computed.”
+EMPTY AND NO-QUALIFYING RESULTS
+
+Analysis columns = every result column EXCEPT the four data coverage columns.
+
+Case 1 — No matching records:
+Applies when row_count == 0, OR when records_before_engine is present and equals 0.
+- narrative_answer must say: “As per our trade records, there are no recorded shipments matching those criteria in the selected period, so the requested metric cannot be computed.”
+- Do not add a coverage sentence.
 - visualization.type must be `none`.
+
+Case 2 — Records matched, but none qualified:
+Applies when records_before_engine > 0 AND every analysis column is NULL in all returned rows (the analysis produced no qualifying result).
+- narrative_answer must say: “As per our trade records, <records_before_engine> shipment records matched your criteria in the selected period, but none met the conditions required for this analysis (for example, <short plain-language reason from the Interpretation Summary or SQL Implementation Plan, if stated>).”
+- If no reason is stated upstream, omit the example clause; do not guess a reason.
+- Then add the coverage Note exactly as defined in the Data Coverage Narrative Rule (on a new line, starting with "Note:").
+- visualization.type must be `none`.
+
+Otherwise, follow the normal narrative and visualization rules below.
 
 NARRATIVE RULE
 
 The narrative must be short, factual, and business-facing.
+
+Opening phrase (CRITICAL):
+Begin every narrative_answer with "As per our trade records," followed directly by the answer (e.g., "As per our trade records, for HS code 63023100, Poland, Spain, and Argentina are..."). Use the phrase once, only at the start.
 
 For scalar results:
 - Explain the computed number, the period, and the scope.
@@ -2795,6 +2863,21 @@ For raw records:
 - Mention how many records are shown and the main scope.
 - Do not over-analyze raw rows.
 
+DATA COVERAGE NARRATIVE RULE
+
+Detection:
+If RESULT SET contains records_before_engine, records_after_engine, excluded_records, and coverage_pct, add a coverage Note at the END of narrative_answer (in all cases except Case 1).
+These values are identical on every row; read them from the first row.
+If these columns are not present (e.g., simple lookups), do NOT add a Note and do NOT invent numbers.
+
+Format (CRITICAL — exact):
+The Note must start on a NEW LINE: separate it from the main answer with "\n\n" inside narrative_answer, and write it exactly as:
+"Note: records_before_engine = <value>, records_after_engine = <value>, excluded_records = <value>, coverage_pct = <value>%"
+- Use these labels exactly, in this order, separated by commas.
+- Do not add reasons, qualifiers, or any other sentence to the Note.
+- Show counts with thousands separators (e.g., 156,591).
+- Show coverage_pct with one decimal place (presentational rounding only; do not recalculate).
+
 VISUALIZATION DECISION RULE
 
 Choose exactly one visualization type from:
@@ -2808,6 +2891,7 @@ Choose exactly one visualization type from:
 
 Choose `none` when:
 - row_count == 0
+- Case 1 or Case 2 of Empty and No-Qualifying Results applies
 - the result is a single scalar value
 - the result is a short distinct-name list with no metric
 - required chart/table columns are not useful
@@ -2931,6 +3015,7 @@ COLUMN SELECTION RULES
 - `visualization.columns` must contain only exact column names present in RESULT SET.
 - For `structured_table`, include the most useful columns for display. For raw records, include relevant record columns such as SHIPPING_DATE, DECL_NO, PRODUCT_DESCRIPTION, HS_CODE, BUYER_COMPANY, SELLER_COMPANY, buyer/seller geography, ports, UNIT, QUANTITY, and SHIPMENT_VALUE when present.
 - `trendline_column` must be null or an exact column name present in RESULT SET.
+- Data coverage columns (records_before_engine, records_after_engine, excluded_records, coverage_pct) are for the narrative only. NEVER use them as x_column, y_column, series_column, or trendline_column, and NEVER include them in visualization.columns.
 - Do not include row data in the visualization object.
 - Do not include chart data arrays.
 - Do not include headers/rows arrays.
@@ -2950,7 +3035,7 @@ Do not output raw rows.
 The JSON object MUST use this schema:
 
 {
-  "narrative_answer": "<short business-facing narrative>",
+  "narrative_answer": "<short business-facing narrative, ending with the data-coverage sentence when coverage columns are present>",
   "visualization": {
     "type": "none | structured_table | line_chart | bar_chart | pie_chart | scatter_chart",
     "title": "<short visual title or null>",

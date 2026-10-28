@@ -176,7 +176,9 @@ Columns:
 
 
 
-SESSIONS: Dict[str, Dict[str, Any]] = {}
+# Engine session state lives in a shared store (Redis in production),
+# not in this process. See text2sql/session_store.py.
+from text2sql.session_store import STORE as SESSION_STORE, SessionBusy
 
 # =========================================================
 # REQUEST MODELS
@@ -1308,14 +1310,35 @@ def health():
 @app.post("/start_session")
 def start_session():
     sid = str(uuid.uuid4())
-    SESSIONS[sid] = new_session_state()
-    return {"session_id": sid, "state": SESSIONS[sid]["state"]}
+    state = new_session_state()
+    SESSION_STORE.save(sid, state)
+    return {"session_id": sid, "state": state["state"]}
+
+
+def _invalid_session():
+    return JSONResponse(status_code=400, content={"error": "Invalid session_id"})
+
+
+def _session_busy():
+    return JSONResponse(status_code=409, content={"error": "This session is still working on a previous request"})
 
 @app.post("/chat")
 def chat(req: ChatRequest):
-    if req.session_id not in SESSIONS:
-        return JSONResponse(status_code=400, content={"error": "Invalid session_id"})
-    session = SESSIONS[req.session_id]
+    """Lock the session, load it, run the turn, save it back."""
+    try:
+        with SESSION_STORE.lock(req.session_id):
+            session = SESSION_STORE.load(req.session_id)
+            if session is None:
+                return _invalid_session()
+            try:
+                return _chat_impl(req, session)
+            finally:
+                SESSION_STORE.save(req.session_id, session)
+    except SessionBusy:
+        return _session_busy()
+
+
+def _chat_impl(req: ChatRequest, session: Dict[str, Any]):
     raw_message = (req.message or "").strip()
     if not raw_message:
         return JSONResponse(status_code=400, content={"error": "Empty message"})
@@ -1384,9 +1407,9 @@ def chat(req: ChatRequest):
     if session["state"] == STATE_AWAITING_CONFIRMATION:
         low = normalized.lower().strip()
         if low in {"yes", "y", "ok", "okay", "proceed", "run"}:
-            return _confirm_internal(req.session_id, "proceed")
+            return _confirm_impl(req.session_id, session, "proceed")
         if low in {"no", "n", "cancel", "stop"}:
-            return _confirm_internal(req.session_id, "cancel")
+            return _confirm_impl(req.session_id, session, "cancel")
 
     agent_out = safe_call_trade_agent(session, normalized)
     action = (agent_out.get("action") or "").upper().strip()
@@ -1456,9 +1479,21 @@ def confirm(req: ConfirmRequest):
     return _confirm_internal(req.session_id, (req.decision or "").strip().lower())
 
 def _confirm_internal(session_id: str, decision: str):
-    if session_id not in SESSIONS:
-        return JSONResponse(status_code=400, content={"error": "Invalid session_id"})
-    session = SESSIONS[session_id]
+    """Lock the session, load it, run the confirm step, save it back."""
+    try:
+        with SESSION_STORE.lock(session_id):
+            session = SESSION_STORE.load(session_id)
+            if session is None:
+                return _invalid_session()
+            try:
+                return _confirm_impl(session_id, session, decision)
+            finally:
+                SESSION_STORE.save(session_id, session)
+    except SessionBusy:
+        return _session_busy()
+
+
+def _confirm_impl(session_id: str, session: Dict[str, Any], decision: str):
     if session["state"] != STATE_AWAITING_CONFIRMATION:
         return JSONResponse(status_code=400, content={"error": "No pending query to confirm"})
     if decision not in {"proceed", "cancel"}:
