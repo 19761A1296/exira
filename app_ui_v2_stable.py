@@ -3042,6 +3042,7 @@ def start_engine_session(
     S.sid = (
         ENGINE.start()
     )
+    print(f"[NEW ENGINE] session_id={S.get('session_id')} engine_sid={S.sid}")
 
     # link the engine session to this chat so a resume can reattach to it
     if S.get("session_id") is not None:
@@ -3249,7 +3250,7 @@ def resume_session(session_id: int):
                 ENGINE.set_hs(S.sid, S.hs_code)
             except Exception:
                 pass
-
+    print(f"[RESUME] session_id={session_id} stored={row.get('engine_sid')} using={S.sid}")
     S.stage = "chat"
 
 
