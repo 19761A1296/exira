@@ -125,6 +125,7 @@ CREATE TABLE IF NOT EXISTS answers (
     session_id  INTEGER NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
     question    TEXT,
     answer      TEXT NOT NULL,
+    trace       TEXT,
     created_at  TEXT NOT NULL
 );
 
@@ -146,6 +147,9 @@ def _migrate(conn):
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)")}
     if "engine_sid" not in cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN engine_sid TEXT")
+    acols = {r["name"] for r in conn.execute("PRAGMA table_info(answers)")}
+    if "trace" not in acols:
+        conn.execute("ALTER TABLE answers ADD COLUMN trace TEXT")
 
 
 # ───────────────────────── users ─────────────────────────
@@ -471,39 +475,53 @@ def session_slots_free(company_id) -> int:
 
 # ───────────────────────── answers ─────────────────────────
 
-def save_answer(session_id, question, answer, keep: int = MAX_ANSWERS) -> bool:
-    """Append one answered turn and trim to the newest `keep`. Empty answers skip."""
-    answer = (answer or "").strip()
-    if not answer:
-        return False
+MAX_TRACE_ROWS = 300   # rows kept per chart so the DB stays small
 
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO answers (session_id, question, answer, created_at)"
-            " VALUES (?,?,?,?)",
-            (session_id, (question or "").strip(), answer, _now()))
-        conn.execute(
-            "DELETE FROM answers WHERE session_id = ? AND answer_id NOT IN"
-            " (SELECT answer_id FROM answers WHERE session_id = ?"
-            "  ORDER BY answer_id DESC LIMIT ?)",
-            (session_id, session_id, keep))
-        conn.execute("UPDATE sessions SET last_used_at = ? WHERE session_id = ?",
-                     (_now(), session_id))
-    return True
 
+def _slim_trace(obj):
+    """Copy of the trace with long row lists cut to MAX_TRACE_ROWS."""
+    if isinstance(obj, dict):
+        return {k: (v[:MAX_TRACE_ROWS] if k == "rows" and isinstance(v, list) else _slim_trace(v))
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_slim_trace(v) for v in obj]
+    return obj
+
+
+def save_answer(session_id, question, answer, keep: int = MAX_ANSWERS, trace=None) -> bool:
+       """Append one answered turn (with its trace) and trim to the newest `keep`. Empty answers skip."""
+       answer = (answer or "").strip()
+       if not answer:
+           return False
+       trace_json = json.dumps(_slim_trace(trace), default=str) if trace else None
+
+       with get_conn() as conn:
+           conn.execute(
+               "INSERT INTO answers (session_id, question, answer, trace, created_at)"
+               " VALUES (?,?,?,?,?)",
+               (session_id, (question or "").strip(), answer, trace_json, _now()))
+           conn.execute(
+               "DELETE FROM answers WHERE session_id = ? AND answer_id NOT IN"
+               " (SELECT answer_id FROM answers WHERE session_id = ?"
+               "  ORDER BY answer_id DESC LIMIT ?)",
+               (session_id, session_id, keep))
+           conn.execute("UPDATE sessions SET last_used_at = ? WHERE session_id = ?",
+                        (_now(), session_id))
+       return True
 
 def get_answers(session_id, limit: int = MAX_ANSWERS) -> list:
     """Oldest first, so the chat window rebuilds in order."""
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT question, answer, created_at FROM answers"
+            "SELECT question, answer, trace, created_at FROM answers"
             " WHERE session_id = ? ORDER BY answer_id DESC LIMIT ?",
             (session_id, limit)
         ).fetchall()
 
     return [{"question": r["question"] or "",
-             "answer": r["answer"],
-             "created_at": r["created_at"]} for r in reversed(rows)]
+                "answer": r["answer"],
+                "trace": json.loads(r["trace"]) if r["trace"] else None,
+                "created_at": r["created_at"]} for r in reversed(rows)]
 
 
 def clear_answers(session_id) -> int:

@@ -3004,7 +3004,7 @@ def finish_flow(out: dict):
     record_query(memory_entry(S.flow_text, S.flow_sent))
     capture(S.answers, S.flow_text, out["answer"])
     if S.session_id is not None:
-        db.save_answer(S.session_id, S.flow_text, out["answer"])
+        db.save_answer(S.session_id, S.flow_text, out["answer"], trace=trace)
 
 def resume_clarification(reply: str):
     """Send the user's clarification answer back into the paused node."""
@@ -3271,7 +3271,7 @@ def run_confirm(
                 answer_text
             )
             if S.session_id is not None:
-                db.save_answer(S.session_id, last_user, answer_text)
+                db.save_answer(S.session_id, last_user, answer_text, trace=(S.turns[-1].get("trace") if S.turns else None))
 
 
 def remember_hs(
@@ -3580,7 +3580,7 @@ def resume_session(session_id: int):
     for item in S.answers:
         if item.get("question"):
             push_turn("user", item["question"])
-        push_turn("assistant", item["answer"])
+        push_turn("assistant", item["answer"], item.get("trace"))
 
     S.append_queries = [a["question"] for a in S.answers if a.get("question")][-MAX_SESSION_QUERIES:]
     S.options = []
