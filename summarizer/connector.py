@@ -37,10 +37,12 @@ HANDLERS — injected by the caller, so this module imports no engine and no web
 
     personal(question) -> str
 
-    trade(question)    -> {"text": str,          what to show and pass on
-                           "ok": bool,           True only if data came back
-                           "pending": bool,      True if the engine wants an HS pick
-                           "needs_answer": bool} True if the engine asked a question
+    trade(question, node) -> {"text": str,          what to show and pass on
+                              "ok": bool,           True only if data came back
+                              "pending": bool,      True if the engine wants an HS pick
+                              "needs_answer": bool} True if the engine asked a question
+
+    For backward compatibility, a legacy trade(question) handler is also accepted.
 
     web(question)      -> str
 
@@ -64,6 +66,7 @@ from a blank. If nothing depends on it, the gap is recorded and the rest runs.
     MODEL_CONNECTOR
 """
 
+import inspect
 import json
 import os
 
@@ -257,6 +260,58 @@ def _log(label: str, value="") -> None:
         print(f"--- CONNECTOR {label}" + (f" | {str(value)[:]}" if value else ""))
 
 
+# ───────────────────────── handler compatibility ─────────────────────────
+
+def _call_trade_handler(fn, question: str, node: dict):
+    """
+    Call the TRADE handler with the full node when the handler supports it.
+
+    New contract:
+        trade(question, node)
+
+    Legacy contract:
+        trade(question)
+
+    This keeps the current UI/CLI working while the new Trade Mini Connector
+    is wired in. Once both callers use the two-argument contract, this helper
+    can remain harmlessly in place.
+    """
+    if fn is None:
+        return {
+            "text": "",
+            "ok": False,
+            "pending": False,
+            "needs_answer": False,
+        }
+
+    try:
+        sig = inspect.signature(fn)
+        params = list(sig.parameters.values())
+
+        accepts_varargs = any(
+            p.kind == inspect.Parameter.VAR_POSITIONAL
+            for p in params
+        )
+
+        positional = [
+            p
+            for p in params
+            if p.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        ]
+
+        if accepts_varargs or len(positional) >= 2:
+            return fn(question, node)
+
+    except (TypeError, ValueError):
+        # If the callable cannot be introspected, preserve the legacy path.
+        pass
+
+    return fn(question)
+
+
 # ───────────────────────── the run ─────────────────────────
 
 class FlowRun:
@@ -409,10 +464,17 @@ class FlowRun:
                 return {"text": (fn(question) if fn else "").strip(),
                         "pending": False, "needs_answer": False}
 
-            # TRADE, and a single-node WEB flow: the engine runs first
+            # TRADE, and a single-node WEB flow: the engine runs first.
+            #
+            # The full node is now made available to the trade handler so the
+            # new Trade Mini Connector can read node["trade_decision"].
+            # Legacy one-argument handlers remain supported.
             fn = self.handlers.get("trade")
-            result = fn(question) if fn else {"text": "", "ok": False,
-                                              "pending": False}
+            result = _call_trade_handler(
+                fn,
+                question,
+                node,
+            )
             if result.get("pending"):
                 return {"text": "", "pending": True, "needs_answer": False}
 
@@ -522,7 +584,7 @@ if __name__ == "__main__":
         print(f"      [personal] <- {q}")
         return f"(from the profile: {q})"
 
-    def stub_trade(q):
+    def stub_trade(q, node=None):
         print(f"      [trade]    <- {q}")
         return {"text": "The user's largest import is polyester fabric, HS 540752, "
                         "from Ningbo, China.",
@@ -554,7 +616,7 @@ if __name__ == "__main__":
 
     state = {"asked": False}
 
-    def stub_trade_asks(q):
+    def stub_trade_asks(q, node=None):
         print(f"      [trade]    <- {q}")
         if not state["asked"]:
             state["asked"] = True
