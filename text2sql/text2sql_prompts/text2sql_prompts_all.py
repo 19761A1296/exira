@@ -18,6 +18,7 @@ Prompt A can answer database-backed trade questions about:
 - rankings, comparisons, growth, trend, and seasonality
 - demand, competition, market share, saturation
 - premium-price buyers/suppliers
+- concentration, dominance and dependency on few players
 - new buyers/suppliers and stopped activity
 
 2. Semantic understanding rule
@@ -32,6 +33,9 @@ Examples:
 - “best month to sell” may mean seasonality
 - “new customers” may mean new buyers
 - “who disappeared” may mean stopped activity
+- “who controls the market” may mean concentration
+- “are we too dependent on one buyer” may mean concentration (dependency)
+- “is it a few big players or many small ones” may mean concentration
 
 3. Subject understanding
 Prompt A can work with:
@@ -63,6 +67,7 @@ Prompt A can answer using:
 - competition intensity
 - buyer-seller balance proxy
 - premium price proxy
+- concentration index and top-N combined share
 
 High-level rules:
 - default metric is trade value unless the user clearly asks otherwise
@@ -134,6 +139,7 @@ Useful exploration paths include:
 - market share
 - saturation
 - stopped activity
+- concentration / dependency
 
 10. Scope boundary
 Inside scope:
@@ -355,6 +361,8 @@ Examples:
 - “low competition markets for biscuits”
 - “compare cotton and bars in India”
 - “which month does demand peak for candy bar?”
+- “is the cotton market in India dominated by a few suppliers?”
+- “how many buyers make up <value%> of turmeric imports into the United States?”
 
 CONFIRM_QUERY means:
 - final_query_text must contain the clean executable natural-language query
@@ -383,7 +391,7 @@ Step 2) History-first
 If user refers to previous result or previous answer, inspect executed_trade_history_last_5 first.
 
 History reference phrases include:
-“previous”, “earlier”, “above”, “that”, “same”, “again”, “last result”, “first result”, “second buyer”, “top buyer”, “top seller”, “slope”, “r square”, “r2”, “why stable”, “difference between”, “compare with previous”, “what changed”.
+“previous”, “earlier”, “above”, “that”, “same”, “again”, “last result”, “first result”, “second buyer”, “top buyer”, “top seller”, “slope”, “r square”, “r2”, “why stable”, “difference between”, “compare with previous”, “what changed”,“top player”, “HHI”, “concentration score”, “top 3 share”, “how many made up 80%”.
 
 If the answer can be derived from executed_trade_history_last_5:
 - action=ANSWER_DIRECT
@@ -474,6 +482,9 @@ Examples:
 “what is buyer?”
 “what is seller?”
 “what is competition in this system?”
+“what is concentration?”
+“what is HHI?”
+“difference between concentration and market share?”
 
 Step 4) Off-topic / out of DB scope
 
@@ -509,6 +520,22 @@ If the user message is a clear trade query that prompt_a_skeleton supports:
 - do not ask for dates, units, or currency unless absolutely required; Prompt A defaults handle them
 - do not generate SQL
 
+Step 7) Market-structure intent preservation (CRITICAL)
+
+When the user asks whether a market is concentrated, dominated, fragmented, diversified, a monopoly, or dependent on few players, final_query_text MUST keep that structure wording. Do NOT rewrite it into "top sellers", "market share of", "low competition", or "number of sellers"; those route to different analyses.
+
+Distinguish:
+- share of ONE named entity → market share wording
+- is the market dominated / how dependent / how many make up X% → concentration wording
+- easy to enter / less competition → competition wording
+- buyers vs sellers balance → saturation wording
+- how many sellers exist → count wording
+
+Dependency on the user's own company ("are we too dependent on one buyer", "my supplier dependency"):
+- Resolve "we/my/our" to the company name in active_focus.user_memory.user_product_info and carry it into final_query_text with its role (seller or buyer).
+- If no company name is available there, use ASK_CLARIFICATION for the company name. Do not guess.
+
+
 ========================
 PRODUCT TERM EXTRACTION
 ========================
@@ -531,7 +558,7 @@ Never classify these as product_terms:
 - regions or scope words: global, worldwide, domestic, international
 - cities/states/ports
 - time windows: last 24 months, 2024, January, previous year
-- metrics/intents: trend, demand, competition, price, buyers, sellers, imports, exports, ports
+- metrics/intents: trend, demand, competition, price, buyers, sellers, imports, exports, ports, concentration, dominance, dependency, monopoly, fragmentation
 - trade roles: buyer, seller, supplier, importer, exporter
 
 Examples:
@@ -589,6 +616,7 @@ For advisory/help queries, followups should guide the user toward executable ana
 - seasonality
 - ports
 - new entrants
+- concentration / dependency
 
 If no product/HS is known, generate generic but useful trade analytics followups asking for product/HS naturally.
 
@@ -685,6 +713,8 @@ Examples of useful next areas:
 - If competition was explored, suggest demand-qualified opportunity, top buyers in low-competition markets, or premium buyers.
 - If seasonality was explored, suggest buyers during peak month, price seasonality, or country-level seasonal demand.
 - If price was explored, suggest premium buyers, price trend, seasonality, or country comparison.
+- If concentration was explored, suggest fragmented markets with rising demand, new suppliers entering the concentrated market, premium buyers among the dominant players, or whether concentration is increasing over time.
+- If top buyers/sellers, market share, or competition were explored, suggest whether that market is concentrated or how many players make up <value%> of it.
 
 Good followups may use one capability or combine capabilities:
 - demand + low competition
@@ -693,6 +723,8 @@ Good followups may use one capability or combine capabilities:
 - seasonality + price
 - ports + buyers/sellers
 - trend + market comparison
+- demand + low concentration
+- concentration + new entrants
 
 ========================
 RULES
@@ -1027,6 +1059,7 @@ If no direction keyword exists and the user asks about a port’s activity/ranki
 
 - treat the port as a neutral node: each shipment contributes to both origin and destination via UNION ALL for per-port ranking/comparison.
 - This may double-count and is allowed only for port ranking/comparison, not global totals.
+Neutral Node is never used for concentration or share calculations.
 
 ---
 
@@ -1474,22 +1507,23 @@ Classify the query into exactly one of these types using this priority:
 
 1. relationship
 Onboarded/new/first-time supplier/buyer/first shipment/new relationship. Simple “new buyers/new suppliers” entity-level queries must use the New Buyers / New Suppliers Engine; buyer-seller pair onboarding is used only when the user explicitly asks for relationships/pairs.
-2. distribution
+2. "How many <players> make up X% / half / most of <market>" is concentration, not count, even though it contains "how many".
+3. distribution
 Share / percentage of total / market share / contribution.
-3. count
+4. count
 “How many / number of / count of” entities or shipments.
 (Count intent overrides ranking words.)
-4. trend
+5. trend
 Trend / over time / monthly/weekly series / slope/r2 / “is demand increasing” across multiple periods.
-5. seasonality
+6. seasonality
 Peak month / usually rises / seasonal pattern / best month / lowest month / cheapest month.
-6. growth
+7. growth
 Increase/decrease/change/growth rate/MoM/YoY/QoQ or comparing two consecutive periods.
-7. comparison
+8. comparison
 A vs B / difference / gap between entities or periods (not framed as growth rate).
-8. ranking
+9. ranking
 Top/highest/lowest/best/leading/most/least/peak (winner selection is ranking too).
-9. aggregation
+10. aggregation
 Single total/average/price for a period without ranking/comparison/trend. Simple average price reporting is aggregation; cheapest/highest/best price by entity is ranking with PRICE metric.
 
 ---
@@ -1891,6 +1925,12 @@ Follow Unit-Safe Average Price Engine. Return only required price fields; for gl
  Competition / margin / saturation
 Return compared entity/dimension + metric(s) needed for interpretation/visual comparison + supporting counts/values.
 
+
+ Concentration (visual-ready / table-ready)
+Single market or named-entity dependency: return Pareto rows, one per player (top 10 or user N), with player column, player_total, share_pct, cumulative_share_pct, player_rank, plus market summary columns repeated on every row: market_total, player_count, hhi, cr1_pct, cr3_pct, cr5_pct, players_to_80_pct, concentration_classification, dominant_player_flag (unit_norm if quantity).
+Multi-market comparison / discovery: one row per market with market key, market_total, player_count, hhi, cr1_pct, cr3_pct, cr5_pct, players_to_80_pct, top_player, concentration_classification, dominant_player_flag.
+Change over time: add period columns, hhi per period, hhi_change, cr3_change_pct_points, concentration_direction.
+
  Data coverage columns
 For every non-Mode-A query, the final SELECT must also return records_before_engine, records_after_engine, excluded_records, and coverage_pct on every row, using the before_count / after_count LEFT JOIN shape from the Data Coverage Engine.
 
@@ -2170,6 +2210,105 @@ If no N is specified for open-ended share lists, do not invent a limit unless Co
 Output:
 Return entity identifier, entity_total_value_usd or entity_total_qty, market_total_value_usd or market_total_qty, market_share_pct, and unit_norm when quantity share is used.
 
+CONCENTRATION ENGINE (MARKET STRUCTURE / DEPENDENCY)
+
+Trigger: concentration, concentrated, consolidated, fragmented, dominated, dominance, monopoly, oligopoly, few players control, diversified/diversification, dependency/dependent/reliance on few suppliers/buyers/countries/ports/products, "top N hold what share", "how many suppliers/buyers make up X%", single-source risk, spread of buyers/suppliers.
+
+Interpretation:
+Concentration is a market-structure verdict: how much of a scoped market is held by its largest players. It is NOT a per-entity share list (Market Share Engine), NOT per-seller intensity (Competition Engine), NOT buyer/seller ratio (Saturation Engine), and NOT an entity count (count type). If the user asks the share of one named entity, use Market Share Engine. If the user asks whether a market is dominated, dependent, diversified, or fragmented, use this engine.
+
+1) Resolve two dimensions (CRITICAL)
+market_scope = the market being assessed (all resolved filters: time, product/HS, geography, direction, port, explicit entity).
+concentrated_dimension = the "players" whose shares are measured.
+
+concentrated_dimension resolution:
+- suppliers/sellers/exporters, "dominated by sellers", import/sourcing intent with company language → SELLER_COMPANY
+- buyers/importers/customers, export/selling intent with company language → BUYER_COMPANY
+- "dependent on countries for imports", sourcing country risk, origin countries → SELLER_COUNTRY
+- "export markets", destination dependency, "which countries absorb" → BUYER_COUNTRY
+- ports → PORT_OF_ORIGIN or PORT_OF_DESTINATION per Core port mapping (Neutral Node is NOT allowed here; shares must sum to 100% of a single-counted market)
+- products/portfolio/basket → HS_CODE
+- corridors → corridor_key = UPPER(TRIM(SELLER_COUNTRY)) || ' -> ' || UPPER(TRIM(BUYER_COUNTRY))
+- unspecified "is the <product> market in <country> concentrated" → SELLER_COMPANY (seller-side structure, consistent with Competition)
+
+Named-entity dependency:
+If the user names one entity and asks how dependent it is ("how dependent is seller X on its buyers"), filter market_scope to that entity using UPPER(TRIM(col)) = '<NAME_NORM>' on the role-correct column, and set concentrated_dimension to the requested counterparty side (BUYER_COMPANY, BUYER_COUNTRY, SELLER_COMPANY, SELLER_COUNTRY, or HS_CODE per wording). Preserve the literal entity name.
+
+2) Time window
+Use Core Timeline rules. Default rolling 24 completed months ending at Anchor.
+
+3) Metric
+Default SHIPMENT_VALUE. Use QUANTITY only if explicitly requested; then apply unit safety: valid unit_norm, QUANTITY > 0, compute concentration separately per unit_norm (filter to unit if specified; otherwise max 3 units, preferring units in both top 3 by record_count and top 3 by total_qty-independent total_value_usd, filling by total_value_usd). Never mix units.
+
+4) Validity
+Exclude NULL/blank concentrated_dimension values. player_norm = UPPER(TRIM(concentrated_dimension)) (HS_CODE: remove '.', '-', spaces; preserve leading zeros). Shares are computed over valid named players only; the denominator is the sum over valid players.
+Exclude players whose player_total <= 0 from share computation.
+
+5) Computation (per market partition)
+market_partition = the grain at which separate verdicts are needed:
+- single market question → no partition (one market)
+- comparison or discovery across markets → partition by the compared/ranked market key (e.g., BUYER_COUNTRY, HS_CODE, BUYER_COUNTRY + product_dimension, named entity)
+- quantity → add unit_norm to the partition
+
+CTE stack (order mandatory, names may vary):
+a) player_agg: filter first, then per market_partition + player_norm: player_total = COALESCE(SUM(metric),0), record_count = COUNT(*).
+b) market_totals: GROUP BY market_partition over player_agg: market_total = SUM(player_total). No window functions in this CTE.
+b2) player_share: JOIN player_agg to market_totals on market_partition; compute share_pct = player_total / NULLIF(market_total,0) * 100 as a plain column. No window functions in this CTE.
+b3) player_ranked: select from player_share; compute player_rank = ROW_NUMBER() OVER (PARTITION BY market_partition ORDER BY player_total DESC, player_norm ASC) and cumulative_share_pct = SUM(share_pct) OVER (PARTITION BY market_partition ORDER BY player_total DESC, player_norm ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW). share_pct here is a materialized column from b2, never a window expression.
+c) market_concentration: GROUP BY market_partition over player_ranked (plain aggregates only, no window functions):
+   - hhi = SUM(share_pct * share_pct)   (0–10,000 scale)
+   - player_count = COUNT(*)
+   - cr1_pct = SUM(CASE WHEN player_rank = 1 THEN share_pct ELSE 0 END)
+   - cr3_pct = SUM(CASE WHEN player_rank <= 3 THEN share_pct ELSE 0 END)
+   - cr5_pct = SUM(CASE WHEN player_rank <= 5 THEN share_pct ELSE 0 END)
+   - players_to_80_pct = MIN(CASE WHEN cumulative_share_pct >= 80 THEN player_rank END)
+   - top_player = the player_norm with player_rank = 1 (reducer context)
+   - market_total, total record_count
+
+Never compute HHI from raw shipment rows. Never compute shares before aggregating to player grain.
+
+6) Classification
+- hhi < 1500 → UNCONCENTRATED
+- 1500 <= hhi <= 2500 → MODERATELY CONCENTRATED
+- hhi > 2500 → HIGHLY CONCENTRATED
+dominant_player_flag = cr1_pct >= 50.
+Thin-market guard: if player_count < 3, classification = INSUFFICIENT PLAYERS (still return hhi, cr1_pct, player_count). For discovery ranking, exclude markets with player_count < 3 unless the user explicitly asks to include them.
+
+7) Concentration change over time
+Trigger: consolidating, fragmenting, "becoming more concentrated", concentration increased/decreased, vs previous period, YoY.
+- Two-period comparison: build two consecutive equal-length windows per Core Timeline; compute the full CTE stack separately per period (period is part of market_partition). Player shares are recomputed within each period; never reuse current-period shares.
+- hhi_change = hhi_current - hhi_previous; cr3_change_pct_points = cr3_current - cr3_previous.
+- concentration_direction: hhi_change > 100 → CONSOLIDATING; hhi_change < -100 → FRAGMENTING; otherwise STABLE.
+- Series (yearly/quarterly): period per Growth rules, previous via plain LAG(hhi) OVER (PARTITION BY market ORDER BY period); first period NULL.
+
+8) Combined engines
+- Demand + Concentration: compute concentration only on demand-qualified markets (demand_classification = MORE DEMAND) by INNER JOIN on BUYER_COUNTRY + product_dimension before player_agg aggregation. Do not compute on all markets and filter later.
+- Concentration + Margin / New entrants / Seasonality: compute concentration as its own CTE stack at the shared market grain, then join on that grain. Do not let another engine's filters alter concentration shares unless the user's question scopes to that subset.
+- If final output is at a higher grain than market_partition, reduce explicitly (MAX/MIN hhi) and output the winning market as reducer context.
+
+9) Ranking
+- "most concentrated / dominated / dependent / monopoly / risky" → ORDER BY hhi DESC
+- "fragmented / diversified / no dominant player / spread out / easiest to break into" → ORDER BY hhi ASC
+- tie-break: market_total DESC
+- default LIMIT 10 for discovery; winner phrasing → 1
+- "how many make up X%" → compute players_to_X_pct with X from the user (default 80)
+- Exclude rows where hhi IS NULL.
+
+10) Output
+Single-market or named-entity question (visual-ready Pareto):
+return top 10 players (or user N) with player_norm, player_total, share_pct, cumulative_share_pct, player_rank, and on every row the market summary: market_total, player_count, hhi, cr1_pct, cr3_pct, cr5_pct, players_to_80_pct, concentration_classification, dominant_player_flag (+ unit_norm if quantity).
+Comparison / discovery across markets (table-ready):
+one row per market_partition with market key, market_total, player_count, hhi, cr1_pct, cr3_pct, cr5_pct, players_to_80_pct, top_player, concentration_classification, dominant_player_flag.
+Change over time: add period columns, hhi per period, hhi_change, cr3_change_pct_points, concentration_direction.
+
+Data coverage: records_before_engine = rows passing resolved question filters; records_after_engine = SUM(record_count) from player_agg over retained markets (after validity, unit, thin-market and demand-qualification exclusions), before any Top-N.
+
+Forbidden:
+- Never use Neutral Node double-counting for concentration.
+- Never merge market_totals, player_share, and player_ranked into one CTE; never compute a window function over share_pct in the same SELECT where share_pct is defined.
+- Never mix units or compute HHI across units.
+- Never use DECL_NO.
+- Never infer the concentrated_dimension from user_memory alone.
 
 MARKET SATURATION ENGINE (OVERLAY)
 
@@ -2282,7 +2421,7 @@ Purpose:
 Count how many records were available before the analytical engines ran and how many fed the final result after they finished. This engine ONLY counts. It MUST NOT filter, clean, flag, or change the data that any engine uses. Engines must be built exactly as if this engine did not exist.
 
 Trigger:
-Apply ONLY when an analytical engine is triggered (Trend, Seasonality, Demand, Competition, Market Share, Saturation, Margin, Unit-Safe Price, Growth/Comparison, New Buyers/Suppliers, Onboarding, Absence). Do not apply to simple totals, counts, rankings, or Mode A.
+Apply ONLY when an analytical engine is triggered (Trend, Seasonality, Demand, Competition, Market Share, Concentration, Saturation, Margin, Unit-Safe Price, Growth/Comparison, New Buyers/Suppliers, Onboarding, Absence). Do not apply to simple totals, counts, rankings, or Mode A.
 
 Definitions:
 records_before_engine = number of imports_exports rows that pass the resolved question filters for the analysis period(s): time window(s), product/HS, geography, direction, port, and explicit entity filters. COUNT(*) of raw rows, before any engine logic, NULL handling, aggregation, or UNION ALL.
@@ -2357,7 +2496,7 @@ Aggregations and metrics: state the resolved metric, aggregate function(s), and 
 
 Grouping: state the output grain and all GROUP BY dimensions. If no grouping is needed, explicitly state that no grouping is needed. If an engine requires lower-grain computation before final output, state the engine grain and final reducer.
 
-Engine logic, if applicable: if growth, comparison, trend, demand, seasonality, competition, margin, market share, saturation, relationship onboarding, or new buyer/supplier logic is triggered, state which engine/rule applies and summarize only the query-specific implementation steps needed for SQL. Do not restate the full engine rules.
+Engine logic, if applicable: if growth, comparison, trend, demand, seasonality, competition, margin, market share, concentration, saturation, relationship onboarding, or new buyer/supplier logic is triggered, state which engine/rule applies and summarize only the query-specific implementation steps needed for SQL. For concentration, state the resolved market_scope, concentrated_dimension, market_partition, and ranking direction. Do not restate the full engine rules.
 
 Average price logic, if applicable: if price is triggered, state that the Unit-Safe Average Price Engine from Core Base Prompt applies and describe only the query-specific entity, unit, ranking, and output choices needed for SQL. Do not restate the full average price rules.
 
@@ -2805,7 +2944,7 @@ Metric naming:
 - For average price, mention unit-safe context when relevant.
 
 Insight completeness:
-- If result set includes decision-support fields such as slope, r2, periods, demand_classification, avg_value_per_seller, best_buyer_country, month_of_year, unit_norm, avg_unit_price, total_value_usd, total_qty, market_share_pct, p90_price, buyer_seller_ratio, shipment_count, or rank, include the important ones in the narrative when they help answer the query.
+- If result set includes decision-support fields such as slope, r2, periods, demand_classification, avg_value_per_seller, best_buyer_country, month_of_year, unit_norm, avg_unit_price, total_value_usd, total_qty, market_share_pct, p90_price, buyer_seller_ratio, shipment_count, rank, hhi, cr1_pct, cr3_pct, players_to_80_pct, player_count, top_player, concentration_classification, hhi_change, or concentration_direction, include the important ones in the narrative when they help answer the query.
 - If the Interpretation Summary implies such metrics but the result set does not contain them, mention that those details were not returned.
 - Data coverage columns (records_before_engine, records_after_engine, excluded_records, coverage_pct) are handled ONLY by the Data Coverage Narrative Rule; do not discuss them elsewhere in the narrative.
 
@@ -2858,6 +2997,13 @@ For market share:
 
 For new buyers/suppliers:
 - Mention the top new entity and value/shipment count if present.
+
+
+For concentration / dependency:
+- Lead with the verdict in plain language from concentration_classification (UNCONCENTRATED = fragmented, no single player dominates; MODERATELY CONCENTRATED; HIGHLY CONCENTRATED = held by a few players). If INSUFFICIENT PLAYERS, say only <player_count> players were observed, so no concentration verdict is meaningful.
+- Support it with the top player's share (cr1_pct), the top 3 combined share (cr3_pct), and how many players make up 80% (players_to_80_pct) out of player_count. Mention hhi only as a supporting figure, e.g., "HHI 3,120 (scale 0–10,000)".
+- For named-entity dependency, phrase it from that entity's side. For multi-market results, name the top 1–3 markets in the ranking direction. For change over time, report concentration_direction with hhi_change.
+- Do not use "monopoly" unless the user used it and cr1_pct is 100. Do not state risk or opportunity as fact.
 
 For raw records:
 - Mention how many records are shown and the main scope.
@@ -3005,6 +3151,13 @@ Competition / margin / saturation:
 - type = `bar_chart` or `scatter_chart`
 - x_column = compared entity/dimension
 - y_column = relevant metric such as `avg_value_per_seller`, `entity_avg_unit_price`, `buyer_seller_ratio`, `p90_price`, or similar
+
+
+Concentration / dependency:
+- Single market or named-entity dependency: type = `bar_chart`, x_column = player column, y_column = `share_pct`.
+- Multi-market comparison / discovery: type = `structured_table` with market key, hhi, concentration_classification, cr1_pct, cr3_pct, players_to_80_pct, player_count, top_player.
+- Change over time: type = `structured_table` with market key, period columns, hhi, hhi_change, concentration_direction.
+- Market summary columns repeated on every row (hhi, cr1_pct, cr3_pct, players_to_80_pct, concentration_classification) are narrative context, not x/y/series.
 
 If required columns for a chart are missing, choose `structured_table` instead.
 If required columns for structured table are missing, choose `none`.
