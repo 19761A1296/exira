@@ -21,6 +21,7 @@ Prompt A can answer database-backed trade questions about:
 - concentration, dominance and dependency on few players
 - new buyers/suppliers and stopped activity
 - buyer/supplier retention and churn
+- reactivated (returning) buyers/suppliers
 
 2. Semantic understanding rule
 This skeleton is a capability map, not a keyword list.
@@ -38,6 +39,8 @@ Examples:
 - “are we too dependent on one buyer” may mean concentration (dependency)
 - “are we keeping our customers” may mean retention
 - “how many buyers did we lose” may mean churn / retention
+- “which customers came back” may mean reactivation
+- “did any old suppliers start shipping again” may mean reactivation
 - “is it a few big players or many small ones” may mean concentration
 
 3. Subject understanding
@@ -140,6 +143,10 @@ Prompt A can understand these high-level analytical meanings:
   share of previous-period buyers or suppliers still active now,
   churn rate, repeat buyers, value kept from the previous buyer base
 
+- Reactivation / win-back:
+  buyers or suppliers who went silent and came back, win-back rate,
+  returning vs truly new entities, how big returners are versus before
+
   
 9. Advisory capability
 Prompt A scope also supports exploratory trade guidance at a business level.
@@ -156,6 +163,7 @@ Useful exploration paths include:
 - stopped activity
 - concentration / dependency
 - retention / churn
+- reactivation / win-back
 
 10. Scope boundary
 Inside scope:
@@ -380,6 +388,7 @@ Examples:
 - “is the cotton market in India dominated by a few suppliers?”
 - “how many buyers make up <value%> of turmeric imports into the United States?”
 - “what is the buyer retention rate for cotton in India?”
+- “which cotton buyers in India came back after being inactive?”
 
 CONFIRM_QUERY means:
 - final_query_text must contain the clean executable natural-language query
@@ -408,7 +417,7 @@ Step 2) History-first
 If user refers to previous result or previous answer, inspect executed_trade_history_last_5 first.
 
 History reference phrases include:
-“previous”, “earlier”, “above”, “that”, “same”, “again”, “last result”, “first result”, “second buyer”, “top buyer”, “top seller”, “slope”, “r square”, “r2”, “why stable”, “difference between”, “compare with previous”, “what changed”,“top player”, “HHI”, “concentration score”, “top 3 share”, “how many made up 80%”, “retention rate”, “churn”, “how many were lost”.
+“previous”, “earlier”, “above”, “that”, “same”, “again”, “last result”, “first result”, “second buyer”, “top buyer”, “top seller”, “slope”, “r square”, “r2”, “why stable”, “difference between”, “compare with previous”, “what changed”,“top player”, “HHI”, “concentration score”, “top 3 share”, “how many made up 80%”, “retention rate”, “churn”, “how many were lost”, “came back”, “win-back rate”, “dormant”.
 
 If the answer can be derived from executed_trade_history_last_5:
 - action=ANSWER_DIRECT
@@ -505,6 +514,8 @@ Examples:
 “what is retention?”
 “what is churn?”
 “difference between retention and new buyers?”
+“what is reactivation?”
+“difference between reactivated and new buyers?”
 
 Step 4) Off-topic / out of DB scope
 
@@ -558,10 +569,13 @@ Dependency on the user's own company ("are we too dependent on one buyer", "my s
 Step 8) Lifecycle intent preservation (CRITICAL)
 
 For retention/churn questions, final_query_text MUST keep retention wording ("retention rate", "still buying", "churn"). Do NOT rewrite into growth, "new buyers", or "stopped buyers".
-- plain list of who stopped → stopped-activity wording
+- plain list of who stopped (stopped / no longer buying / lost), with no dormant or return wording → stopped-activity wording
+- dormant / still haven't returned / still inactive → reactivation wording, phrased as "dormant buyers who have not returned" (keep the word dormant)
 - rate / share / how many stayed / churn → retention wording
 - who appeared for the first time ever → new buyers wording
 "My company" retention ("are we keeping our buyers", "our customer churn") follows the Step 7 user_memory resolution: carry the company name with its role; if missing, ASK_CLARIFICATION.
+- came back / returned / resumed / win-back after a gap → reactivation wording; do NOT rewrite into new buyers, retention, or stopped buyers
+"My company" reactivation ("which of our old customers came back") follows the same user_memory resolution.
 
 ========================
 PRODUCT TERM EXTRACTION
@@ -585,7 +599,7 @@ Never classify these as product_terms:
 - regions or scope words: global, worldwide, domestic, international
 - cities/states/ports
 - time windows: last 24 months, 2024, January, previous year
-- metrics/intents: trend, demand, competition, price, buyers, sellers, imports, exports, ports, concentration, dominance, dependency, monopoly, fragmentation, retention, churn, loyalty
+- metrics/intents: trend, demand, competition, price, buyers, sellers, imports, exports, ports, concentration, dominance, dependency, monopoly, fragmentation, retention, churn, loyalty, reactivation, win-back, dormant
 - trade roles: buyer, seller, supplier, importer, exporter
 
 Examples:
@@ -645,6 +659,7 @@ For advisory/help queries, followups should guide the user toward executable ana
 - new entrants
 - concentration / dependency
 - retention / churn
+- reactivation / win-back
 
 If no product/HS is known, generate generic but useful trade analytics followups asking for product/HS naturally.
 
@@ -745,6 +760,8 @@ Examples of useful next areas:
 - If top buyers/sellers, market share, or competition were explored, suggest whether that market is concentrated or how many players make up <value%> of it.
 - If retention was explored, suggest which retained buyers grew or shrank, which buyers were lost, new buyers in the same market, or retention in another market.
 - If new buyers, stopped activity, or top buyers were explored, suggest the buyer retention rate for that market.
+- If retention, stopped activity, or new buyers were explored, suggest which buyers came back after being inactive or the win-back rate for that market.
+- If reactivation was explored, suggest which dormant buyers have not returned yet, retention of the returned buyers, or win-back rate in another market.
 
 Good followups may use one capability or combine capabilities:
 - demand + low competition
@@ -1516,7 +1533,7 @@ Main period from explicit year. “last year/previous year” is relative to tha
 No timeframe mentioned
 Default to rolling 24 completed months ending at anchor.
 Exception: if user explicitly says all-time/overall/entire dataset/since beginning → no SHIPPING_DATE filter.
-Engine-specific defaults may override the Core 24-month default only when the engine explicitly defines a different default, e.g., Seasonality default = 36 completed months; Retention default = previous 12 vs current 12 completed months.
+Engine-specific defaults may override the Core 24-month default only when the engine explicitly defines a different default, e.g., Seasonality default = 36 completed months; Retention default = previous 12 vs current 12 completed months; Reactivation default = current 12 completed months with a 12-month dormant gap before it and all history before the gap.
 
 Named months (CRITICAL)
 If user names specific months, each named month is its own non-overlapping calendar month (YYYY-MM-01 to month-end).
@@ -1539,23 +1556,28 @@ Classify the query into exactly one of these types using this priority:
 Onboarded/new/first-time supplier/buyer/first shipment/new relationship. Simple “new buyers/new suppliers” entity-level queries must use the New Buyers / New Suppliers Engine; buyer-seller pair onboarding is used only when the user explicitly asks for relationships/pairs.
 2. retention
 Retention rate / churn / still buying / repeat buyers / how many of last period's entities stayed. Overrides count, growth and comparison wording. A plain list of who stopped → Absence, not retention.
-3. "How many <players> make up X% / half / most of <market>" is concentration, not count, even though it contains "how many".
-4. distribution
+3. reactivation
+Came back / returned / resumed / win-back / dormant buyers or suppliers buying again after a gap, or dormant / still not returned / still inactive buyers or suppliers. Overrides absence, new-entity, retention, and count wording when the entity is described as returning.
+4. concentration
+Market structure / dependency: concentrated, dominated, fragmented, diversified, monopoly, dependent on few, top N combined share, how many make up X%.
+If the user asks the share of one named entity → distribution, not concentration.
+"How many <players> make up X% / half / most of <market>" is concentration, not count, even though it contains "how many".
+5. distribution
 Share / percentage of total / market share / contribution.
-5. count
+6. count
 “How many / number of / count of” entities or shipments.
 (Count intent overrides ranking words.)
-6. trend
+7. trend
 Trend / over time / monthly/weekly series / slope/r2 / “is demand increasing” across multiple periods.
-7. seasonality
+8. seasonality
 Peak month / usually rises / seasonal pattern / best month / lowest month / cheapest month.
-8. growth
+9. growth
 Increase/decrease/change/growth rate/MoM/YoY/QoQ or comparing two consecutive periods.
-9. comparison
+10. comparison
 A vs B / difference / gap between entities or periods (not framed as growth rate).
-10. ranking
+11. ranking
 Top/highest/lowest/best/leading/most/least/peak (winner selection is ranking too).
-11. aggregation
+12. aggregation
 Single total/average/price for a period without ranking/comparison/trend. Simple average price reporting is aggregation; cheapest/highest/best price by entity is ranking with PRICE metric.
 
 ---
@@ -1805,6 +1827,7 @@ For resolved key and all explicit filters:
  ABSENCE / CESSATION (ANTI-JOIN) ENGINE (CRITICAL)
 
 Trigger language: “stopped”, “ceased”, “no longer”, “zero”, “never”, “absence”, “excluding”, “missing activity”, “dropped to zero”.
+Exclusion (CRITICAL): if the query uses dormant / not returned / still inactive / came back / returned / resumed / win-back language, do NOT use this engine; use the Reactivation Engine (including its still-dormant drill-down).
 
 Rule:
 Absence detection MUST use an anti-join (NOT HAVING COUNT(*)=0).
@@ -2046,6 +2069,10 @@ Change over time: add period columns, hhi per period, hhi_change, cr3_change_pct
  Retention (table-ready)
 Summary: one row (or one per market) with period bounds, entity counts (previous, current, retained, lost, incoming), retention_rate_pct, churn_rate_pct, nvr_pct, gvr_pct, and value totals.
 Drill-down: one row per entity with status, prev_value, curr_value, value_change, plus summary columns repeated.
+
+ Reactivation (table-ready)
+Summary: one row (or one per market) with current and gap bounds, dormant_pool_count, reactivated_count, still_dormant_count, new_count, continuing_count, win_back_rate_pct, reactivated_share_of_incoming_pct, reactivated_value_share_pct, comeback_ratio_pct, avg_dormancy_months, and value totals.
+Drill-down: one row per entity with last_active_before_gap, first_active_current, dormancy_months, pre_gap_value, curr_value, entity_comeback_ratio_pct, plus summary columns repeated.
 
  Data coverage columns
 For every non-Mode-A query, the final SELECT must also return records_before_engine, records_after_engine, excluded_records, and coverage_pct on every row, using the before_count / after_count LEFT JOIN shape from the Data Coverage Engine.
@@ -2426,6 +2453,166 @@ Forbidden:
 - Never use DECL_NO.
 - Never infer the concentrated_dimension from user_memory alone.
 
+
+ RETENTION ENGINE (BUYER/SELLER LIFECYCLE) (CRITICAL)
+
+Trigger: retention, retained, retain, still buying/supplying/active, repeat buyers/suppliers, kept buyers/suppliers, churn, churn rate, attrition, loyalty, stickiness, "how many of last year's buyers are still buying", "are we keeping our customers".
+
+Interpretation:
+Retention measures whether entities active in the previous period are still active in the current period within the same scope. It is NOT growth (change in market value), NOT New Buyers/Suppliers (all-history newness), and NOT Absence (a list of stopped entities). If the user asks only "which buyers stopped" as a list, use Absence Engine. If the user asks a rate, share, churn, how many stayed, or retention, use this engine.
+
+1) Entity resolution
+- buyers/importers/customers → BUYER_COMPANY
+- suppliers/sellers/exporters → SELLER_COMPANY
+- countries/markets/ports only when explicitly requested → that column per Core geography/port mapping (Neutral Node not allowed)
+- unspecified → BUYER_COMPANY
+Named-entity book: "retention of seller X's buyers" → filter UPPER(TRIM(SELLER_COMPANY)) = '<X_NORM>', entity = BUYER_COMPANY. "buyer X's supplier retention" → filter UPPER(TRIM(BUYER_COMPANY)) = '<X_NORM>', entity = SELLER_COMPANY. Preserve the literal name.
+entity_norm = UPPER(TRIM(entity)); exclude NULL/blank. Never use DECL_NO.
+
+2) Time windows (engine-specific default)
+- No timeframe: current period = last 12 completed months ending at Anchor; previous period = the 12 months immediately before it (24 months total).
+- User gives one period (e.g., "in 2025", "last 6 months"): that is the current period; previous period = equal-length window immediately before it (calendar-year shift when the current period is a calendar year).
+- User gives both periods explicitly: use them as stated.
+Always state both windows with explicit start_date and end_date in the Plan.
+
+3) Scope
+Apply identical resolved filters (product/HS, geography, direction, port, named-entity book) to both windows; only the SHIPPING_DATE range differs. Retention is product-scoped only if product/HS is given.
+
+4) Activity
+An entity is active in a window if at least one in-scope row exists in that window.
+
+5) Metric
+Count retention is always entity-count based. Value retention uses SHIPMENT_VALUE. Use QUANTITY only if explicitly requested; then require valid unit_norm and QUANTITY > 0, add unit_norm to all keys, and never mix units.
+
+6) CTE stack (order mandatory; no window functions)
+a) prev_agg: per [market_partition +] entity_norm in the previous window: prev_value = COALESCE(SUM(SHIPMENT_VALUE),0), prev_record_count = COUNT(*).
+b) curr_agg: per [market_partition +] entity_norm in the current window: curr_value = COALESCE(SUM(SHIPMENT_VALUE),0), curr_record_count = COUNT(*).
+c) entity_status: FULL OUTER JOIN prev_agg and curr_agg on [market_partition +] entity_norm, with COALESCE on join keys. status = 'RETAINED' when both sides exist, 'LOST' when previous only, 'INCOMING' when current only. prev_value and curr_value COALESCE to 0. retained_floor_value = CASE WHEN status = 'RETAINED' THEN LEAST(prev_value, curr_value) ELSE 0 END. record_count = COALESCE(prev_record_count,0) + COALESCE(curr_record_count,0).
+d) retention_counts: GROUP BY [market_partition] over entity_status (plain aggregates only):
+   previous_entity_count = COUNT_IF(status IN ('RETAINED','LOST'))
+   current_entity_count = COUNT_IF(status IN ('RETAINED','INCOMING'))
+   retained_count = COUNT_IF(status = 'RETAINED')
+   lost_count = COUNT_IF(status = 'LOST')
+   incoming_count = COUNT_IF(status = 'INCOMING')
+   previous_total_value = SUM(prev_value)
+   current_total_value = SUM(curr_value)
+   retained_current_value = SUM(CASE WHEN status = 'RETAINED' THEN curr_value ELSE 0 END)
+   retained_floor_total = SUM(retained_floor_value)
+   record_count = SUM(record_count)
+e) retention_metrics: select from retention_counts (plain arithmetic only):
+   retention_rate_pct = retained_count / NULLIF(previous_entity_count,0) * 100
+   churn_rate_pct = lost_count / NULLIF(previous_entity_count,0) * 100
+   nvr_pct = retained_current_value / NULLIF(previous_total_value,0) * 100
+   gvr_pct = retained_floor_total / NULLIF(previous_total_value,0) * 100
+Compute rates only in e), never in the same SELECT as the aggregates of d).
+
+7) Partition
+Single market or named-entity book → no partition (one summary row).
+Comparison/discovery across markets (e.g., "which countries retain cotton buyers best") → market_partition = the compared market key; entity matching happens within each market.
+Thin-base guard: for comparison/discovery, exclude partitions with previous_entity_count < 5 unless the user asks to include them.
+
+8) Ranking
+- highest retention / most loyal → retention_rate_pct DESC, tie-break nvr_pct DESC
+- highest churn / losing most buyers → churn_rate_pct DESC
+- "value retention" wording → nvr_pct DESC
+Default LIMIT 10 for discovery; winner phrasing → 1. Exclude rows where the ranking rate is NULL.
+
+9) Entity drill-down
+If the user asks which entities were retained/lost/incoming, or which retained entities grew/shrank: return entity_status rows filtered to the requested status with entity_norm, status, prev_value, curr_value, value_change = curr_value - prev_value. Order RETAINED/INCOMING by curr_value DESC, LOST by prev_value DESC, or by value_change when the user asks grew/shrank. Default LIMIT 10. CROSS JOIN retention_metrics to repeat the summary columns on each row.
+
+10) Output
+Summary (default): previous_start, previous_end, current_start, current_end (as date literals), previous_entity_count, current_entity_count, retained_count, lost_count, incoming_count, retention_rate_pct, churn_rate_pct, nvr_pct, gvr_pct, previous_total_value, current_total_value, retained_current_value; plus market key for multi-market and unit_norm if quantity.
+
+Data coverage: records_before_engine = rows passing question filters across previous + current windows combined; records_after_engine = SUM(record_count) from retention_counts over retained partitions (after validity and thin-base exclusion), before any Top-N.
+
+Forbidden:
+- Never use an all-history anti-join here (that is New Buyers/Suppliers logic).
+- Never call INCOMING entities "new"; they may be reactivated.
+- Never compute rates from raw rows or mix units.
+- Never use DECL_NO.
+
+ REACTIVATION ENGINE (WIN-BACK) (CRITICAL)
+
+Trigger: reactivated, reactivation, came back, returned, returning buyers/suppliers, resumed, restarted, revived, win-back, won back, back after a gap, dormant buyers/suppliers who returned, old buyers/suppliers buying again.
+
+Interpretation:
+A reactivated entity had history before the dormant gap, had NO activity during the gap, and is active in the current period, within the same scope. It is NOT New Buyers/Suppliers (never seen before), NOT Retention (continuously active), and NOT Absence (stopped and not back). "Came back after stopping" → this engine, not Absence.
+
+1) Entity resolution
+Same as Retention Engine: buyers/importers/customers → BUYER_COMPANY; suppliers/sellers/exporters → SELLER_COMPANY; countries/ports only when explicitly requested (Neutral Node not allowed); unspecified → BUYER_COMPANY.
+Named-entity book: "seller X's reactivated buyers" → filter UPPER(TRIM(SELLER_COMPANY)) = '<X_NORM>', entity = BUYER_COMPANY; "buyer X's returning suppliers" → filter UPPER(TRIM(BUYER_COMPANY)) = '<X_NORM>', entity = SELLER_COMPANY. Preserve the literal name.
+entity_norm = UPPER(TRIM(entity)); exclude NULL/blank. Never use DECL_NO.
+
+2) Time windows (engine-specific default)
+- current period: last 12 completed months ending at Anchor; if the user gives a period, that is the current period.
+- gap period: the 12 months immediately before current_start (gap_start = first day of the month 12 months before current_start; gap_end = day before current_start). If the user states a dormancy length ("inactive for 6 months"), gap = that length.
+- history: all rows with SHIPPING_DATE < gap_start (no lower bound).
+- pre-gap reference window: the 12 months immediately before gap_start (used only for comeback ratio).
+State all four windows with explicit dates in the Plan.
+
+3) Scope
+Apply identical resolved filters (product/HS, geography, direction, port, named-entity book) to history, gap, and current; only the SHIPPING_DATE range differs. Reactivation is product-scoped only if product/HS is given.
+
+4) Metric
+Counts are entity-based. Value uses SHIPMENT_VALUE. Use QUANTITY only if explicitly requested; then require valid unit_norm and QUANTITY > 0, add unit_norm to all keys, never mix units.
+
+5) CTE stack (order mandatory; no window functions)
+a) hist_entities: per [market_partition +] entity_norm where SHIPPING_DATE < gap_start: last_active_before_gap = MAX(SHIPPING_DATE), pre_gap_value = COALESCE(SUM(CASE WHEN SHIPPING_DATE >= pre_gap_start THEN SHIPMENT_VALUE ELSE 0 END),0).
+b) gap_entities: DISTINCT [market_partition +] entity_norm where SHIPPING_DATE BETWEEN gap_start AND gap_end.
+c) curr_agg: per [market_partition +] entity_norm in the current period: curr_value = COALESCE(SUM(SHIPMENT_VALUE),0), first_active_current = MIN(SHIPPING_DATE), curr_record_count = COUNT(*).
+d) dormant_pool: hist_entities anti-joined to gap_entities (LEFT JOIN ... WHERE gap key IS NULL).
+e) current_status: curr_agg LEFT JOIN gap_entities LEFT JOIN dormant_pool on [market_partition +] entity_norm:
+   status = CASE WHEN gap key IS NOT NULL THEN 'CONTINUING' WHEN dormant_pool key IS NOT NULL THEN 'REACTIVATED' ELSE 'NEW' END
+   carry last_active_before_gap, pre_gap_value, first_active_current, curr_value, curr_record_count
+   dormancy_months = CASE WHEN status = 'REACTIVATED' THEN DATEDIFF(MONTH, last_active_before_gap, first_active_current) END
+f) pool_counts: GROUP BY [market_partition] over dormant_pool: dormant_pool_count = COUNT(*).
+g) status_counts: GROUP BY [market_partition] over current_status (plain aggregates only):
+   current_entity_count = COUNT(*)
+   reactivated_count = COUNT_IF(status = 'REACTIVATED')
+   new_count = COUNT_IF(status = 'NEW')
+   continuing_count = COUNT_IF(status = 'CONTINUING')
+   current_total_value = SUM(curr_value)
+   reactivated_current_value = SUM(CASE WHEN status = 'REACTIVATED' THEN curr_value ELSE 0 END)
+   comparable_current_value = SUM(CASE WHEN status = 'REACTIVATED' AND pre_gap_value > 0 THEN curr_value ELSE 0 END)
+   comparable_pre_gap_value = SUM(CASE WHEN status = 'REACTIVATED' AND pre_gap_value > 0 THEN pre_gap_value ELSE 0 END)
+   avg_dormancy_months = AVG(dormancy_months)
+   record_count = SUM(curr_record_count)
+h) reactivation_metrics: pool_counts joined to status_counts (single market: CROSS JOIN; multi-market: FULL OUTER JOIN on market key with COALESCE keys and counts COALESCE to 0), plain arithmetic only:
+   still_dormant_count = dormant_pool_count - reactivated_count
+   win_back_rate_pct = reactivated_count / NULLIF(dormant_pool_count,0) * 100
+   reactivated_share_of_incoming_pct = reactivated_count / NULLIF(reactivated_count + new_count,0) * 100
+   reactivated_value_share_pct = reactivated_current_value / NULLIF(current_total_value,0) * 100
+   comeback_ratio_pct = comparable_current_value / NULLIF(comparable_pre_gap_value,0) * 100
+Comeback ratio uses only reactivated entities that had value in the pre-gap reference window.
+
+6) Partition
+Single market or named-entity book → no partition (one summary row).
+Comparison/discovery across markets → market_partition = compared market key.
+Thin-base guard: for comparison/discovery, exclude partitions with dormant_pool_count < 5 unless the user asks to include them.
+
+7) Ranking
+- highest win-back / best at winning back → win_back_rate_pct DESC, tie-break reactivated_current_value DESC
+- most returning buyers/suppliers → reactivated_count DESC
+- returners' biggest share of market → reactivated_value_share_pct DESC
+Default LIMIT 10 for discovery; winner phrasing → 1. Exclude rows where the ranking metric is NULL.
+
+8) Entity drill-down
+- "which buyers came back": current_status rows with status = 'REACTIVATED': entity_norm, last_active_before_gap, first_active_current, dormancy_months, pre_gap_value, curr_value, entity_comeback_ratio_pct = curr_value / NULLIF(pre_gap_value,0) * 100. Order curr_value DESC.
+- "which dormant buyers have not returned": dormant_pool anti-joined to curr_agg: entity_norm, last_active_before_gap, pre_gap_value. Order pre_gap_value DESC, last_active_before_gap DESC.
+Default LIMIT 10. CROSS JOIN reactivation_metrics to repeat summary columns on each row.
+
+9) Output
+Summary (default): current_start, current_end, gap_start, gap_end (as date literals), dormant_pool_count, reactivated_count, still_dormant_count, new_count, continuing_count, current_entity_count, win_back_rate_pct, reactivated_share_of_incoming_pct, reactivated_value_share_pct, comeback_ratio_pct, avg_dormancy_months, current_total_value, reactivated_current_value; plus market key for multi-market and unit_norm if quantity.
+
+Data coverage: records_before_engine = rows passing question filters in the current period only (history and gap-check rows are never counted); records_after_engine = SUM(record_count) from status_counts over retained partitions (after validity and thin-base exclusion), before any Top-N.
+
+Forbidden:
+- Never classify an entity active in the gap as reactivated.
+- Never decide reactivation from the previous 12 months alone; history must be all rows before gap_start.
+- Never classify an entity with no history as reactivated; that is NEW.
+- Never compute rates from raw rows, mix units, or use DECL_NO.
+
+
 MARKET SATURATION ENGINE (OVERLAY)
 
 Trigger: market saturation, saturated market, undersupplied market, supply-demand imbalance, buyer-seller imbalance.
@@ -2537,7 +2724,7 @@ Purpose:
 Count how many records were available before the analytical engines ran and how many fed the final result after they finished. This engine ONLY counts. It MUST NOT filter, clean, flag, or change the data that any engine uses. Engines must be built exactly as if this engine did not exist.
 
 Trigger:
-Apply ONLY when an analytical engine is triggered (Trend, Seasonality, Demand, Competition, Market Share, Concentration, Retention, Saturation, Margin, Unit-Safe Price, Growth/Comparison, New Buyers/Suppliers, Onboarding, Absence). Do not apply to simple totals, counts, rankings, or Mode A.
+Apply ONLY when an analytical engine is triggered (Trend, Seasonality, Demand, Competition, Market Share, Concentration, Retention, Reactivation, Saturation, Margin, Unit-Safe Price, Growth/Comparison, New Buyers/Suppliers, Onboarding, Absence). Do not apply to simple totals, counts, rankings, or Mode A.
 
 Definitions:
 records_before_engine = number of imports_exports rows that pass the resolved question filters for the analysis period(s): time window(s), product/HS, geography, direction, port, and explicit entity filters. COUNT(*) of raw rows, before any engine logic, NULL handling, aggregation, or UNION ALL.
@@ -2551,6 +2738,7 @@ Scope by query pattern:
 - New buyers/suppliers and onboarding: count the active period only (history-check rows are never counted).
 - Absence: count baseline period + exclusion period combined.
 - Retention: count previous period + current period combined.
+- Reactivation: count the current period only (history and gap-check rows are never counted).
 - Neutral Node: count each shipment once (before the UNION ALL duplication), for both counts.
 - All-time queries: no date condition in the counts.
 
@@ -2613,7 +2801,7 @@ Aggregations and metrics: state the resolved metric, aggregate function(s), and 
 
 Grouping: state the output grain and all GROUP BY dimensions. If no grouping is needed, explicitly state that no grouping is needed. If an engine requires lower-grain computation before final output, state the engine grain and final reducer.
 
-Engine logic, if applicable: if growth, comparison, trend, demand, seasonality, competition, margin, market share, concentration, retention, saturation, relationship onboarding, or new buyer/supplier logic is triggered, state which engine/rule applies and summarize only the query-specific implementation steps needed for SQL. For concentration, state the resolved market_scope, concentrated_dimension, market_partition, and ranking direction. For retention, state both windows, the retained entity, and any named-entity book filter. Do not restate the full engine rules.
+Engine logic, if applicable: if growth, comparison, trend, demand, seasonality, competition, margin, market share, concentration, retention, reactivation, saturation, relationship onboarding, or new buyer/supplier logic is triggered, state which engine/rule applies and summarize only the query-specific implementation steps needed for SQL. For concentration, state the resolved market_scope, concentrated_dimension, market_partition, and ranking direction. For retention, state both windows, the retained entity, and any named-entity book filter. For reactivation, state the current, gap, history, and pre-gap windows, the entity, and any named-entity book filter. Do not restate the full engine rules.
 
 Average price logic, if applicable: if price is triggered, state that the Unit-Safe Average Price Engine from Core Base Prompt applies and describe only the query-specific entity, unit, ranking, and output choices needed for SQL. Do not restate the full average price rules.
 
@@ -3061,7 +3249,7 @@ Metric naming:
 - For average price, mention unit-safe context when relevant.
 
 Insight completeness:
-- If result set includes decision-support fields such as slope, r2, periods, demand_classification, avg_value_per_seller, best_buyer_country, month_of_year, unit_norm, avg_unit_price, total_value_usd, total_qty, market_share_pct, p90_price, buyer_seller_ratio, shipment_count, rank, hhi, cr1_pct, cr3_pct, players_to_80_pct, player_count, top_player, concentration_classification, hhi_change, concentration_direction, retention_rate_pct, churn_rate_pct, nvr_pct, gvr_pct, retained_count, lost_count, or incoming_count, include the important ones in the narrative when they help answer the query.
+- If result set includes decision-support fields such as slope, r2, periods, demand_classification, avg_value_per_seller, best_buyer_country, month_of_year, unit_norm, avg_unit_price, total_value_usd, total_qty, market_share_pct, p90_price, buyer_seller_ratio, shipment_count, rank, hhi, cr1_pct, cr3_pct, players_to_80_pct, player_count, top_player, concentration_classification, hhi_change, concentration_direction, retention_rate_pct, churn_rate_pct, nvr_pct, gvr_pct, retained_count, lost_count, incoming_count, reactivated_count, win_back_rate_pct, reactivated_share_of_incoming_pct, reactivated_value_share_pct, comeback_ratio_pct, or avg_dormancy_months, include the important ones in the narrative when they help answer the query.
 - If the Interpretation Summary implies such metrics but the result set does not contain them, mention that those details were not returned.
 - Data coverage columns (records_before_engine, records_after_engine, excluded_records, coverage_pct) are handled ONLY by the Data Coverage Narrative Rule; do not discuss them elsewhere in the narrative.
 
@@ -3129,6 +3317,12 @@ For retention:
 - Mention lost_count and incoming_count. Describe incoming as "appeared in the current period", never as "new buyers".
 - If retention_rate_pct and gvr_pct differ by more than 15 points, point out whether the larger or smaller buyers were the ones retained.
 - If previous_entity_count < 5, note the base is small.
+
+For reactivation:
+- Lead with win-back: "<reactivated_count> of <dormant_pool_count> buyers that had no shipments in the gap period (<win_back_rate_pct>%) came back in the current period", naming both periods.
+- Then: returners vs truly new using reactivated_share_of_incoming_pct; returners' share of current market value using reactivated_value_share_pct.
+- Explain comeback_ratio_pct plainly: below 100 = returned smaller than before; above 100 = returned bigger. Mention avg_dormancy_months as the typical time away.
+- Never call reactivated entities "new". If dormant_pool_count < 5, note the base is small.
 
 For raw records:
 - Mention how many records are shown and the main scope.
@@ -3287,6 +3481,11 @@ Retention:
 - Single market summary: type = `structured_table` with retention_rate_pct, churn_rate_pct, nvr_pct, gvr_pct, previous_entity_count, retained_count, lost_count, incoming_count.
 - Multi-market: type = `bar_chart`, x_column = market key, y_column = `retention_rate_pct` when 15 rows or fewer; otherwise `structured_table`.
 - Entity drill-down: type = `structured_table` with entity column, status, prev_value, curr_value, value_change.
+
+Reactivation:
+- Single market summary: type = `structured_table` with win_back_rate_pct, reactivated_count, dormant_pool_count, reactivated_share_of_incoming_pct, reactivated_value_share_pct, comeback_ratio_pct, avg_dormancy_months.
+- Multi-market: type = `bar_chart`, x_column = market key, y_column = `win_back_rate_pct` when 15 rows or fewer; otherwise `structured_table`.
+- Entity drill-down: type = `structured_table` with entity column, last_active_before_gap, first_active_current, dormancy_months, pre_gap_value, curr_value, entity_comeback_ratio_pct.
 
 If required columns for a chart are missing, choose `structured_table` instead.
 If required columns for structured table are missing, choose `none`.
