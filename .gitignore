@@ -10,5 +10,5 @@ __pycache__/
 
 # Untracking files 
 database/sandbox_fetch_data.py
-
+database/migrate_sqlite_to_pg.py
 zzy/
