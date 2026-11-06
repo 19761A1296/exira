@@ -15,7 +15,7 @@ Prompt A can answer database-backed trade questions about:
 - shipment records, distinct listings, and simple lookups
 - trade value, quantity, shipment count, buyer/seller count
 - average price and price comparisons
-- rankings, comparisons, growth, trend, and seasonality
+- rankings, comparisons, growth, growth momentum, growth acceleration, trend, and seasonality
 - demand, competition, market share, saturation
 - premium-price buyers/suppliers
 - concentration, dominance and dependency on few players
@@ -107,6 +107,14 @@ Prompt A can understand these high-level analytical meanings:
 - Growth:
   increase/decrease versus prior period, MoM, QoQ, YoY, growth rate, change
 
+- Growth momentum:
+  which markets/buyers/suppliers/products are gaining or losing momentum, strongest or weakest momentum, gaining traction, losing traction
+  Momentum is a defined capability, not plain growth.
+
+- Growth acceleration:
+  growth speeding up or slowing down, accelerating or decelerating markets, slowdown, growth rate rising or falling, growing faster or slower than before
+  Acceleration is a defined capability, not plain growth or trend.
+
 - Seasonality:
   best month, peak month, lowest month, usual rise/fall period, recurring pattern
 
@@ -152,6 +160,7 @@ Prompt A can understand these high-level analytical meanings:
 Prompt A scope also supports exploratory trade guidance at a business level.
 Useful exploration paths include:
 - demand/growth markets
+- markets/buyers/suppliers/products gaining momentum or accelerating
 - top buyers/sellers
 - low competition markets
 - premium-paying buyers
@@ -547,6 +556,7 @@ Step 6) Concrete executable trade query
 If the user message is a clear trade query that prompt_a_skeleton supports:
 - action=CONFIRM_QUERY
 - final_query_text must be the clean executable user question
+- Preserve analytical concept words exactly when they carry engine meaning: momentum, growth momentum, gaining momentum, losing momentum, traction, acceleration, accelerating, deceleration, decelerating, slowing growth, speeding up, growth rate rising, and growth rate falling. Never rewrite these into generic wording such as "growth performance", "period-over-period growth", "growth series", or plain "growth rate", because downstream Prompt A distinguishes Growth Momentum and Growth Acceleration from ordinary Growth/Trend logic.
 - do not ask unnecessary clarifications
 - do not ask for dates, units, or currency unless absolutely required; Prompt A defaults handle them
 - do not generate SQL
@@ -955,6 +965,7 @@ And the query does NOT contain triggers requiring analytics/derived metrics, suc
 - average/avg/price/unit price/cheap/expensive
 - trend/over time/monthly/seasonal/seasonality/peak month
 - growth/MoM/QoQ/YoY/compare
+- momentum/growth momentum/gaining momentum/losing momentum/traction/acceleration/accelerating/decelerating/slowing growth/speeding up
 - demand/competition/margin/saturation
 - new buyers/new suppliers/onboarded/first-time
 
@@ -1566,7 +1577,13 @@ If the user asks the share of one named entity → distribution, not concentrati
 Share / percentage of total / market share / contribution.
 6. count
 “How many / number of / count of” entities or shipments.
-(Count intent overrides ranking words.)
+(Count intent overrides ranking words. If counting entities by momentum or acceleration, run that engine first, then count by class.)
+
+INSERTED PRIORITY TYPES (CRITICAL — evaluated after count and before item 7 trend):
+- acceleration: accelerating / decelerating / growth speeding up or slowing down / growth rate rising or falling / growing faster or slower than before / slowdown. Use the Growth Acceleration Engine.
+- momentum: momentum / growth momentum / gaining or losing momentum / gaining or losing traction. Use the Growth Momentum Engine.
+If acceleration or momentum matches, select that type and do not fall through to trend, growth, comparison, or ranking merely because those words also appear. Acceleration has priority over momentum when both meanings are explicitly present only for the acceleration portion; if the user explicitly requests both engines, run both under the combined-engine rule.
+
 7. trend
 Trend / over time / monthly/weekly series / slope/r2 / “is demand increasing” across multiple periods.
 8. seasonality
@@ -1627,6 +1644,7 @@ and must enforce ranking in SQL.
 
 
 GROWTH & COMPARISON RULES
+Scope guard (CRITICAL): All existing rules in this section remain unchanged and apply to plain growth/comparison questions. If the query explicitly asks for momentum/traction, use the Growth Momentum Engine instead of this section for that analytical concept. If the query explicitly asks for acceleration/deceleration/growth speeding up/slowing down, use the Growth Acceleration Engine instead of this section for that analytical concept. Do not substitute plain Growth rules, cycle growth, overall_growth_pct, or the observed-only LAG growth series for Momentum or Acceleration calculations.
 1) Mode Resolution & Math
 First, classify the growth mode based on linguistic triggers:
 ABSOLUTE MODE
@@ -1893,85 +1911,6 @@ Ranking:
 Return entity_norm, total_value_usd, shipment_count, plus any requested geo/product context (and unit_norm only if quantity was used).
 
 
-
- RETENTION ENGINE (BUYER/SELLER LIFECYCLE) (CRITICAL)
-
-Trigger: retention, retained, retain, still buying/supplying/active, repeat buyers/suppliers, kept buyers/suppliers, churn, churn rate, attrition, loyalty, stickiness, "how many of last year's buyers are still buying", "are we keeping our customers".
-
-Interpretation:
-Retention measures whether entities active in the previous period are still active in the current period within the same scope. It is NOT growth (change in market value), NOT New Buyers/Suppliers (all-history newness), and NOT Absence (a list of stopped entities). If the user asks only "which buyers stopped" as a list, use Absence Engine. If the user asks a rate, share, churn, how many stayed, or retention, use this engine.
-
-1) Entity resolution
-- buyers/importers/customers → BUYER_COMPANY
-- suppliers/sellers/exporters → SELLER_COMPANY
-- countries/markets/ports only when explicitly requested → that column per Core geography/port mapping (Neutral Node not allowed)
-- unspecified → BUYER_COMPANY
-Named-entity book: "retention of seller X's buyers" → filter UPPER(TRIM(SELLER_COMPANY)) = '<X_NORM>', entity = BUYER_COMPANY. "buyer X's supplier retention" → filter UPPER(TRIM(BUYER_COMPANY)) = '<X_NORM>', entity = SELLER_COMPANY. Preserve the literal name.
-entity_norm = UPPER(TRIM(entity)); exclude NULL/blank. Never use DECL_NO.
-
-2) Time windows (engine-specific default)
-- No timeframe: current period = last 12 completed months ending at Anchor; previous period = the 12 months immediately before it (24 months total).
-- User gives one period (e.g., "in 2025", "last 6 months"): that is the current period; previous period = equal-length window immediately before it (calendar-year shift when the current period is a calendar year).
-- User gives both periods explicitly: use them as stated.
-Always state both windows with explicit start_date and end_date in the Plan.
-
-3) Scope
-Apply identical resolved filters (product/HS, geography, direction, port, named-entity book) to both windows; only the SHIPPING_DATE range differs. Retention is product-scoped only if product/HS is given.
-
-4) Activity
-An entity is active in a window if at least one in-scope row exists in that window.
-
-5) Metric
-Count retention is always entity-count based. Value retention uses SHIPMENT_VALUE. Use QUANTITY only if explicitly requested; then require valid unit_norm and QUANTITY > 0, add unit_norm to all keys, and never mix units.
-
-6) CTE stack (order mandatory; no window functions)
-a) prev_agg: per [market_partition +] entity_norm in the previous window: prev_value = COALESCE(SUM(SHIPMENT_VALUE),0), prev_record_count = COUNT(*).
-b) curr_agg: per [market_partition +] entity_norm in the current window: curr_value = COALESCE(SUM(SHIPMENT_VALUE),0), curr_record_count = COUNT(*).
-c) entity_status: FULL OUTER JOIN prev_agg and curr_agg on [market_partition +] entity_norm, with COALESCE on join keys. status = 'RETAINED' when both sides exist, 'LOST' when previous only, 'INCOMING' when current only. prev_value and curr_value COALESCE to 0. retained_floor_value = CASE WHEN status = 'RETAINED' THEN LEAST(prev_value, curr_value) ELSE 0 END. record_count = COALESCE(prev_record_count,0) + COALESCE(curr_record_count,0).
-d) retention_counts: GROUP BY [market_partition] over entity_status (plain aggregates only):
-   previous_entity_count = COUNT_IF(status IN ('RETAINED','LOST'))
-   current_entity_count = COUNT_IF(status IN ('RETAINED','INCOMING'))
-   retained_count = COUNT_IF(status = 'RETAINED')
-   lost_count = COUNT_IF(status = 'LOST')
-   incoming_count = COUNT_IF(status = 'INCOMING')
-   previous_total_value = SUM(prev_value)
-   current_total_value = SUM(curr_value)
-   retained_current_value = SUM(CASE WHEN status = 'RETAINED' THEN curr_value ELSE 0 END)
-   retained_floor_total = SUM(retained_floor_value)
-   record_count = SUM(record_count)
-e) retention_metrics: select from retention_counts (plain arithmetic only):
-   retention_rate_pct = retained_count / NULLIF(previous_entity_count,0) * 100
-   churn_rate_pct = lost_count / NULLIF(previous_entity_count,0) * 100
-   nvr_pct = retained_current_value / NULLIF(previous_total_value,0) * 100
-   gvr_pct = retained_floor_total / NULLIF(previous_total_value,0) * 100
-Compute rates only in e), never in the same SELECT as the aggregates of d).
-
-7) Partition
-Single market or named-entity book → no partition (one summary row).
-Comparison/discovery across markets (e.g., "which countries retain cotton buyers best") → market_partition = the compared market key; entity matching happens within each market.
-Thin-base guard: for comparison/discovery, exclude partitions with previous_entity_count < 5 unless the user asks to include them.
-
-8) Ranking
-- highest retention / most loyal → retention_rate_pct DESC, tie-break nvr_pct DESC
-- highest churn / losing most buyers → churn_rate_pct DESC
-- "value retention" wording → nvr_pct DESC
-Default LIMIT 10 for discovery; winner phrasing → 1. Exclude rows where the ranking rate is NULL.
-
-9) Entity drill-down
-If the user asks which entities were retained/lost/incoming, or which retained entities grew/shrank: return entity_status rows filtered to the requested status with entity_norm, status, prev_value, curr_value, value_change = curr_value - prev_value. Order RETAINED/INCOMING by curr_value DESC, LOST by prev_value DESC, or by value_change when the user asks grew/shrank. Default LIMIT 10. CROSS JOIN retention_metrics to repeat the summary columns on each row.
-
-10) Output
-Summary (default): previous_start, previous_end, current_start, current_end (as date literals), previous_entity_count, current_entity_count, retained_count, lost_count, incoming_count, retention_rate_pct, churn_rate_pct, nvr_pct, gvr_pct, previous_total_value, current_total_value, retained_current_value; plus market key for multi-market and unit_norm if quantity.
-
-Data coverage: records_before_engine = rows passing question filters across previous + current windows combined; records_after_engine = SUM(record_count) from retention_counts over retained partitions (after validity and thin-base exclusion), before any Top-N.
-
-Forbidden:
-- Never use an all-history anti-join here (that is New Buyers/Suppliers logic).
-- Never call INCOMING entities "new"; they may be reactivated.
-- Never compute rates from raw rows or mix units.
-- Never use DECL_NO.
-
-
 ASSUMPTION RULES (CRITICAL)
 
 You MUST NOT assume:
@@ -2052,6 +1991,12 @@ If monthly/quarterly/yearly growth series is requested, SQL must include:
 - absolute_growth, percentage_growth (NULL when prev NULL/0)
 - overall_growth_pct = AVG(valid percentage_growth) per entity
 Grain: <=12m monthly → month_start; >12m monthly → month_of_year cycle; QoQ → quarter_start unless quarter-cycle requested; YoY → year_start.
+
+ Growth momentum (table-ready)
+Return one row per resolved entity (or entity + unit_norm for QUANTITY) with the real entity column plus: current_value, previous_value, absolute_change, growth_pct, recent_current_value, recent_previous_value, recent_change, recent_growth_pct, momentum_delta_pp, growth_contribution_pp, share_of_positive_growth_pct when computed, momentum_class, momentum_rank. Do not return a period series unless the user separately asks for one.
+
+ Growth acceleration (table-ready)
+Return one row per resolved entity (or entity + unit_norm for QUANTITY) with the real entity column plus: recent_value, recent_base_value, prior_value, prior_base_value, recent_growth_pct, prior_growth_pct, acceleration_pp, recent_abs_change, acceleration_class, acceleration_rank. Do not return a period series unless the user separately asks for one.
 
  Average price
 Follow Unit-Safe Average Price Engine. Return only required price fields; for global avg price with no unit, follow “max 3 units” rule.
@@ -2718,13 +2663,217 @@ high_margin_entity_count = COUNT_IF(entity_avg_unit_price >= p90_price)
 total_value_usd = SUM(entity_total_value_usd) over retained entities (per product_dimension + unit_norm or reduced as requested).
 
 
+GROWTH MOMENTUM ENGINE (CRITICAL)
+
+Trigger:
+momentum, growth momentum, gaining momentum, losing momentum, strongest/weakest momentum, building momentum, gaining traction, losing traction, momentum strengthening, momentum weakening.
+Plain growth wording such as growth, growth rate, fastest growing, increase, MoM, QoQ, or YoY does NOT trigger this engine by itself. Acceleration/deceleration wording triggers the Growth Acceleration Engine instead.
+
+Meaning:
+Growth Momentum measures whether an entity has grown in the current seasonally aligned window versus the same months one year earlier AND whether positive/negative movement is still present in the most recent completed months. It is not an arbitrary composite score, not an average of period-over-period growth rates, not a regression slope, and not a calendar-year comparison unless the user explicitly names a calendar year.
+
+Precedence (CRITICAL):
+When Growth Momentum is triggered, preserve all Core rules but do not use the plain Growth section's cycle growth, overall_growth_pct = AVG(percentage_growth), observed-only LAG growth series, or 4-layer growth CTE stack to calculate momentum. The existing Growth rules remain unchanged for ordinary growth queries.
+
+1) Completed-month anchor and windows
+Use the Core Timeline ANCHOR_DATE, which is already the last day of the most recently completed month. Therefore Momentum never uses a partial current month.
+END_DATE = ANCHOR_DATE unless the user gives an explicit valid completed-period end under Core Timeline rules.
+L = current-window length in months:
+- No timeframe -> L = 12.
+- User states a recent length N <= 12 months -> L = N.
+- User states a range/length > 12 months -> L = 12 and current window is the last 12 completed months within that stated range. State this interpretation in the Interpretation Summary.
+- Explicit past calendar year Y -> current window is Y-01-01 through Y-12-31; base window is the full calendar year Y-1; recent windows use the last 3 months of Y and the same 3 months in Y-1.
+- Explicit current year follows the existing Core Timeline rule: rolling 12 completed months ending at ANCHOR_DATE.
+Current window C = first day of the month (L-1) months before END_DATE month through END_DATE.
+Base window P = C shifted back exactly 12 months, preserving the same calendar months. For L < 12, never compare with the immediately preceding short window; use the same months one year earlier to control seasonality.
+Recent window RC = last R completed months ending at END_DATE, where R = LEAST(3, L).
+Recent base window RP = RC shifted back exactly 12 months.
+Scan span = P_start through END_DATE. Use one filtered scan over this span.
+Never build Momentum windows with DATE_TRUNC('QUARTER'), DATE_TRUNC('YEAR'), generated month series, or partial months.
+The SQL Implementation Plan MUST state C, P, RC, and RP with literal dates.
+
+Example with ANCHOR_DATE 2026-10-31 and no timeframe:
+C = 2025-11-01 to 2026-10-31; P = 2024-11-01 to 2025-10-31; RC = 2026-08-01 to 2026-10-31; RP = 2025-08-01 to 2025-10-31; scan span = 2024-11-01 to 2026-10-31.
+
+2) Metric
+Default VALUE: metric = SHIPMENT_VALUE. VALUE must not add UNIT or QUANTITY filters.
+QUANTITY only when explicitly requested: require UNIT IS NOT NULL, TRIM(UNIT) <> '', QUANTITY > 0, define unit_norm = UPPER(TRIM(UNIT)), and compute at entity_norm + unit_norm. Never mix units.
+
+3) Entity grain
+Resolve the compared entity using existing Core direction/geography/product rules:
+- export markets/destinations -> BUYER_COUNTRY
+- sourcing markets/origins -> SELLER_COUNTRY
+- buyers/customers/importers -> BUYER_COMPANY
+- suppliers/sellers/exporters -> SELLER_COMPANY
+- products with no named product -> HS_CODE
+- ports -> resolved port column
+For text entities, entity_norm = UPPER(TRIM(entity_column)); exclude NULL/blank entity. Every scope filter (company, product/HS, geography, direction, port) applies identically to all Momentum windows.
+
+4) Required computation shape
+entity_windows: filter first over scan span and GROUP BY entity_norm (plus unit_norm for QUANTITY). Use conditional aggregation so months without shipments contribute zero to each window aggregate:
+- current_value = COALESCE(SUM(CASE WHEN SHIPPING_DATE BETWEEN C_start AND C_end THEN metric ELSE 0 END), 0)
+- previous_value = COALESCE(SUM(CASE WHEN SHIPPING_DATE BETWEEN P_start AND P_end THEN metric ELSE 0 END), 0)
+- recent_current_value = COALESCE(SUM(CASE WHEN SHIPPING_DATE BETWEEN RC_start AND RC_end THEN metric ELSE 0 END), 0)
+- recent_previous_value = COALESCE(SUM(CASE WHEN SHIPPING_DATE BETWEEN RP_start AND RP_end THEN metric ELSE 0 END), 0)
+- record_count = COUNT(*)
+Do not use LAG() and do not build a generated month series.
+
+base_guard: exactly one row (or one row per unit_norm for QUANTITY), computed from entity_windows where previous_value > 0:
+- base_p25 = PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY previous_value)
+- base_entity_count = COUNT(*)
+
+momentum_metrics:
+- absolute_change = current_value - previous_value
+- growth_pct = (current_value - previous_value) / NULLIF(previous_value, 0) * 100
+- recent_change = recent_current_value - recent_previous_value
+- recent_growth_pct = (recent_current_value - recent_previous_value) / NULLIF(recent_previous_value, 0) * 100
+- momentum_delta_pp = recent_growth_pct - growth_pct. This is a diagnostic showing whether the recent YoY growth rate is stronger or weaker than the broader-window YoY growth rate. It is measured in percentage points and is NOT an arbitrary momentum score.
+- growth_contribution_pp = absolute_change / NULLIF(SUM(previous_value) OVER (), 0) * 100 (PARTITION BY unit_norm for QUANTITY). This is the entity's contribution to aggregate base-relative growth in percentage points; do NOT call it the entity's percent share of total growth.
+- share_of_positive_growth_pct, when useful for explanation = CASE WHEN absolute_change > 0 THEN absolute_change / NULLIF(SUM(CASE WHEN absolute_change > 0 THEN absolute_change ELSE 0 END) OVER (), 0) * 100 END (PARTITION BY unit_norm for QUANTITY). This answers what share of all positive absolute growth came from the entity. Keep it distinct from growth_contribution_pp.
+
+5) Momentum classification
+Evaluate momentum_class in exactly this order. Classification uses absolute_change and recent_change signs so zero percentage bases cannot break classification:
+1. previous_value = 0 AND current_value > 0 -> NEW
+2. current_value = 0 AND previous_value > 0 -> LOST
+3. current_value = 0 AND previous_value = 0 -> INACTIVE
+4. base_entity_count >= 4 AND previous_value < base_p25 -> LOW_BASE
+5. absolute_change > 0 AND recent_change > 0 -> POSITIVE MOMENTUM
+6. absolute_change > 0 -> FADING MOMENTUM
+7. recent_change > 0 -> EARLY RECOVERY
+8. otherwise -> NEGATIVE MOMENTUM
+
+Interpretation of momentum_delta_pp within POSITIVE MOMENTUM:
+- positive momentum_delta_pp -> recent YoY growth is strengthening relative to the broader window
+- negative momentum_delta_pp -> growth remains positive but recent YoY growth is weakening
+- approximately zero -> broadly stable positive momentum
+Do not create extra classes from momentum_delta_pp unless the user explicitly asks for strengthening/weakening detail; the canonical momentum_class above remains the primary classification.
+
+6) Ranking
+For gaining/strongest/which entities have momentum:
+- Assign momentum_rank ONLY to POSITIVE MOMENTUM rows.
+- ORDER ranked rows by growth_pct DESC, recent_growth_pct DESC, absolute_change DESC.
+- NEW, LOW_BASE, and NULL-growth rows are never ranked against established growth-rate rows.
+For losing/weakest momentum:
+- Assign momentum_rank ONLY to NEGATIVE MOMENTUM rows.
+- ORDER by growth_pct ASC, recent_growth_pct ASC, absolute_change ASC.
+If user asks biggest gain in value/largest increase/added the most, rank POSITIVE MOMENTUM by absolute_change DESC instead.
+Return every classified entity unless the user explicitly requests only a class. Apply Core default-N/user Top-N only to the ranked class. If user asks how many, classify first and then count entities by momentum_class.
+Recommended display order for positive intent: POSITIVE MOMENTUM, FADING MOMENTUM, EARLY RECOVERY, NEW, NEGATIVE MOMENTUM, LOST, LOW_BASE, INACTIVE.
+Recommended display order for negative intent: NEGATIVE MOMENTUM, LOST, FADING MOMENTUM, EARLY RECOVERY, POSITIVE MOMENTUM, NEW, LOW_BASE, INACTIVE.
+
+7) Output
+Return the real entity column, unit_norm only for QUANTITY, current_value, previous_value, absolute_change, growth_pct, recent_current_value, recent_previous_value, recent_change, recent_growth_pct, momentum_delta_pp, growth_contribution_pp, share_of_positive_growth_pct when computed, momentum_class, momentum_rank, plus Data Coverage columns. Round percentage and percentage-point columns to 2 decimals.
+Never report NEW entities with a growth percentage derived from a zero base.
+
+8) Data coverage
+records_before_engine = imports_exports rows in the full Momentum scan span passing only the resolved question filters. records_after_engine = SUM(record_count) across retained classified entities before Top-N/rank display filtering. Every classified class is retained; normal engine validity rules such as blank-entity exclusion and invalid-unit/quantity exclusion for QUANTITY determine exclusions.
+
+
+GROWTH ACCELERATION ENGINE (CRITICAL)
+
+Trigger:
+accelerating, acceleration, growth acceleration, decelerating, deceleration, slowing growth, growth slowing down, growth speeding up, growth picking up pace, growth rate rising, growth rate falling, growing faster than before, growing slower than before, slowdown.
+
+Meaning:
+Growth Acceleration measures the change in an entity's seasonally aligned year-over-year growth rate between two consecutive, non-overlapping recent blocks. It answers whether growth itself is speeding up or slowing down, not simply how much the entity grew. A move from non-positive growth to positive growth is TURNAROUND, not ACCELERATING; a move from positive growth to non-positive growth is REVERSAL, not ordinary DECELERATING.
+
+Precedence (CRITICAL):
+When Growth Acceleration is triggered, preserve all Core rules but do not use the plain Growth section's cycle growth, overall_growth_pct = AVG(percentage_growth), observed-only LAG growth series, or 4-layer growth CTE stack to calculate acceleration. Existing Growth and Trend engines remain unchanged for their own intents.
+
+1) Completed-month anchor and windows
+Use Core Timeline ANCHOR_DATE, already the last day of the most recently completed month, so Acceleration never uses a partial current month.
+END_DATE = ANCHOR_DATE unless user gives an explicit valid completed-period end under Core Timeline rules.
+Default block length B = 6 months.
+If user explicitly asks for quarterly growth acceleration / acceleration by quarter, B = 3 months, still using seasonally aligned YoY comparisons.
+Important terminology guard: ordinary QoQ growth means one quarter versus the immediately preceding quarter and belongs to existing Growth rules. Do NOT silently call the B=3 seasonally aligned acceleration method ordinary QoQ growth. The B=3 Acceleration method means change in YoY growth between two consecutive 3-month blocks.
+No other default B is allowed unless future engine configuration explicitly adds one.
+Recent block A = last B completed months ending at END_DATE.
+Prior block PB = B completed months immediately before A.
+Recent base AB = A shifted back exactly 12 months.
+Prior base PBB = PB shifted back exactly 12 months.
+Required span = PBB_start through END_DATE, equal to 12 + 2B months (24 months for B=6; 18 months for B=3).
+If user states a shorter timeframe, retain the required historical lookback needed to calculate acceleration and state that interpretation. If user states a longer timeframe, use only the last required span ending at the user's range end unless the user explicitly requests a historical acceleration series.
+Never use partial months, calendar-quarter truncation, calendar-year truncation, or generated period series to build these four windows.
+The SQL Implementation Plan MUST state A, PB, AB, and PBB with literal dates.
+
+Example with ANCHOR_DATE 2026-10-31, B=6:
+A = 2026-05-01 to 2026-10-31; PB = 2025-11-01 to 2026-04-30; AB = 2025-05-01 to 2025-10-31; PBB = 2024-11-01 to 2025-04-30.
+Example with ANCHOR_DATE 2026-10-31, B=3:
+A = 2026-08-01 to 2026-10-31; PB = 2026-05-01 to 2026-07-31; AB = 2025-08-01 to 2025-10-31; PBB = 2025-05-01 to 2025-07-31.
+
+2) Metric and entity grain
+Use the same metric/entity resolution rules as Growth Momentum: VALUE defaults to SHIPMENT_VALUE with no unit filter; QUANTITY is used only when explicitly requested and must be unit-safe at entity_norm + unit_norm. Apply the same resolved scope filters to all four windows and exclude blank text entities.
+
+3) Required computation shape
+entity_windows: filter first over required span, GROUP BY entity_norm (plus unit_norm for QUANTITY), and compute:
+- recent_value = COALESCE(SUM(CASE WHEN SHIPPING_DATE BETWEEN A_start AND A_end THEN metric ELSE 0 END), 0)
+- recent_base_value = COALESCE(SUM(CASE WHEN SHIPPING_DATE BETWEEN AB_start AND AB_end THEN metric ELSE 0 END), 0)
+- prior_value = COALESCE(SUM(CASE WHEN SHIPPING_DATE BETWEEN PB_start AND PB_end THEN metric ELSE 0 END), 0)
+- prior_base_value = COALESCE(SUM(CASE WHEN SHIPPING_DATE BETWEEN PBB_start AND PBB_end THEN metric ELSE 0 END), 0)
+- record_count = COUNT(*)
+Do not use LAG() and do not build a generated period series.
+
+growth_rates:
+- recent_growth_pct = (recent_value - recent_base_value) / NULLIF(recent_base_value, 0) * 100
+- prior_growth_pct = (prior_value - prior_base_value) / NULLIF(prior_base_value, 0) * 100
+- acceleration_pp = recent_growth_pct - prior_growth_pct
+- recent_abs_change = recent_value - recent_base_value
+acceleration_pp is measured in percentage points, never percent.
+
+base_guard: exactly one row (or one per unit_norm for QUANTITY), computed from entity_windows where recent_base_value > 0 AND prior_base_value > 0:
+- base_p25 = PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY recent_base_value + prior_base_value)
+- base_entity_count = COUNT(*)
+
+4) Acceleration tolerance
+DEFAULT_ACCELERATION_TOLERANCE_PP = 5 percentage points.
+If the user explicitly gives an acceleration/deceleration threshold (for example, accelerated by at least 10 percentage points), use that explicit threshold instead of 5 for classification/ranking qualification. Otherwise use 5.
+The tolerance is a business classification threshold, not a mathematical identity, and must be described as such if relevant.
+
+5) Acceleration classification
+Evaluate acceleration_class in exactly this order using tolerance T (default 5 pp):
+1. recent_base_value = 0 OR prior_base_value = 0 -> INSUFFICIENT HISTORY
+2. recent_value = 0 -> INACTIVE
+3. base_entity_count >= 4 AND (recent_base_value + prior_base_value) < base_p25 -> LOW_BASE
+4. prior_growth_pct <= 0 AND recent_growth_pct > 0 -> TURNAROUND
+5. prior_growth_pct > 0 AND recent_growth_pct <= 0 -> REVERSAL
+6. recent_growth_pct > 0 AND acceleration_pp >= T -> ACCELERATING
+7. recent_growth_pct > 0 AND acceleration_pp <= -T -> DECELERATING
+8. recent_growth_pct > 0 -> STEADY GROWTH
+9. acceleration_pp >= T -> DECLINE EASING
+10. acceleration_pp <= -T -> DECLINE DEEPENING
+11. otherwise -> STEADY DECLINE
+TURNAROUND must never be reported/ranked as ACCELERATING. REVERSAL must remain distinct from ordinary DECELERATING.
+
+6) Ranking
+For accelerating/speeding-up intent:
+- Assign acceleration_rank ONLY to ACCELERATING rows.
+- ORDER by acceleration_pp DESC, recent_growth_pct DESC, recent_abs_change DESC.
+For decelerating/slowing-down intent:
+- Assign acceleration_rank ONLY to DECELERATING rows.
+- ORDER by acceleration_pp ASC, recent_growth_pct ASC, recent_abs_change ASC.
+LOW_BASE and INSUFFICIENT HISTORY remain visible but are never ranked against valid acceleration rates.
+Return every classified entity unless user explicitly requests only a class. Apply Core default-N/user Top-N only to the ranked class. If user asks how many, classify first, then count entities by acceleration_class.
+Recommended display order for acceleration intent: ACCELERATING, TURNAROUND, STEADY GROWTH, DECELERATING, REVERSAL, DECLINE EASING, STEADY DECLINE, DECLINE DEEPENING, INACTIVE, INSUFFICIENT HISTORY, LOW_BASE.
+Recommended display order for deceleration intent: DECELERATING, REVERSAL, DECLINE DEEPENING, STEADY GROWTH, ACCELERATING, TURNAROUND, DECLINE EASING, STEADY DECLINE, INACTIVE, INSUFFICIENT HISTORY, LOW_BASE.
+
+7) Output
+Return the real entity column, unit_norm only for QUANTITY, recent_value, recent_base_value, prior_value, prior_base_value, recent_growth_pct, prior_growth_pct, acceleration_pp, recent_abs_change, acceleration_class, acceleration_rank, plus Data Coverage columns. Round percentage and percentage-point columns to 2 decimals.
+
+8) Data coverage
+records_before_engine = imports_exports rows in the full required acceleration span passing only resolved question filters. records_after_engine = SUM(record_count) across retained classified entities before Top-N/rank display filtering. Normal engine validity rules such as blank-entity exclusion and invalid-unit/quantity exclusion for QUANTITY determine exclusions.
+
+
+MOMENTUM + ACCELERATION TOGETHER (CRITICAL)
+If one user question explicitly asks for both Momentum and Acceleration, compute each engine independently at the same resolved entity grain using its own canonical windows and formulas. Use the union of both required scan spans for raw access, but do not force either engine to adopt the other's window definitions. FULL OUTER JOIN the two classified results on entity_norm (and unit_norm for QUANTITY). Output both engine metric/classification sets. Order by the engine the user emphasizes; if neither is emphasized, order by Momentum first. Do not collapse both concepts into a composite score unless the user explicitly defines such a score.
+
+
 DATA COVERAGE ENGINE (COUNTING OVERLAY — ALL NON-MODE-A QUERIES)
 
 Purpose:
 Count how many records were available before the analytical engines ran and how many fed the final result after they finished. This engine ONLY counts. It MUST NOT filter, clean, flag, or change the data that any engine uses. Engines must be built exactly as if this engine did not exist.
 
 Trigger:
-Apply ONLY when an analytical engine is triggered (Trend, Seasonality, Demand, Competition, Market Share, Concentration, Retention, Reactivation, Saturation, Margin, Unit-Safe Price, Growth/Comparison, New Buyers/Suppliers, Onboarding, Absence). Do not apply to simple totals, counts, rankings, or Mode A.
+Apply ONLY when an analytical engine is triggered (Trend, Seasonality, Demand, Competition, Market Share, Concentration, Retention, Reactivation, Saturation, Margin, Unit-Safe Price, Growth/Comparison, Growth Momentum, Growth Acceleration, New Buyers/Suppliers, Onboarding, Absence). Do not apply to simple totals, counts, rankings, or Mode A.
 
 Definitions:
 records_before_engine = number of imports_exports rows that pass the resolved question filters for the analysis period(s): time window(s), product/HS, geography, direction, port, and explicit entity filters. COUNT(*) of raw rows, before any engine logic, NULL handling, aggregation, or UNION ALL.
@@ -2735,6 +2884,7 @@ If the engines drop no rows, records_after_engine = records_before_engine.
 
 Scope by query pattern:
 - Growth / comparison across periods: count all compared periods combined.
+- Growth Momentum / Growth Acceleration: count every raw row once across the engine's full required scan span (the union of its four windows), before engine validity/classification rules.
 - New buyers/suppliers and onboarding: count the active period only (history-check rows are never counted).
 - Absence: count baseline period + exclusion period combined.
 - Retention: count previous period + current period combined.
@@ -2801,7 +2951,7 @@ Aggregations and metrics: state the resolved metric, aggregate function(s), and 
 
 Grouping: state the output grain and all GROUP BY dimensions. If no grouping is needed, explicitly state that no grouping is needed. If an engine requires lower-grain computation before final output, state the engine grain and final reducer.
 
-Engine logic, if applicable: if growth, comparison, trend, demand, seasonality, competition, margin, market share, concentration, retention, reactivation, saturation, relationship onboarding, or new buyer/supplier logic is triggered, state which engine/rule applies and summarize only the query-specific implementation steps needed for SQL. For concentration, state the resolved market_scope, concentrated_dimension, market_partition, and ranking direction. For retention, state both windows, the retained entity, and any named-entity book filter. For reactivation, state the current, gap, history, and pre-gap windows, the entity, and any named-entity book filter. Do not restate the full engine rules.
+Engine logic, if applicable: if growth, comparison, growth momentum, growth acceleration, trend, demand, seasonality, competition, margin, market share, concentration, retention, reactivation, saturation, relationship onboarding, or new buyer/supplier logic is triggered, state which engine/rule applies and summarize only the query-specific implementation steps needed for SQL. For concentration, state the resolved market_scope, concentrated_dimension, market_partition, and ranking direction. For retention, state both windows, the retained entity, and any named-entity book filter. For reactivation, state the current, gap, history, and pre-gap windows, the entity, and any named-entity book filter. Do not restate the full engine rules. For Growth Momentum and Growth Acceleration, always state all four canonical engine windows with literal dates and state any explicit user threshold overriding the default acceleration tolerance.
 
 Average price logic, if applicable: if price is triggered, state that the Unit-Safe Average Price Engine from Core Base Prompt applies and describe only the query-specific entity, unit, ranking, and output choices needed for SQL. Do not restate the full average price rules.
 
@@ -2995,6 +3145,7 @@ GLOBAL CONSTRAINTS
   - Port logic (PORT_OF_ORIGIN, PORT_OF_DESTINATION, neutral port rules).
   - Grouping grain (who, which product, by port, etc.).
   - Growth/comparison definitions (current vs previous periods, gaps).
+  - Growth Momentum and Growth Acceleration definitions when present in the SQL Implementation Plan, including their literal windows, formulas, classification order, LOW_BASE/history guards, and acceleration tolerance. Do not replace them with ordinary Growth, Trend, LAG-series, or regression logic while fixing SQL.
 
 You may:
 - Fix column/alias names.
@@ -3249,7 +3400,7 @@ Metric naming:
 - For average price, mention unit-safe context when relevant.
 
 Insight completeness:
-- If result set includes decision-support fields such as slope, r2, periods, demand_classification, avg_value_per_seller, best_buyer_country, month_of_year, unit_norm, avg_unit_price, total_value_usd, total_qty, market_share_pct, p90_price, buyer_seller_ratio, shipment_count, rank, hhi, cr1_pct, cr3_pct, players_to_80_pct, player_count, top_player, concentration_classification, hhi_change, concentration_direction, retention_rate_pct, churn_rate_pct, nvr_pct, gvr_pct, retained_count, lost_count, incoming_count, reactivated_count, win_back_rate_pct, reactivated_share_of_incoming_pct, reactivated_value_share_pct, comeback_ratio_pct, or avg_dormancy_months, include the important ones in the narrative when they help answer the query.
+- If result set includes decision-support fields such as slope, r2, periods, demand_classification, avg_value_per_seller, best_buyer_country, month_of_year, unit_norm, avg_unit_price, total_value_usd, total_qty, market_share_pct, p90_price, buyer_seller_ratio, shipment_count, momentum_class, momentum_rank, momentum_delta_pp, growth_contribution_pp, share_of_positive_growth_pct, acceleration_class, acceleration_rank, acceleration_pp, prior_growth_pct, recent_growth_pct, rank, hhi, cr1_pct, cr3_pct, players_to_80_pct, player_count, top_player, concentration_classification, hhi_change, concentration_direction, retention_rate_pct, churn_rate_pct, nvr_pct, gvr_pct, retained_count, lost_count, incoming_count, reactivated_count, win_back_rate_pct, reactivated_share_of_incoming_pct, reactivated_value_share_pct, comeback_ratio_pct, or avg_dormancy_months, include the important ones in the narrative when they help answer the query.
 - If the Interpretation Summary implies such metrics but the result set does not contain them, mention that those details were not returned.
 - Data coverage columns (records_before_engine, records_after_engine, excluded_records, coverage_pct) are handled ONLY by the Data Coverage Narrative Rule; do not discuss them elsewhere in the narrative.
 
@@ -3289,6 +3440,22 @@ For rankings/lists:
 For trends:
 - Mention upward/downward/stable only if classification or supporting fields are present.
 - Mention slope/r2/periods only if useful and present.
+
+For growth momentum:
+- State the compared windows in plain dates from the Interpretation Summary / SQL Implementation Plan when relevant: current window versus the same months one year earlier, plus the recent completed-month window versus the same recent months one year earlier.
+- Lead with momentum_class = POSITIVE MOMENTUM rows in momentum_rank order for positive-momentum questions. For the top 1-3, mention growth_pct, previous_value -> current_value, and recent_growth_pct when present.
+- Use momentum_delta_pp only as a diagnostic: positive means recent YoY growth strengthened relative to the broader window; negative means growth remained positive but weakened. Describe it in percentage points.
+- Mention FADING MOMENTUM, EARLY RECOVERY, NEW, LOST, and LOW_BASE separately only when relevant. Never give NEW entities a fabricated growth percentage and never call FADING/EARLY RECOVERY strong positive momentum.
+- For momentum_class NEW, say "no shipments in the base window, active now"; do not call them new buyers/suppliers, because they may be first-time or returning. For momentum_class LOST, say "active in the base window, no shipments in the current window". Use first-time, returning, or still-dormant wording only for New Buyers/Suppliers or Reactivation results.
+- If growth_contribution_pp is used, call it contribution to aggregate growth in percentage points, not percent share of growth. If share_of_positive_growth_pct is present, it may be described as the entity's share of all positive absolute growth. Never interchange these two metrics.
+
+For growth acceleration:
+- State the four compared blocks in plain dates when relevant.
+- Lead with acceleration_class = ACCELERATING rows in acceleration_rank order for acceleration questions. For the top 1-3, mention prior_growth_pct -> recent_growth_pct and acceleration_pp.
+- Always describe acceleration_pp in percentage points, never percent.
+- TURNAROUND means movement from non-positive to positive growth and must be described as recovery/turnaround, never as ordinary acceleration. REVERSAL means positive growth moved to non-positive and remains distinct from ordinary deceleration.
+- Mention LOW_BASE or INSUFFICIENT HISTORY when relevant and do not rank them against valid acceleration rows.
+- If no entity belongs to the requested ranked class, say so plainly and summarize the most relevant available class without changing classifications.
 
 For seasonality:
 - Mention the peak/trough month if a winner flag/rank or clear max/min row is present.
@@ -3371,6 +3538,8 @@ Choose `structured_table` for:
 - average price outputs
 - market share outputs
 - competition / margin / saturation outputs
+- growth momentum outputs
+- growth acceleration outputs
 - demand-qualified market lists
 - any wide or tabular output where rows are the main result
 
@@ -3449,6 +3618,13 @@ rank_no and/or total_value_usd (if present)
 Do not invent extra limits in Prompt C. Frontend may choose how many series to display.
 5) Column selection rule
 Only reference exact column names present in the SQL result. Do not invent columns.
+
+Growth Momentum / Growth Acceleration Visualization Mapping
+Default type = `structured_table` because these engines return classified entity-level analytical rows rather than a chronological series.
+For Growth Momentum, useful table columns when present are: resolved entity column, current_value, previous_value, absolute_change, growth_pct, recent_growth_pct, momentum_delta_pp, growth_contribution_pp, share_of_positive_growth_pct, momentum_class, momentum_rank.
+For Growth Acceleration, useful table columns when present are: resolved entity column, prior_growth_pct, recent_growth_pct, acceleration_pp, recent_abs_change, acceleration_class, acceleration_rank.
+If the user explicitly asks for a chart and the required columns exist, Growth Momentum may use a bar_chart with x_column = resolved entity column and y_column = growth_pct (or momentum_delta_pp only when the user explicitly asks to visualize strengthening/weakening); Growth Acceleration may use a bar_chart with x_column = resolved entity column and y_column = acceleration_pp.
+Do not use a line_chart merely because these concepts involve time; the canonical engine output is entity-level, not a period series.
 
 Market share / contribution:
 - type = `pie_chart` or `bar_chart`
