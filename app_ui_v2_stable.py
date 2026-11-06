@@ -3122,6 +3122,37 @@ def start_flow(text: str, sent: str, memory: dict):
     finish_flow(S.flow_run.start())
 
 
+def ensure_engine_session() -> bool:
+    """Make sure this chat's engine session still exists in the store.
+
+    If it expired (idle past the TTL) or was removed, start a new one,
+    save its id on the chat session and restore the HS scope.
+    Returns True when the engine session was replaced.
+    """
+    old = S.get("sid")
+    if ENGINE.exists(old):
+        return False
+
+    S.sid = ENGINE.start()
+    if S.get("session_id") is not None:
+        db.save_session(S.session_id, engine_sid=S.sid)
+    ENGINE.inject_memory(S.sid, build_memory())
+    if S.get("hs_code"):
+        try:
+            ENGINE.set_hs(S.sid, S.hs_code)
+        except Exception:
+            pass
+
+    # whatever the old engine session was waiting for is gone with it
+    S.selecting = False
+    S.pending_clarify = None
+    S.pending_confirm = None
+    S.flow_run = None
+
+    print(f"[ENGINE RECOVER] session_id={S.get('session_id')} old={old} new={S.sid}")
+    return True
+
+
 def handle_message(text: str, from_list: bool = False):
     text = (text or "").strip()
     if not text:
@@ -3132,6 +3163,7 @@ def handle_message(text: str, from_list: bool = False):
     while history and history[-1]["role"] == "USER":
         history.pop()
 
+    ensure_engine_session()
     ENGINE.inject_memory(S.sid, build_memory())
 
     # ---- an HS domain pick, possibly in the middle of a flow ----
@@ -3215,6 +3247,14 @@ def run_confirm(
 ):
 
     S.pending_confirm = None
+
+    if ensure_engine_session():
+        push_turn(
+            "assistant",
+            "This session was idle for too long, so the pending query was cleared. "
+            "Please ask it again."
+        )
+        return
 
     try:
 
@@ -3310,6 +3350,8 @@ def remember_hs(
 def switch_scope(
     choice: str
 ):
+
+    ensure_engine_session()
 
     code = re.sub(
         r"[.\-\s]",
