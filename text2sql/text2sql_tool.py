@@ -1,5 +1,6 @@
-# backend/main.py
-# Agentic Trade Chatbot backend
+# text2sql/text2sql_tool.py
+# Agentic Trade Chatbot engine. Called in-process through engine_adapter.py
+# (start_session / chat / confirm); there is no HTTP server here.
 # Core chat/domain/confirmation flow kept stable.
 # Visualization support is added only after successful Prompt A/B/C execution.
 # Paste your final Prompt A, Prompt B, Prompt C, Trade Agent, Followup Agent prompts into the placeholders below.
@@ -19,31 +20,15 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 import snowflake.connector
 from dotenv import load_dotenv
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from dataclasses import dataclass
 from text2sql.text2sql_prompts.text2sql_prompts_all import PROMPT_A_TEMPLATE, PROMPT_B_TEMPLATE, PROMPT_C_TEMPLATE, TRADE_AGENT_PROMPT_TEMPLATE, FOLLOWUP_AGENT_PROMPT_TEMPLATE, NORMALIZE_PROMPT_TEMPLATE, PROMPT_A_SKELETON_BIBLE
 # =========================================================
 # PATHS / ENV
 # =========================================================
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
-FRONTEND_DIR = PROJECT_ROOT / "frontend"
 ENV_PATH = PROJECT_ROOT / ".env"
 load_dotenv(ENV_PATH)
-
-# =========================================================
-# APP
-# =========================================================
-app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # =========================================================
 # CONSTANTS / CONFIG
@@ -75,7 +60,6 @@ PROMPT_B_MAX_TOKENS = int(os.getenv("PROMPT_B_MAX_TOKENS", "5000"))
 PROMPT_C_MAX_TOKENS = int(os.getenv("PROMPT_C_MAX_TOKENS", "3500"))
 
 MAX_SQL_FIX_ATTEMPTS = int(os.getenv("MAX_SQL_FIX_ATTEMPTS", "3"))
-PORT = int(os.getenv("PORT", "8001"))
 
 SNOWFLAKE_ACCOUNT = os.getenv("SNOWFLAKE_ACCOUNT", "")
 SNOWFLAKE_USER = os.getenv("SNOWFLAKE_USER", "")
@@ -183,12 +167,14 @@ from text2sql.session_store import STORE as SESSION_STORE, SessionBusy
 # =========================================================
 # REQUEST MODELS
 # =========================================================
-class ChatRequest(BaseModel):
+@dataclass
+class ChatRequest:
     session_id: str
     message: str
     source: Optional[str] = None
 
-class ConfirmRequest(BaseModel):
+@dataclass
+class ConfirmRequest:
     session_id: str
     decision: str
 
@@ -1294,20 +1280,9 @@ def handle_pending_domain_selection(req: ChatRequest, session: Dict[str, Any], p
     }
 
 # =========================================================
-# ROUTES
+# ENGINE ENTRY POINTS  (called by engine_adapter.py)
+# Errors come back as {"error": "..."}.
 # =========================================================
-@app.get("/")
-def home():
-    index_path = FRONTEND_DIR / "index.html"
-    if not index_path.exists():
-        return JSONResponse(status_code=404, content={"error": f"index.html not found at: {index_path}"})
-    return FileResponse(index_path)
-
-@app.get("/health")
-def health():
-    return {"ok": True, "model": GEMINI_MODEL, "table": TRADE_TABLE_NAME}
-
-@app.post("/start_session")
 def start_session():
     sid = str(uuid.uuid4())
     state = new_session_state()
@@ -1315,14 +1290,18 @@ def start_session():
     return {"session_id": sid, "state": state["state"]}
 
 
+def _error(message: str) -> Dict[str, str]:
+    return {"error": message}
+
+
 def _invalid_session():
-    return JSONResponse(status_code=400, content={"error": "Invalid session_id"})
+    return _error("Invalid session_id")
 
 
 def _session_busy():
-    return JSONResponse(status_code=409, content={"error": "This session is still working on a previous request"})
+    return _error("This session is still working on a previous request")
 
-@app.post("/chat")
+
 def chat(req: ChatRequest):
     """Lock the session, load it, run the turn, save it back."""
     try:
@@ -1341,7 +1320,7 @@ def chat(req: ChatRequest):
 def _chat_impl(req: ChatRequest, session: Dict[str, Any]):
     raw_message = (req.message or "").strip()
     if not raw_message:
-        return JSONResponse(status_code=400, content={"error": "Empty message"})
+        return _error("Empty message")
 
     pending_domain = session["active_focus"].get("pending_domain_disambiguation")
     if pending_domain:
@@ -1474,7 +1453,6 @@ def _chat_impl(req: ChatRequest, session: Dict[str, Any]):
     messages.append(msg_followup(followups, title="Suggested questions:"))
     return {"session_id": req.session_id, "state": session["state"], "messages": messages}
 
-@app.post("/confirm")
 def confirm(req: ConfirmRequest):
     return _confirm_internal(req.session_id, (req.decision or "").strip().lower())
 
@@ -1495,9 +1473,9 @@ def _confirm_internal(session_id: str, decision: str):
 
 def _confirm_impl(session_id: str, session: Dict[str, Any], decision: str):
     if session["state"] != STATE_AWAITING_CONFIRMATION:
-        return JSONResponse(status_code=400, content={"error": "No pending query to confirm"})
+        return _error("No pending query to confirm")
     if decision not in {"proceed", "cancel"}:
-        return JSONResponse(status_code=400, content={"error": "decision must be proceed|cancel"})
+        return _error("decision must be proceed|cancel")
 
     if decision == "cancel":
         session["active_focus"]["pending_query_text"] = None
@@ -1571,11 +1549,3 @@ def _confirm_impl(session_id: str, session: Dict[str, Any], decision: str):
     if followups:
         messages.append(msg_followup(followups, title="Follow-up questions:"))
     return {"session_id": session_id, "state": session["state"], "messages": messages}
-
-@app.get("/favicon.ico")
-def favicon():
-    return JSONResponse(status_code=204, content=None)
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=True)

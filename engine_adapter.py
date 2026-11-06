@@ -106,10 +106,7 @@ class Engine:
 
     @staticmethod
     def _unwrap(resp):
-        # chat()/confirm() return JSONResponse on error paths
-        if hasattr(resp, "body"):
-            import json
-            return json.loads(resp.body)
+        # chat()/confirm() return a plain dict, with an "error" key on failures
         return resp
 
 
