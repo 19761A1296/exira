@@ -69,6 +69,8 @@ from a blank. If nothing depends on it, the gap is recorded and the rest runs.
 import inspect
 import json
 import os
+import re
+import unicodedata
 
 import requests
 from dotenv import load_dotenv
@@ -204,8 +206,78 @@ STYLE
 - Use Markdown headings, bullets and bold emphasis sparingly when they improve
   scanning.
 - Do not repeat the same fact in multiple sections.
-- Do not mention sources, routing, agents, sub-questions, q1/q2, prompts,
-  connectors, databases or internal processing.
+- Do not mention routing, agents, sub-questions, q1/q2, prompts, connectors,
+  databases or internal processing. Do not expose raw internal source labels.
+- You MAY refer naturally to the information you worked with, for example
+  "From the trade records I have...", "I found...", or "From the latest market
+  information I found..." when that makes the answer clearer and more human.
+
+HUMAN VOICE (CRITICAL)
+- Write as if you are speaking directly to the user as a capable trade analyst,
+  not as a machine reporting a system output.
+- Use first-person phrasing naturally when appropriate: "I found...", "What
+  stands out to me is...", "From the trade records I have...", "I'd focus on...".
+- Address the user directly with "you" and "your" where the underlying answers
+  support that relationship.
+- Do NOT overuse "I" in every sentence. The tone should feel natural, calm and
+  professional rather than scripted.
+- Avoid robotic phrases such as "the system identified", "the database shows",
+  "the provided data indicates", "the user has", or "according to the generated
+  result" when a natural human phrasing can say the same thing.
+- Do not pretend to have personal experiences, feelings, private knowledge or
+  information beyond THE ANSWERS. First-person language refers only to the
+  analysis and information supplied in this prompt.
+
+PRESENTATION QUALITY (CRITICAL)
+- Lead with the answer or the most decision-relevant finding. Do not make the
+  user read a long setup before learning what matters.
+- For complex answers, use a clear progression such as: key finding -> evidence
+  -> implications/risks -> actions -> useful next checks. Adapt this structure
+  to the actual question; do not force sections that are not needed.
+- When several comparable entities and their values are already present in THE
+  ANSWERS, a compact Markdown table is preferred when it improves scanning.
+  Reformatting supplied facts into a table is allowed; recalculating or inventing
+  values is not.
+- Use bullets for distinct risks, findings or actions. Keep each bullet focused
+  on one idea.
+- Recommendations should be concrete and action-oriented when recommendations
+  are present in THE ANSWERS. Do not create recommendations that upstream
+  answers did not provide.
+- Put caveats and limitations near the finding they qualify, or in a short
+  final limitations/next-checks section when there are several of them.
+- Do not dump long raw prose from one upstream answer when it can be organized
+  more clearly without changing its meaning.
+
+MARKDOWN AND TYPOGRAPHY HYGIENE (CRITICAL)
+- Use standard Markdown only.
+- Use only normal Unicode prose. NEVER use mathematical/fancy Unicode alphabets
+  for ordinary words or sentences.
+- Use ## for major section headings when sections are needed. Do not mix several
+  decorative heading styles.
+- Use **bold** only for short labels, entity names or key values that genuinely
+  deserve emphasis. Never bold or italicize whole paragraphs.
+- Do not use italic emphasis for ordinary prose. Do not use decorative ***text***.
+- Use hyphen bullets (-) rather than asterisks as bullet markers.
+- Never expose unmatched or stray Markdown markers such as *, **, ***, _, ` or #.
+- Ensure normal spaces exist between words and after sentence-ending punctuation.
+  If an upstream answer contains an obvious formatting defect such as words
+  accidentally concatenated together, repair ONLY the spacing/punctuation needed
+  for readability; do not alter entity names, HS codes, figures, dates or meaning.
+- Put a blank line before and after headings, tables and lists so the frontend
+  renders them cleanly.
+- Do not place literal Markdown markers around values in a way that leaves the
+  markers visible to the user.
+
+FINAL SELF-CHECK (MANDATORY BEFORE RETURNING)
+Before returning the response, silently verify all of the following:
+1. Every factual claim is supported by THE ANSWERS.
+2. No number, name, date, HS code or classification was changed.
+3. The response reads like one person speaking to the user, not pasted modules.
+4. No broken spacing or concatenated prose remains where it is obviously a
+   formatting defect.
+5. Markdown markers are balanced and standard.
+6. Typography is consistent: normal text plus restrained standard Markdown only.
+7. The most important answer is easy to find within the first few lines.
  
 FAILURES
 - If one part could not be answered, mention that briefly in the appropriate
@@ -227,6 +299,50 @@ def _strip_fences(text: str) -> str:
     text = (text or "").strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[-1].rsplit("```", 1)[0]
+    return text.strip()
+
+
+def _clean_final_answer(text: str) -> str:
+    """Normalize presentation artifacts without changing answer content.
+
+    This is intentionally conservative. It does not rewrite facts, names, numbers,
+    dates, HS codes or analytical conclusions; the LLM combine pass owns prose and
+    structure. This helper only normalizes typography/whitespace and removes
+    obviously unbalanced emphasis markers that can break the Streamlit rendering.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+
+    # Compatibility-normalize decorative mathematical Unicode letters into normal
+    # text while preserving ordinary Unicode names and punctuation.
+    text = unicodedata.normalize("NFKC", text)
+
+    # Remove invisible formatting characters that can make words render oddly.
+    text = (
+        text.replace("\u00a0", " ")
+        .replace("\u200b", "")
+        .replace("\u200c", "")
+        .replace("\u200d", "")
+        .replace("\ufeff", "")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+    )
+
+    # Strip trailing whitespace and keep paragraph spacing predictable.
+    lines = [line.rstrip() for line in text.split("\n")]
+    text = "\n".join(lines)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    # The final-answer style deliberately avoids italics. If a model still leaves
+    # an unmatched bold/italic marker, remove that marker family rather than let
+    # raw asterisks leak into the UI. Balanced standard bold remains untouched.
+    if text.count("**") % 2:
+        text = text.replace("**", "")
+    single_star_view = text.replace("**", "")
+    if single_star_view.count("*") % 2:
+        text = text.replace("*", "")
+
     return text.strip()
 
 
@@ -505,9 +621,9 @@ class FlowRun:
         if not self.answers:
             return "Nothing came back for that. Try rephrasing it."
 
-        if len(self.answers) == 1 and not self.failed:
-            return next(iter(self.answers.values()))
-
+        # Always run the final presentation pass, even for a single answered
+        # node. Previously single-node flows returned the raw engine text directly,
+        # which allowed inconsistent tone/Markdown/spacing to reach the UI.
         blocks = []
         for qid in self.queue:
             if qid in self.answers:
@@ -524,13 +640,19 @@ class FlowRun:
         try:
             combined = _chat(prompt, COMBINE_MAX_TOKENS)
             if combined:
-                return combined
+                return _clean_final_answer(combined)
         except Exception as exc:
             print("connector: combine failed:", type(exc).__name__, exc)
 
-        # fall back to the parts rather than losing the work
-        return "\n\n".join(self.answers[qid] for qid in self.queue
-                           if qid in self.answers)
+        # Fall back to the parts rather than losing the work. Even on fallback,
+        # normalize only presentation artifacts; never rewrite the underlying facts.
+        return _clean_final_answer(
+            "\n\n".join(
+                self.answers[qid]
+                for qid in self.queue
+                if qid in self.answers
+            )
+        )
 
     def _done(self) -> dict:
         return {
@@ -548,7 +670,7 @@ class FlowRun:
             else self.stopped_reason
         return {
             "status": "stopped",
-            "answer": answer,
+            "answer": _clean_final_answer(answer),
             "answers": dict(self.answers),
             "asked": dict(self.asked),
             "failed": list(self.failed),
