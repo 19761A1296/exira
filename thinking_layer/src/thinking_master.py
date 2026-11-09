@@ -99,13 +99,16 @@ def create_temp_engine(engine_id: Optional[str]) -> str:
         try:
             state = copy.deepcopy(STORE.load(engine_id) or {})
         except Exception as exc:
-            dbg("THINKING_MASTER", f"could not read engine session {engine_id}: {exc}")
+            pass
+            # dbg("THINKING_MASTER", f"could not read engine session {engine_id}: {exc}")
         if not state:
-            dbg("THINKING_MASTER", f"engine session {engine_id} not found; continuing without context")
+            pass
+            # dbg("THINKING_MASTER", f"engine session {engine_id} not found; continuing without context")
     try:
         STORE.save(temp_id, state)
     except Exception as exc:
-        dbg("THINKING_MASTER", f"could not save temp engine session: {exc}")
+        pass
+        # dbg("THINKING_MASTER", f"could not save temp engine session: {exc}")
     return temp_id
 
 
@@ -130,7 +133,8 @@ def delete_temp_engine(temp_engine_id: str) -> None:
     try:
         STORE.delete(temp_engine_id)
     except Exception as exc:
-        dbg("THINKING_MASTER", f"could not delete temp engine session {temp_engine_id}: {exc}")
+        pass
+        # dbg("THINKING_MASTER", f"could not delete temp engine session {temp_engine_id}: {exc}")
 
 
 # =========================================================
@@ -294,7 +298,7 @@ def run_step(n: int, decision: Dict[str, Any]) -> Dict[str, Any]:
         **result,
         "seconds": round(time.time() - started, 2),
     }
-    dbg("THINKING_MASTER STEP", f"{n} [{step['tool']}] {step['status']}: {sub_q}")
+    # dbg("THINKING_MASTER STEP", f"{n} [{step['tool']}] {step['status']}: {sub_q}")
     return step
 
 
@@ -344,7 +348,7 @@ def run(query: str, engine_id: Optional[str],
         stopped = f"step limit reached ({MAX_STEPS})"
         while len(steps) < MAX_STEPS:
             decision = decide_next(query, context, steps, dependency_answers)
-            dbg("THINKING_MASTER DECISION", decision)
+            # dbg("THINKING_MASTER DECISION", decision)
             if decision["action"] == "finish":
                 stopped = decision["reason"] or "master finished"
                 break

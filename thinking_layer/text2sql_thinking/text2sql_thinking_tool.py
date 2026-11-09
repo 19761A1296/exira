@@ -523,7 +523,7 @@ def _narrate(question: str, a_parts: Dict[str, str], sql: str,
         max_tokens=PROMPT_C_MAX_TOKENS,
         temperature=0.0,
     ).strip()
-    dbg("PROMPT C RAW", c_raw)
+    # dbg("PROMPT C RAW", c_raw)
 
     try:
         c_json = extract_json_object(c_raw)
@@ -565,8 +565,8 @@ def run(question: str) -> Dict[str, Any]:
 
     try:
         question = normalize_message(raw_question)
-        dbg("QUERY", raw_question)
-        dbg("NORMALIZED", question)
+        # dbg("QUERY", raw_question)
+        # dbg("NORMALIZED", question)
         a_raw = call_gemini(build_prompt_a(question), max_tokens=PROMPT_A_MAX_TOKENS, temperature=0.0)
         a_parts = parse_prompt_a_output(a_raw)
         sql_to_run = (a_parts.get("sql") or "").strip()
@@ -581,14 +581,14 @@ def run(question: str) -> Dict[str, Any]:
             ok, rows, cols, err = run_snowflake(sql_to_run)
             if ok:
                 rows = convert_decimals(rows)
-                dbg("ROW COUNT", f"{len(rows)} rows, cols = {cols}")
+                # dbg("ROW COUNT", f"{len(rows)} rows, cols = {cols}")
                 narrative, visualization, c_raw = _narrate(question, a_parts, sql_to_run, rows, cols)
-                dbg("ANSWER", narrative)
+                # dbg("ANSWER", narrative)
                 return done("success", narrative=narrative, visualization=visualization,
                             sql=sql_to_run, rows=rows, cols=cols, prompt_c_raw=c_raw)
 
             attempts.append({"sql": sql_to_run, "error": err})
-            dbg(f"SQL FAILED (attempt {attempt_idx})", err)
+            # dbg(f"SQL FAILED (attempt {attempt_idx})", err)
             if attempt_idx == MAX_SQL_FIX_ATTEMPTS:
                 return done("sql_execution_failure", narrative="SQL execution failed.",
                             sql=sql_to_run, error=err)

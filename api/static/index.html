@@ -1,0 +1,544 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EXIRA · API test console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+:root{
+  --ink:#13294B; --ink-soft:#4A5A75; --paper:#F4F6F5; --card:#FFFFFF; --line:#D9DFE3;
+  --signal:#F2C230; --signal-ink:#3A2E00; --sea:#1F7A8C; --ok:#2E7D4F; --bad:#B3261E;
+  --log-bg:#13294B; --log-ink:#DCE6F2; --log-mute:#8FA3BF;
+  --radius-s:6px; --radius-m:10px;
+  font-family:"IBM Plex Sans",system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  color:var(--ink); background:var(--paper);
+}
+@media (prefers-color-scheme: dark){
+  :root{ --ink:#E6ECF3; --ink-soft:#9FB0C6; --paper:#0F1A2B; --card:#16243A; --line:#26374F;
+         --signal-ink:#2A2100; --log-bg:#0A1220; }
+}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;grid-template-columns:minmax(0,1fr) 380px}
+@media (max-width:1000px){ body{grid-template-columns:1fr} #log{height:40vh;position:static} }
+button,input,textarea{font:inherit;color:inherit}
+button{cursor:pointer;border:1px solid var(--line);background:var(--card);padding:.5rem .85rem;border-radius:var(--radius-s)}
+button:hover{border-color:var(--sea)}
+button.primary{background:var(--ink);color:var(--paper);border-color:var(--ink)}
+button.signal{background:var(--signal);color:var(--signal-ink);border-color:var(--signal);font-weight:600}
+button.danger{color:var(--bad)}
+button:disabled{opacity:.45;cursor:not-allowed}
+button:focus-visible,input:focus-visible,textarea:focus-visible,summary:focus-visible{outline:2px solid var(--sea);outline-offset:2px}
+input,textarea{width:100%;padding:.55rem .7rem;border:1px solid var(--line);border-radius:var(--radius-s);background:var(--card)}
+textarea{min-height:5rem;resize:vertical}
+label{display:block;font-size:.85rem;color:var(--ink-soft);margin:.8rem 0 .3rem}
+
+main{padding:0 2rem 4rem;max-width:1100px}
+header{display:flex;align-items:center;gap:1rem;flex-wrap:wrap;padding:1.1rem 0;border-bottom:2px solid var(--ink);margin-bottom:1.5rem}
+.brand{font-weight:600;font-size:1.25rem;letter-spacing:.02em}
+.brand small{display:block;font-weight:400;font-size:.78rem;color:var(--ink-soft);letter-spacing:0}
+.crumbs{flex:1;color:var(--ink-soft);font-size:.9rem}
+.crumbs b{color:var(--ink);font-weight:500}
+.stage{background:var(--signal);color:var(--signal-ink);padding:.2rem .6rem;border-radius:var(--radius-s);font-size:.8rem;font-weight:600}
+.toggle{display:flex;align-items:center;gap:.4rem;font-size:.85rem;color:var(--ink-soft)}
+.toggle input{width:auto}
+
+h1{font-size:1.6rem;font-weight:600;margin:.2rem 0 .3rem}
+.lead{color:var(--ink-soft);margin:0 0 1.4rem;max-width:62ch}
+.row{display:flex;gap:.6rem;flex-wrap:wrap;align-items:center}
+.list{display:grid;gap:.6rem}
+.item{display:flex;justify-content:space-between;gap:1rem;align-items:center;background:var(--card);border:1px solid var(--line);border-left:4px solid var(--sea);padding:.8rem 1rem;border-radius:var(--radius-s)}
+.item .meta{font-size:.82rem;color:var(--ink-soft)}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:var(--radius-m);padding:1.1rem 1.2rem;margin:1rem 0}
+.empty{color:var(--ink-soft);padding:1rem 0}
+pre{white-space:pre-wrap;word-break:break-word;font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.78rem;background:var(--paper);padding:.7rem;border-radius:var(--radius-s);max-height:360px;overflow:auto;margin:.5rem 0}
+
+#notices{position:sticky;top:0;z-index:5}
+.notice{margin:.5rem 0;padding:.6rem .9rem;border-radius:var(--radius-s);border-left:4px solid var(--sea);background:var(--card);font-size:.9rem}
+.notice.warning{border-color:var(--signal)} .notice.error{border-color:var(--bad);color:var(--bad)}
+
+#busy{display:none;margin:1rem 0;padding:.9rem 1rem;border:1px dashed var(--sea);border-radius:var(--radius-m);background:var(--card)}
+#busy.on{display:block}
+#busy .title{font-weight:600;display:flex;align-items:center;gap:.6rem}
+.dot{width:.6rem;height:.6rem;border-radius:50%;background:var(--signal);animation:pulse 1s infinite alternate}
+@keyframes pulse{to{opacity:.25}}
+@media (prefers-reduced-motion:reduce){.dot{animation:none}}
+#busy ol{margin:.5rem 0 0;padding-left:1.2rem;color:var(--ink-soft);font-size:.88rem}
+
+.chat{display:grid;grid-template-columns:minmax(0,1fr) 280px;gap:1.5rem}
+@media (max-width:1300px){.chat{grid-template-columns:1fr}}
+.turn{margin:.8rem 0;padding:.8rem 1rem;border-radius:var(--radius-m);max-width:100%}
+.turn.user{background:var(--ink);color:var(--paper);margin-left:auto;width:fit-content;max-width:80%}
+.turn.assistant{background:var(--card);border:1px solid var(--line)}
+.turn.system{font-size:.82rem;color:var(--ink-soft);padding:.2rem 1rem}
+.md p{margin:.4rem 0;max-width:80ch;line-height:1.55} .md ul,.md ol{margin:.4rem 0;padding-left:1.3rem}
+.md table{border-collapse:collapse;font-size:.85rem;margin:.6rem 0;display:block;overflow-x:auto}
+.md th,.md td{border:1px solid var(--line);padding:.3rem .55rem;text-align:left}
+.md h1,.md h2,.md h3,.md h4{font-size:1rem;margin:.8rem 0 .3rem}
+.chart{margin:.8rem 0;background:var(--paper);border-radius:var(--radius-s);padding:.6rem}
+.chart canvas{max-height:300px}
+.opts{display:flex;flex-direction:column;gap:.4rem;margin:.8rem 0}
+.opts button{text-align:left}
+.clar{border:1px solid var(--signal);border-left-width:4px}
+.composer{display:flex;gap:.6rem;margin-top:1rem;position:sticky;bottom:0;background:var(--paper);padding:.8rem 0}
+aside.side .panel{margin:0 0 .8rem}
+aside.side h3{font-size:.95rem;margin:0 0 .5rem}
+details summary{cursor:pointer;color:var(--ink-soft);font-size:.88rem;padding:.2rem 0}
+
+#log{position:sticky;top:0;height:100vh;overflow:auto;background:var(--log-bg);color:var(--log-ink);font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.76rem}
+#log .head{position:sticky;top:0;background:var(--log-bg);padding:1rem;border-bottom:1px solid #2A4268;display:flex;justify-content:space-between;align-items:center;gap:.5rem}
+#log .head strong{font-family:"IBM Plex Sans",sans-serif;font-size:.9rem}
+#log .head input{background:transparent;color:var(--log-ink);border-color:#2A4268;font-size:.75rem;padding:.25rem .4rem;width:11rem}
+#log .head button{background:transparent;color:var(--log-mute);border-color:#2A4268;font-size:.75rem;padding:.25rem .5rem}
+.call{border-bottom:1px solid #1E3352;padding:.5rem 1rem}
+.call summary{color:var(--log-ink);display:flex;gap:.5rem;align-items:baseline;list-style:none}
+.call summary::-webkit-details-marker{display:none}
+.call .m{font-weight:500;min-width:3.4rem}
+.call .m.GET{color:#7FD1B9}.call .m.POST{color:var(--signal)}.call .m.DELETE{color:#FF8A80}
+.call .p{flex:1;word-break:break-all}
+.call .s{color:var(--log-mute)} .call .s.bad{color:#FF8A80}
+.call.poll{opacity:.55}
+.call pre{background:#0B1830;color:var(--log-ink);max-height:240px}
+.tally{padding:.6rem 1rem;color:var(--log-mute);border-bottom:1px solid #1E3352;line-height:1.6}
+.tally span{color:var(--log-ink)}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="brand">EXIRA<small>API test console</small></div>
+    <div class="crumbs" id="crumbs"></div>
+    <span class="stage" id="stage">signed out</span>
+    <label class="toggle"><input type="checkbox" id="debug"> debug traces</label>
+    <button id="signout" hidden>Sign out</button>
+  </header>
+  <div id="notices"></div>
+  <div id="busy"><div class="title"><span class="dot"></span><span id="busy-title">Working…</span></div><ol id="busy-steps"></ol></div>
+  <div id="screen"></div>
+</main>
+
+<aside id="log" aria-label="API calls">
+  <div class="head">
+    <strong>API calls</strong>
+    <input id="base" title="API base URL" aria-label="API base URL">
+    <button id="clearlog">Clear</button>
+  </div>
+  <div class="tally" id="tally">Endpoints used: <span>0</span> of 17</div>
+  <div id="calls"></div>
+</aside>
+
+<script>
+// ───────────────────────── setup ─────────────────────────
+const $ = (id) => document.getElementById(id);
+const store = {
+  get(k, d=null){ try { return localStorage.getItem(k) ?? d; } catch { return d; } },
+  set(k, v){ try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch {} },
+};
+let BASE = store.get("exira_base", location.origin.startsWith("http") ? location.origin : "http://localhost:8000");
+let WID = store.get("exira_wid");
+let VIEW = null, BUSY = false;
+$("base").value = BASE;
+$("base").onchange = (e) => { BASE = e.target.value.replace(/\/$/, ""); store.set("exira_base", BASE); };
+$("debug").checked = store.get("exira_debug") === "1";
+$("debug").onchange = (e) => { store.set("exira_debug", e.target.checked ? "1" : null); if (WID) refresh(); };
+const debugOn = () => $("debug").checked;
+
+// the 17 endpoints, to show which ones the session has exercised
+const ENDPOINTS = [
+  ["GET","/health"],["GET","/jobs/{job}"],["POST","/workspaces"],["GET","/workspaces/{w}"],["DELETE","/workspaces/{w}"],
+  ["POST","/workspaces/{w}/navigate"],["POST","/workspaces/{w}/companies/{c}/open"],["DELETE","/workspaces/{w}/companies/{c}"],
+  ["GET","/workspaces/{w}/companies/{c}/report"],["POST","/workspaces/{w}/onboarding/{a}"],["POST","/workspaces/{w}/sessions"],
+  ["POST","/workspaces/{w}/sessions/{s}/resume"],["DELETE","/workspaces/{w}/sessions/{s}"],["POST","/workspaces/{w}/session/end"],
+  ["POST","/workspaces/{w}/scope/start"],["POST","/workspaces/{w}/scope/change"],["POST","/workspaces/{w}/messages"],
+];
+const used = new Set();
+function pattern(method, path){
+  const p = path.split("?")[0]
+    .replace(/^\/jobs\/[^/]+/, "/jobs/{job}")
+    .replace(/^\/workspaces\/[^/]+/, m => m === "/workspaces" ? m : "/workspaces/{w}")
+    .replace(/\/companies\/\d+/, "/companies/{c}").replace(/\/sessions\/\d+/, "/sessions/{s}")
+    .replace(/\/onboarding\/[^/]+/, "/onboarding/{a}");
+  return method + " " + p;
+}
+function markUsed(method, path){
+  used.add(pattern(method, path));
+  const hit = ENDPOINTS.filter(([m,p]) => used.has(m + " " + p)).length;
+  const missing = ENDPOINTS.filter(([m,p]) => !used.has(m + " " + p)).map(([m,p]) => m + " " + p);
+  $("tally").innerHTML = `Endpoints used: <span>${hit}</span> of ${ENDPOINTS.length}` +
+    (missing.length ? `<details><summary>Not yet used (${missing.length})</summary>${missing.map(esc).join("<br>")}</details>` : " ✓ all");
+}
+
+// ───────────────────────── API calls + log ─────────────────────────
+function esc(s){ return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+async function api(method, path, body, {poll=false} = {}){
+  const t0 = performance.now();
+  let status = 0, data = null;
+  try {
+    const res = await fetch(BASE + path, {
+      method, headers: body ? {"Content-Type": "application/json"} : {},
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    status = res.status;
+    data = await res.json().catch(() => null);
+  } catch (e) {
+    data = {detail: `Cannot reach the API at ${BASE}: ${e.message}`};
+  }
+  logCall(method, path, body, status, data, Math.round(performance.now() - t0), poll);
+  markUsed(method, path);
+  if (status < 200 || status >= 300) {
+    const err = new Error((data && (data.detail || data.error)) || `HTTP ${status}`);
+    err.status = status; throw err;
+  }
+  return data;
+}
+
+function logCall(method, path, body, status, data, ms, poll){
+  const el = document.createElement("details");
+  el.className = "call" + (poll ? " poll" : "");
+  const bad = !status || status >= 400;
+  el.innerHTML = `<summary><span class="m ${method}">${method}</span><span class="p">${esc(path)}</span>
+    <span class="s ${bad ? "bad" : ""}">${status || "ERR"} · ${ms}ms</span></summary>
+    ${body ? `<pre>→ ${esc(JSON.stringify(body, null, 2))}</pre>` : ""}
+    <pre>← ${esc(JSON.stringify(data, null, 2)).slice(0, 20000)}</pre>`;
+  const calls = $("calls");
+  calls.prepend(el);
+  while (calls.children.length > 300) calls.lastChild.remove();
+}
+$("clearlog").onclick = () => { $("calls").innerHTML = ""; };
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const q = () => `?debug=${debugOn()}`;
+
+// run an action as a job, show progress, render the resulting view
+async function action(method, path, body, label="Working…"){
+  if (BUSY) return;
+  setBusy(true, label);
+  try {
+    let job = await api(method, path + q(), body);
+    while (!["done", "failed", "error"].includes(job.status)) {
+      showSteps(job.progress);
+      await sleep(800);
+      job = await api("GET", `/jobs/${job.job_id}`, null, {poll: true});
+    }
+    showSteps(job.progress);
+    if (job.view) render(job.view);
+    if (job.status !== "done") notice("error", job.error || "The action did not finish.");
+  } catch (e) {
+    handleError(e);
+  } finally {
+    setBusy(false);
+  }
+}
+
+function setBusy(on, label){
+  BUSY = on;
+  $("busy").classList.toggle("on", on);
+  if (on) { $("busy-title").textContent = label; $("busy-steps").innerHTML = ""; }
+  document.querySelectorAll("#screen button, #screen input, #screen textarea").forEach(el => el.disabled = on);
+}
+function showSteps(progress){
+  $("busy-steps").innerHTML = (progress || []).map(p => `<li>${esc(p.message)} <small>(${p.at}s)</small></li>`).join("");
+}
+function notice(level, message){
+  const div = document.createElement("div");
+  div.className = "notice " + level; div.textContent = message;
+  $("notices").appendChild(div);
+  setTimeout(() => div.remove(), level === "error" ? 12000 : 7000);
+}
+function handleError(e){
+  if (e.status === 404 && String(e.message).includes("Workspace")) { signOutLocal(); notice("warning", "Your workspace expired. Sign in again."); return; }
+  notice("error", e.message);
+}
+
+// ───────────────────────── markdown + charts ─────────────────────────
+function md(text){
+  const lines = esc(text || "").split("\n");
+  let html = "", list = null, table = [];
+  const inline = s => s.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>").replace(/`([^`]+)`/g, "<code>$1</code>");
+  const flushList = () => { if (list) { html += `</${list}>`; list = null; } };
+  const flushTable = () => {
+    if (!table.length) return;
+    const rows = table.filter(r => !/^\s*\|?\s*:?-{2,}/.test(r));
+    html += "<table>" + rows.map((r, i) => "<tr>" + r.replace(/^\s*\||\|\s*$/g, "").split("|")
+      .map(c => i === 0 ? `<th>${inline(c.trim())}</th>` : `<td>${inline(c.trim())}</td>`).join("") + "</tr>").join("") + "</table>";
+    table = [];
+  };
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    if (/^\s*\|.*\|\s*$/.test(line)) { flushList(); table.push(line); continue; }
+    flushTable();
+    let m;
+    if ((m = line.match(/^(#{1,4})\s+(.*)/))) { flushList(); html += `<h${m[1].length}>${inline(m[2])}</h${m[1].length}>`; }
+    else if ((m = line.match(/^\s*[-*•]\s+(.*)/))) { if (list !== "ul") { flushList(); html += "<ul>"; list = "ul"; } html += `<li>${inline(m[1])}</li>`; }
+    else if ((m = line.match(/^\s*\d+[.)]\s+(.*)/))) { if (list !== "ol") { flushList(); html += "<ol>"; list = "ol"; } html += `<li>${inline(m[1])}</li>`; }
+    else if (!line.trim()) { flushList(); }
+    else { flushList(); html += `<p>${inline(line)}</p>`; }
+  }
+  flushList(); flushTable();
+  return `<div class="md">${html}</div>`;
+}
+
+const charts = [];
+function chartBlock(viz, rows, title){
+  if (!viz || !rows || !rows.length || viz.type === "none") return "";
+  const id = "c" + Math.random().toString(36).slice(2);
+  charts.push({id, viz, rows});
+  const cols = viz.columns && viz.columns.length ? viz.columns : Object.keys(rows[0]);
+  const table = `<details><summary>Data (${rows.length} rows)</summary><div class="md"><table><tr>${cols.map(c => `<th>${esc(c)}</th>`).join("")}</tr>` +
+    rows.slice(0, 100).map(r => `<tr>${cols.map(c => `<td>${esc(r[c])}</td>`).join("")}</tr>`).join("") + `</table></div></details>`;
+  const drawable = ["bar_chart","line_chart","pie_chart","scatter_chart"].includes(viz.type) && viz.x_column && viz.y_column;
+  return `<div class="chart">${title ? `<small>${esc(title)}</small>` : ""}${viz.title ? `<div><strong>${esc(viz.title)}</strong></div>` : ""}
+    ${drawable ? `<canvas id="${id}" role="img" aria-label="${esc(viz.title || viz.type)}"></canvas>` : ""}${table}</div>`;
+}
+function drawCharts(){
+  const palette = ["#1F7A8C","#F2C230","#13294B","#7FB069","#D1495B","#8E7DBE"];
+  for (const {id, viz, rows} of charts.splice(0)) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    if (!window.Chart) { el.outerHTML = "<p class='empty'>Chart library could not load (no internet?). The data is below.</p>"; continue; }
+    const type = {bar_chart:"bar", line_chart:"line", pie_chart:"pie", scatter_chart:"scatter"}[viz.type];
+    let labels = [...new Set(rows.map(r => r[viz.x_column]))], datasets;
+    if (viz.series_column && type !== "pie") {
+      const series = [...new Set(rows.map(r => r[viz.series_column]))];
+      datasets = series.map((s, i) => ({label: String(s), backgroundColor: palette[i % 6], borderColor: palette[i % 6],
+        data: labels.map(l => { const r = rows.find(r => r[viz.x_column] === l && r[viz.series_column] === s); return r ? Number(r[viz.y_column]) : null; })}));
+    } else if (type === "scatter") {
+      datasets = [{label: viz.y_column, backgroundColor: palette[0], data: rows.map(r => ({x: Number(r[viz.x_column]), y: Number(r[viz.y_column])}))}];
+      labels = undefined;
+    } else {
+      datasets = [{label: viz.y_column, backgroundColor: type === "pie" ? palette : palette[0], borderColor: palette[0],
+        data: labels.map(l => Number((rows.find(r => r[viz.x_column] === l) || {})[viz.y_column]))}];
+    }
+    new Chart(el, {type, data: {labels, datasets}, options: {responsive: true, maintainAspectRatio: false, plugins: {legend: {display: datasets.length > 1 || type === "pie"}}}});
+  }
+}
+function traceBlocks(trace){
+  if (!trace) return "";
+  let html = "";
+  if (trace.charts && trace.charts.length) html += trace.charts.map(c => chartBlock((c.trace || {}).visualization, (c.trace || {}).rows, c.qid)).join("");
+  else html += chartBlock(trace.visualization, trace.rows);
+  const sources = trace.web_sources || (trace.web && trace.web.sources);
+  if (sources && sources.length) html += `<details><summary>Web sources (${sources.length})</summary><pre>${esc(JSON.stringify(sources, null, 2))}</pre></details>`;
+  if (trace.thinking) html += `<details><summary>Thinking layer (${trace.thinking.length})</summary><pre>${esc(JSON.stringify(trace.thinking, null, 2))}</pre></details>`;
+  if (debugOn()) html += `<details><summary>Full trace (debug)</summary><pre>${esc(JSON.stringify(trace, null, 2))}</pre></details>`;
+  return html;
+}
+
+// ───────────────────────── screens ─────────────────────────
+function render(view, {notices = true} = {}){
+  VIEW = view;
+  if (notices) (view.notices || []).forEach(n => notice(n.level, n.message));
+  $("stage").textContent = view.stage.replace("_", " ");
+  $("signout").hidden = !WID;
+  const c = view.company, s = view.session;
+  $("crumbs").innerHTML = view.user_id ? `<b>${esc(view.user_id)}</b>` + (c ? ` / ${esc(c.name)}` : "") + (s ? ` / session ${esc(s.slot)}` : "") : "";
+  const screens = {onboarding, company_picker: companies, session_picker: sessions, scope, chat, done, login};
+  $("screen").innerHTML = "";
+  (screens[view.stage] || login)(view);
+  drawCharts();
+}
+function h(html){ $("screen").insertAdjacentHTML("beforeend", html); }
+function on(id, fn){ const el = document.getElementById(id); if (el) el.onclick = fn; }
+const W = () => `/workspaces/${WID}`;
+
+// login
+function login(){
+  h(`<h1>Sign in</h1><p class="lead">Enter a user ID. New users go straight to adding their first company.</p>
+     <div class="panel"><label for="uid">User ID</label>
+     <div class="row"><input id="uid" placeholder="e.g. baxter_user_001" style="flex:1"><button class="primary" id="go">Sign in</button></div></div>
+     <div class="row"><button id="health">Check API health</button></div>`);
+  const go = async () => {
+    const uid = $("uid").value.trim();
+    if (!uid) return notice("error", "Enter a user ID.");
+    try {
+      const r = await api("POST", "/workspaces" + q(), {user_id: uid});
+      WID = r.workspace_id; store.set("exira_wid", WID); render(r.view);
+    } catch (e) { handleError(e); }
+  };
+  on("go", go); $("uid").onkeydown = e => { if (e.key === "Enter") go(); };
+  on("health", async () => { try { const r = await api("GET", "/health"); notice("info", `API ok · state: ${r.state_store} · database: ${r.database}`); } catch (e) { handleError(e); } });
+}
+
+// onboarding wizard
+function onboarding(v){
+  const o = v.onboarding, step = o.step;
+  const A = (name, body, label) => action("POST", `${W()}/onboarding/${name}`, body, label);
+  h(`<h1>Add a company</h1><p class="lead">Attempt ${o.attempt} of ${o.max_attempts} · step <strong>${esc(step)}</strong></p>`);
+
+  if (o.failure) {
+    h(`<div class="panel clar"><p><strong>${esc(o.failure.reason)}</strong></p>
+      ${o.failure.exhausted ? `<button class="primary" id="giveup">Continue without a profile</button>` :
+       `<label for="extra">Add more information and try again</label><input id="extra">
+        <div class="row" style="margin-top:.6rem"><button class="primary" id="retry">Try again</button><button id="giveup">Cancel</button></div>`}</div>`);
+    on("retry", () => A("retry", {extra: $("extra").value}, "Starting over…"));
+    on("giveup", () => A("give_up", {}, "Leaving onboarding…"));
+    return;
+  }
+
+  if (step === "input") {
+    h(`<div class="panel"><p>Fill in at least one of the two. Both is better.</p>
+      <label for="t">Company name / description</label><textarea id="t">${esc(o.text)}</textarea>
+      <label for="u">Company URLs, one or more</label><textarea id="u">${esc(o.urls)}</textarea>
+      <div class="row" style="margin-top:.8rem"><button class="primary" id="next">Continue</button>${v.company ? "" : ""}<button id="cancel">Cancel</button></div></div>`);
+    on("next", () => A("input", {text: $("t").value, urls: $("u").value}, "Looking up the company…"));
+    on("cancel", () => A("give_up", {}, "Leaving onboarding…"));
+  }
+  else if (step === "narrow") {
+    h(`<div class="panel"><p>${o.matches.length} companies match “${esc(o.text || o.chosen_company)}”. Narrow the list.</p>
+      <label for="cty">Country (leave blank to skip)</label><input id="cty" value="${esc(o.filters.country)}">
+      <label for="hs">HS code — first 2 digits are used (needs a country)</label><input id="hs" value="${esc(o.filters.hs2)}">
+      <div class="row" style="margin-top:.8rem"><button class="primary" id="apply">Apply filter</button><button id="all">Show all ${o.matches.length} anyway</button></div></div>`);
+    on("apply", () => A("narrow", {country: $("cty").value, hs2: $("hs").value}, "Filtering…"));
+    on("all", () => A("show_all", {}, "Showing all…"));
+  }
+  else if (step === "pick_text" || step === "pick_url") {
+    h(`<div class="panel"><p>Which one is your company?</p>
+      ${o.matches.length > o.narrow_threshold ? `<button id="narrow">Narrow this list</button>` : ""}
+      <div class="opts">${o.matches.map((m, i) => `<button data-i="${i + 1}">${i + 1}. ${esc(m)}</button>`).join("")}</div>
+      <button id="none">None of these</button></div>`);
+    document.querySelectorAll("[data-i]").forEach(b => b.onclick = () => A("pick", {index: Number(b.dataset.i)}, step === "pick_url" ? "Building the profile…" : "Saving the choice…"));
+    on("narrow", () => A("open_narrow", {}, "Opening filters…"));
+    on("none", () => A("none_of_these", {}, "Continuing…"));
+  }
+  else if (step === "ask_urls") {
+    h(`<div class="panel"><p>${o.chosen_company ? `Found <strong>${esc(o.chosen_company)}</strong>. Add its website for a better profile, or skip.` : "Add your company's website links."}</p>
+      <label for="u2">Company URLs</label><input id="u2">
+      <div class="row" style="margin-top:.8rem"><button class="primary" id="use">Use these links</button><button id="skip">Skip</button></div></div>`);
+    on("use", () => A("give_urls", {urls: $("u2").value}, "Reading the links…"));
+    on("skip", () => A("skip_urls", {}, "Building the profile…"));
+  }
+  else if (step === "scrape_known") {
+    h(`<div class="panel"><p>From <strong>${esc(o.urls)}</strong> for <strong>${esc(o.chosen_company)}</strong>:</p>
+      ${o.scraped.company_info ? md(o.scraped.company_info) : "<p class='empty'>Nothing was scraped from those links.</p>"}
+      <div class="row" style="margin-top:.8rem"><button class="primary" id="acc">Accept</button><button id="skipl">Skip links</button></div>
+      <label for="nu">Different links</label><div class="row"><input id="nu" style="flex:1" ${o.can_retry_scrape ? "" : "disabled"}><button id="rs" ${o.can_retry_scrape ? "" : "disabled"}>Retry</button></div></div>`);
+    on("acc", () => A("accept_scrape", {}, "Building the profile…"));
+    on("skipl", () => A("skip_links", {}, "Building the profile…"));
+    on("rs", () => A("retry_scrape", {urls: $("nu").value}, "Reading the links again…"));
+  }
+  else if (step === "review_urls") {
+    const sc = o.scraped;
+    h(`<div class="panel"><p>Read from <strong>${esc(o.urls)}</strong>. Keep what is right.</p>
+      <label><input type="checkbox" id="tn" ${sc.company_name ? "checked" : "disabled"} style="width:auto"> Company name: <strong>${esc(sc.company_name || "nothing scraped")}</strong></label>
+      <label><input type="checkbox" id="ti" ${sc.company_info ? "checked" : "disabled"} style="width:auto"> Company information</label>
+      ${sc.company_info ? md(sc.company_info) : "<p class='empty'>Nothing scraped.</p>"}
+      <div class="row" style="margin-top:.8rem"><button class="primary" id="cont">Continue</button></div>
+      <label for="nu2">Different links</label><div class="row"><input id="nu2" style="flex:1" ${o.can_retry_scrape ? "" : "disabled"}><button id="rs2" ${o.can_retry_scrape ? "" : "disabled"}>Retry</button></div></div>`);
+    on("cont", () => A("review_continue", {take_name: $("tn").checked, take_info: $("ti").checked}, "Matching the company…"));
+    on("rs2", () => A("retry_scrape", {urls: $("nu2").value}, "Reading the links again…"));
+  }
+}
+
+// company picker
+function companies(v){
+  h(`<h1>Your companies</h1><p class="lead">Each company keeps its own profile and up to 10 sessions. ${v.companies.length} of 5 used.</p><div class="list" id="cl"></div>`);
+  if (!v.companies.length) h(`<p class="empty">No companies yet. Add one to get started.</p>`);
+  $("cl").innerHTML = v.companies.map(c => `<div class="item"><div><strong>${esc(c.company_name)}</strong>
+      <div class="meta">Slot ${c.slot} · ${c.session_count} session${c.session_count === 1 ? "" : "s"} · last used ${esc((c.last_used_at || c.created_at || "").slice(0, 10))}</div>
+      <div id="rep${c.company_id}"></div></div>
+      <div class="row"><button class="primary" data-open="${c.company_id}">Open</button><button data-rep="${c.company_id}">Report</button><button class="danger" data-del="${c.company_id}">Delete</button></div></div>`).join("");
+  if (v.company_slots_free > 0) h(`<div class="row" style="margin-top:1rem"><button class="signal" id="add">Add a company · ${v.company_slots_free} slot${v.company_slots_free === 1 ? "" : "s"} free</button></div>`);
+  on("add", () => action("POST", `${W()}/onboarding/start`, {}, "Opening onboarding…"));
+  document.querySelectorAll("[data-open]").forEach(b => b.onclick = () => action("POST", `${W()}/companies/${b.dataset.open}/open`, null, "Opening the company…"));
+  document.querySelectorAll("[data-del]").forEach(b => b.onclick = () => confirm("Delete this company and all its sessions?") && action("DELETE", `${W()}/companies/${b.dataset.del}`, null, "Deleting…"));
+  document.querySelectorAll("[data-rep]").forEach(b => b.onclick = async () => {
+    const box = $("rep" + b.dataset.rep);
+    if (box.innerHTML) { box.innerHTML = ""; return; }
+    try { const r = await api("GET", `${W()}/companies/${b.dataset.rep}/report`); box.innerHTML = `<pre>${esc(JSON.stringify(r, null, 2))}</pre>`; } catch (e) { handleError(e); }
+  });
+}
+
+// session picker
+function sessions(v){
+  h(`<div class="row"><button id="back">← Back to companies</button></div>
+     <h1>${esc(v.company ? v.company.name : "Sessions")}</h1><p class="lead">Each session keeps its own scope, summary, persona and last 20 answers. ${v.sessions.length} of 10 used.</p><div class="list" id="sl"></div>`);
+  if (!v.sessions.length) h(`<p class="empty">No sessions yet. Start one to ask questions.</p>`);
+  $("sl").innerHTML = v.sessions.map(s => `<div class="item"><div><strong>${esc(s.label || "s" + s.slot)}</strong> ${s.scope_label ? "· " + esc(s.scope_label) : ""}
+      <div class="meta">${s.answer_count} answer${s.answer_count === 1 ? "" : "s"} · last used ${esc((s.last_used_at || s.created_at || "").slice(0, 10))}${s.ended_at ? " · ended" : ""}</div></div>
+      <div class="row"><button class="primary" data-res="${s.session_id}">Resume</button><button class="danger" data-dels="${s.session_id}">Delete</button></div></div>`).join("");
+  if (v.session_slots_free > 0) h(`<div class="row" style="margin-top:1rem"><button class="signal" id="new">New session · ${v.session_slots_free} free</button></div>`);
+  on("back", () => action("POST", `${W()}/navigate`, {to: "companies"}, "Loading companies…"));
+  on("new", () => action("POST", `${W()}/sessions`, null, "Preparing a new session…"));
+  document.querySelectorAll("[data-res]").forEach(b => b.onclick = () => action("POST", `${W()}/sessions/${b.dataset.res}/resume`, null, "Resuming the session…"));
+  document.querySelectorAll("[data-dels]").forEach(b => b.onclick = () => confirm("Delete this session?") && action("DELETE", `${W()}/sessions/${b.dataset.dels}`, null, "Deleting…"));
+}
+
+// scope
+function scope(v){
+  h(`<h1>Choose your trade scope</h1><p class="lead">Start from an HS code linked to your profile, or enter an HS code or product name.</p>
+     ${v.candidates.length ? `<div class="opts">${v.candidates.map(c => `<button data-hs="${esc(c.code)}">HS ${esc(c.code)} · ${esc(c.domain)}</button>`).join("")}</div>` : ""}
+     <div class="panel"><label for="sc">HS code or product</label><div class="row"><input id="sc" style="flex:1" placeholder="e.g. 0901 or coffee"><button class="primary" id="start">Start analysis</button></div></div>
+     <button id="back">← Back to sessions</button>`);
+  const start = (choice) => action("POST", `${W()}/scope/start`, {choice}, "Starting the session…");
+  document.querySelectorAll("[data-hs]").forEach(b => b.onclick = () => start(b.dataset.hs));
+  on("start", () => $("sc").value.trim() && start($("sc").value.trim()));
+  $("sc").onkeydown = e => { if (e.key === "Enter" && $("sc").value.trim()) start($("sc").value.trim()); };
+  on("back", () => action("POST", `${W()}/navigate`, {to: "sessions"}, "Loading sessions…"));
+}
+
+// chat
+function chat(v){
+  const ch = v.chat, ctx = v.context || {};
+  const send = (text, source) => action("POST", `${W()}/messages`, {text, source}, "EXIRA is analysing your request…");
+  const turns = ch.turns.map(t => t.role === "system" ? `<div class="turn system">${esc(t.content)}</div>`
+    : t.role === "user" ? `<div class="turn user">${esc(t.content)}</div>`
+    : `<div class="turn assistant">${md(t.content)}${traceBlocks(t.trace)}</div>`).join("");
+  h(`<div class="chat"><section>
+      <h1>Ask about your market</h1><p class="lead">Scope: <strong>${esc(ch.scope.label || "not set")}</strong></p>
+      <div id="turns">${turns || `<p class="empty">Ask a question about buyers, suppliers, demand, prices or trends.</p>`}</div>
+      ${ch.clarification ? `<div class="panel clar"><p><strong>${esc(ch.clarification.question)}</strong></p>
+         <div class="opts">${ch.clarification.options.map((o, i) => `<button data-clar="${esc(o)}">${i + 1}. ${esc(o)}</button>`).join("")}</div></div>` : ""}
+      ${ch.options.length ? `<div class="opts">${ch.options.map(o => `<button data-sug="${esc(o)}">${esc(o)}</button>`).join("")}</div>` : ""}
+      <div class="composer"><input id="msg" placeholder="${esc(ch.input_hint)}" style="flex:1"><button class="primary" id="send">Send</button></div>
+    </section>
+    <aside class="side">
+      <div class="panel"><h3>Session</h3>
+        <div class="row"><button id="switch">Switch session</button><button class="signal" id="end">End session & save</button></div></div>
+      <div class="panel"><h3>Change scope</h3>
+        ${v.candidates.length ? `<div class="opts">${v.candidates.map(c => `<button data-sw="${esc(c.code)}">HS ${esc(c.code)} · ${esc(c.domain)}</button>`).join("")}</div>` : `<p class="empty">No saved HS codes yet.</p>`}
+        <div class="row"><input id="other" placeholder="Other code or product" style="flex:1"><button id="useother">Use</button></div>
+        ${ch.scope.history.length > 1 ? `<details><summary>Scope history (${ch.scope.history.length})</summary>${ch.scope.history.map(esc).join("<br>")}</details>` : ""}</div>
+      <div class="panel"><h3>Context</h3>
+        <details><summary>Company profile</summary>${md(ctx.company_profile || "—")}</details>
+        <details><summary>Previous session summary</summary>${md(ctx.previous_summary || "—")}</details>
+        <details><summary>Current queries (${(ctx.current_queries || []).length})</summary>${(ctx.current_queries || []).map((x, i) => `${i + 1}. ${esc(x)}`).join("<br>") || "—"}</details>
+        <details><summary>Persona</summary>${md(ctx.persona || "—")}</details>
+        <details><summary>Captured answers (${(ctx.captured_answers || []).length})</summary><pre>${esc(JSON.stringify(ctx.captured_answers || [], null, 2))}</pre></details>
+        ${ch.system_notes.length ? `<details><summary>System notes (${ch.system_notes.length})</summary>${ch.system_notes.map(esc).join("<br>")}</details>` : ""}
+      </div>
+    </aside></div>`);
+  const typed = () => { const t = $("msg").value.trim(); if (t) send(t, "typed"); };
+  on("send", typed); $("msg").onkeydown = e => { if (e.key === "Enter") typed(); };
+  document.querySelectorAll("[data-clar]").forEach(b => b.onclick = () => send(b.dataset.clar, "clarification"));
+  document.querySelectorAll("[data-sug]").forEach(b => b.onclick = () => send(b.dataset.sug, "suggestion"));
+  document.querySelectorAll("[data-sw]").forEach(b => b.onclick = () => action("POST", `${W()}/scope/change`, {choice: b.dataset.sw}, "Changing scope…"));
+  on("useother", () => $("other").value.trim() && action("POST", `${W()}/scope/change`, {choice: $("other").value.trim()}, "Changing scope…"));
+  on("switch", () => action("POST", `${W()}/navigate`, {to: "sessions"}, "Loading sessions…"));
+  on("end", () => action("POST", `${W()}/session/end`, null, "Summarising and saving the session…"));
+  const last = $("turns").lastElementChild; if (last) last.scrollIntoView({block: "nearest"});
+}
+
+// done
+function done(v){
+  h(`<h1>Session saved</h1><p class="lead">Saved for ${esc(v.user_id)}.</p>
+     <div class="panel"><h3>Session notes</h3>${md(v.session_notes || "_nothing recorded_")}</div>
+     <div class="row"><button class="primary" id="back">Back to my companies</button><button id="out">Sign out</button></div>`);
+  on("back", () => action("POST", `${W()}/navigate`, {to: "companies"}, "Loading companies…"));
+  on("out", signOut);
+}
+
+// ───────────────────────── sign out / start ─────────────────────────
+function signOutLocal(){ WID = null; store.set("exira_wid", null); render({stage: "login"}); }
+async function signOut(){ try { if (WID) await api("DELETE", W()); } catch (e) {} signOutLocal(); }
+$("signout").onclick = signOut;
+
+async function refresh(){
+  try { render(await api("GET", W() + q()), {notices: false}); } catch (e) { handleError(e); }
+}
+WID ? refresh() : render({stage: "login"});
+</script>
+</body>
+</html>

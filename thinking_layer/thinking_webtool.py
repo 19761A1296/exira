@@ -181,9 +181,9 @@ def _in_scope(question: str, api_key: str) -> bool:
         choice = (r.json().get("choices") or [{}])[0]
         verdict = ((choice.get("message") or {}).get("content") or "").strip()
     except Exception as exc:
-        _dbg("SCOPE CHECK FAILED", f"{type(exc).__name__}: {exc}")
+        # _dbg("SCOPE CHECK FAILED", f"{type(exc).__name__}: {exc}")
         return True
-    _dbg("SCOPE", verdict or "(empty)")
+    # _dbg("SCOPE", verdict or "(empty)")
     return not verdict.upper().startswith("OUT")
 
 
@@ -236,9 +236,9 @@ def run(question: str) -> Dict[str, Any]:
         return done(error="OPENROUTER_API_KEY is not set")
 
     try:
-        _dbg("QUESTION", question)
+        # _dbg("QUESTION", question)
         if not _in_scope(question, api_key):
-            _dbg("OUT OF SCOPE", question)
+            # _dbg("OUT OF SCOPE", question)
             return done(stage=STAGE_OUT_OF_SCOPE, answer=OUT_OF_SCOPE_MESSAGE, model=SCOPE_MODEL)
 
         r = requests.post(URL, headers={"Authorization": f"Bearer {api_key}"},
@@ -262,11 +262,11 @@ def run(question: str) -> Dict[str, Any]:
                         error=f"empty reply ({choice.get('finish_reason')})")
 
         if answer.upper().startswith(OUT_OF_SCOPE_MARKER):
-            _dbg("OUT OF SCOPE", question)
+            # _dbg("OUT OF SCOPE", question)
             return done(stage=STAGE_OUT_OF_SCOPE, answer=OUT_OF_SCOPE_MESSAGE)
 
-        _dbg("ANSWER", answer)
-        _dbg("SOURCES", "\n".join(citations) or "(none)")
+        # _dbg("ANSWER", answer)
+        # _dbg("SOURCES", "\n".join(citations) or "(none)")
         return done(stage=STAGE_SUCCESS, answer=answer, citations=citations)
 
     except Exception as exc:
