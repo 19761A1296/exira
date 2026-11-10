@@ -140,7 +140,12 @@ def go_sessions():
 
 
 def new_session():
-    """'+ New session': clear the chat and choose a scope next."""
+    """'+ New session': clear the chat and open it with no scope.
+
+    The first product question sets the scope through the existing engine
+    flow. begin_with() / POST /scope/start still work for clients that want
+    to start on a chosen scope.
+    """
     _need_user()
     if S.company_id is None:
         raise UserError("Open a company first.")
@@ -161,7 +166,28 @@ def new_session():
     S.pending_clarify = None
     S.flow_run = None
     S.candidates = collect_hs_from_memory(build_memory(), HS2_DOMAIN_MAP)
-    S.stage = "scope"
+    begin_without_scope()
+
+
+def begin_without_scope():
+    """Create a session with no scope and open the chat straight away."""
+    S.hs_code = None
+    S.scope_label = ""
+
+    if S.session_id is None:
+        sid = db.create_session(S.company_id, scope_label="", hs_code="")
+        if sid is None:
+            error("That company already has 10 sessions. Delete one first.")
+            S.stage = "session_picker"
+            return
+        S.session_id = sid
+        row = db.get_session(sid)
+        S.session_slot = row["slot"] if row else None
+        S.persona = load_persona(sid)
+
+    S.stage = "chat"
+    start_engine_session("")
+    S.scope_history = []
 
 
 def resume_session(session_id: int):
@@ -211,6 +237,8 @@ def resume_session(session_id: int):
                 ENGINE.set_hs(S.sid, S.hs_code)
             except Exception:
                 pass
+        else:
+            ENGINE.skip_setup(S.sid)
     print(f"[RESUME] session_id={session_id} stored={row.get('engine_sid')} using={S.sid}")
     S.stage = "chat"
 

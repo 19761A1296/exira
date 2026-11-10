@@ -319,7 +319,7 @@ def ask_scope_shift(current_label: str, candidates: list[dict]) -> str | None:
 
     """
 
-    raw = input(f"\n[{current_label}] Enter to continue, 'c' to change scope: ").strip().lower()
+    raw = input(f"\n[{current_label or 'no scope yet'}] Enter to continue, 'c' to change scope: ").strip().lower()
 
     if raw in EXIT_WORDS:
 
@@ -427,44 +427,19 @@ def begin_session(old_session_memory: str = "", user_product_info: str = "",
 
     candidates = collect_hs_from_memory(memory, HS2_DOMAIN_MAP)
 
-
-
-    choice = choose_scope(candidates)
-
-    if not choice:
-
-        return None
-
-
-
-    hs_code = choice if is_hs_digits(choice) else None
-
-    if hs_code:
-
-        remember_hs(candidates, hs_code)
-
-    scope_label = f"HS {hs_code}" if hs_code else choice
-
-
-
-    if session_id:
-
-        db.save_session(session_id, scope_label=scope_label,
-
-                        hs_code=hs_code or "")
-
-
+    # A new session starts with no scope: the first product question sets it
+    # through the normal engine flow (HS domain pick). choose_scope() is kept
+    # for the mid-chat 'c' scope change.
+    hs_code = None
+    scope_label = ""
 
     sid = ENGINE.start()
-
     ENGINE.inject_memory(sid, memory)
+    ENGINE.skip_setup(sid)
 
-
-
-    # a product name goes in as-is so the engine can run its HS domain probe
-
-    options = render(ENGINE.send(sid, scope_label if hs_code else choice))
-
+    print("\nWelcome! Ask about any product, HS code, market, buyer or supplier. "
+          "There is no trade scope yet: it is set from your first product question.")
+    options = []
     selecting = ENGINE.scope_pending(sid)
 
 

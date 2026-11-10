@@ -43,6 +43,15 @@ class Engine:
             session["state"] = engine.STATE_IDLE
         self._update(sid, apply)
 
+    def skip_setup(self, sid: str) -> None:
+        """Start without a scope: leave SETUP so the first message is treated as a
+        normal question (Trade Agent extracts the product and runs the HS pick),
+        instead of the whole message being taken as the product name."""
+        def apply(session):
+            if session.get("state") == engine.STATE_SETUP:
+                session["state"] = engine.STATE_IDLE
+        self._update(sid, apply)
+
     def inject_memory(self, sid: str, memory: dict) -> None:
         """Push router-side memory into the engine session before every call."""
         def apply(session):

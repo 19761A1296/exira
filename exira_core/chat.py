@@ -1131,6 +1131,8 @@ def ensure_engine_session() -> bool:
             ENGINE.set_hs(S.sid, S.hs_code)
         except Exception:
             pass
+    else:
+        ENGINE.skip_setup(S.sid)
 
     # whatever the old engine session was waiting for is gone with it
     S.selecting = False
@@ -1423,6 +1425,13 @@ def switch_scope(
     S.show_hs_panel = False
 
 
+WELCOME_MESSAGE = (
+    "Welcome! Ask about any product, HS code, market, buyer or supplier. "
+    "There is no trade scope yet: it is set automatically from your first "
+    "product question and keeps updating as you go."
+)
+
+
 def start_engine_session(
     opening: str
 ):
@@ -1440,6 +1449,13 @@ def start_engine_session(
         S.sid,
         build_memory()
     )
+
+    # no opening (new session without a scope): just greet; the first
+    # product question sets the scope through the normal engine flow
+    if not opening:
+        ENGINE.skip_setup(S.sid)
+        push_turn("assistant", WELCOME_MESSAGE)
+        return
 
     try:
 

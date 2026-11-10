@@ -238,7 +238,7 @@ def onboarding_action(wid: str, action: str, body: OnboardingBody = OnboardingBo
 
 # ───────────────────────── sessions ─────────────────────────
 
-@app.post("/workspaces/{wid}/sessions", tags=["sessions"], summary="New session (then choose a scope)")
+@app.post("/workspaces/{wid}/sessions", tags=["sessions"], summary="New session (opens the chat with no scope)")
 def new_session(wid: str, wait: float = Wait, debug: bool = Debug):
     return _action(wid, "new_session", ws.new_session, wait=wait, debug=debug)
 

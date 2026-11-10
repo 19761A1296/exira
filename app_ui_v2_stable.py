@@ -3142,6 +3142,8 @@ def ensure_engine_session() -> bool:
             ENGINE.set_hs(S.sid, S.hs_code)
         except Exception:
             pass
+    else:
+        ENGINE.skip_setup(S.sid)
 
     # whatever the old engine session was waiting for is gone with it
     S.selecting = False
@@ -3433,6 +3435,13 @@ def switch_scope(
     S.show_hs_panel = False
 
 
+WELCOME_MESSAGE = (
+    "Welcome! Ask about any product, HS code, market, buyer or supplier. "
+    "There is no trade scope yet: it is set automatically from your first "
+    "product question and keeps updating as you go."
+)
+
+
 def start_engine_session(
     opening: str
 ):
@@ -3450,6 +3459,13 @@ def start_engine_session(
         S.sid,
         build_memory()
     )
+
+    # no opening (new session without a scope): just greet; the first
+    # product question sets the scope through the normal engine flow
+    if not opening:
+        ENGINE.skip_setup(S.sid)
+        push_turn("assistant", WELCOME_MESSAGE)
+        return
 
     try:
 
@@ -3564,6 +3580,32 @@ def begin_with(choice: str):
     start_engine_session(opening)
     S.scope_history = [S.scope_label] if S.scope_label else []
 
+
+def begin_without_scope():
+    """Create a session with no scope and open the chat straight away.
+
+    The first product question sets the scope through the existing engine
+    flow (HS picker / sync_scope), exactly like a scope change mid-chat.
+    """
+    S.hs_code = None
+    S.scope_label = ""
+
+    if S.session_id is None:
+        sid = db.create_session(S.company_id, scope_label="", hs_code="")
+        if sid is None:
+            st.error("That company already has 10 sessions. Delete one first.")
+            S.stage = "session_picker"
+            return
+
+        S.session_id = sid
+        row = db.get_session(sid)
+        S.session_slot = row["slot"] if row else None
+        S.persona = load_persona(sid)
+
+    S.stage = "chat"
+    start_engine_session("")
+    S.scope_history = []
+
 # =========================================================
 # COMPANY AND SESSION PICKERS
 # =========================================================
@@ -3648,6 +3690,8 @@ def resume_session(session_id: int):
                 ENGINE.set_hs(S.sid, S.hs_code)
             except Exception:
                 pass
+        else:
+            ENGINE.skip_setup(S.sid)
     print(f"[RESUME] session_id={session_id} stored={row.get('engine_sid')} using={S.sid}")
 
     S.stage = "chat"
@@ -3797,7 +3841,8 @@ def page_session_picker():
     if free > 0:
         if st.button(f"+ New session  ·  {free} slot{'s' if free != 1 else ''} free",
                      type="primary", use_container_width=True):
-            # a new session picks its scope first; begin_with creates the row
+            # a new session opens straight into chat with no scope;
+            # the first product question sets it (page_scope is no longer used here)
             S.session_id = None
             S.session_slot = None
             S.old_session = ""
@@ -3810,7 +3855,7 @@ def page_session_picker():
             S.hs_code = None
             S.options = []
             S.candidates = collect_hs_from_memory(build_memory(), HS2_DOMAIN_MAP)
-            S.stage = "scope"
+            begin_without_scope()
             st.rerun()
     else:
         st.caption("All 10 session slots are in use. Delete one to start another.")
