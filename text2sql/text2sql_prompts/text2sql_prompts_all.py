@@ -2101,7 +2101,7 @@ Summary: one row (or one per market) with current and gap bounds, dormant_pool_c
 Drill-down: one row per entity with last_active_before_gap, first_active_current, dormancy_months, pre_gap_value, curr_value, entity_comeback_ratio_pct, plus summary columns repeated.
 
  Data coverage columns
-For every non-Mode-A query, the final SELECT must also return records_before_engine, records_after_engine, excluded_records, and coverage_pct on every row, using the before_count / after_count LEFT JOIN shape from the Data Coverage Engine.
+ONLY when an analytical engine is triggered (see the Data Coverage Engine Trigger), the final SELECT must also return records_before_engine, records_after_engine, excluded_records, and coverage_pct on every row, using the before_count / after_count LEFT JOIN shape from the Data Coverage Engine. For every other query (simple totals, sums, counts, averages, rankings / Top-N, filtered lookups, and Mode A), do NOT return these columns.
 
  Final rule
 If chart/table display is useful, return clean dimension + metric columns that Prompt C can map. If not useful, return the simplest correct result.
@@ -2953,13 +2953,15 @@ MOMENTUM + ACCELERATION TOGETHER (CRITICAL)
 If one user question explicitly asks for both Momentum and Acceleration, compute each engine independently at the same resolved entity grain using its own canonical windows and formulas. Use the union of both required scan spans for raw access, but do not force either engine to adopt the other's window definitions. FULL OUTER JOIN the two classified results on entity_norm (and unit_norm for QUANTITY). Output both engine metric/classification sets. Order by the engine the user emphasizes; if neither is emphasized, order by Momentum first. Do not collapse both concepts into a composite score unless the user explicitly defines such a score.
 
 
-DATA COVERAGE ENGINE (COUNTING OVERLAY — ALL NON-MODE-A QUERIES)
+DATA COVERAGE ENGINE (COUNTING OVERLAY — ANALYTICAL ENGINE QUERIES ONLY)
 
 Purpose:
 Count how many records were available before the analytical engines ran and how many fed the final result after they finished. This engine ONLY counts. It MUST NOT filter, clean, flag, or change the data that any engine uses. Engines must be built exactly as if this engine did not exist.
 
 Trigger:
-Apply ONLY when an analytical engine is triggered (Trend, Seasonality, Demand, Competition, Market Share, Concentration, Retention, Reactivation, Saturation, Margin, Unit-Safe Price, Growth/Comparison, Growth Momentum, Growth Acceleration, New Buyers/Suppliers, Onboarding, Absence). Do not apply to simple totals, counts, rankings, or Mode A.
+Apply ONLY when an analytical engine is triggered (Trend, Seasonality, Demand, Competition, Market Share, Concentration, Retention, Reactivation, Saturation, Margin, Unit-Safe Price, Growth/Comparison, Growth Momentum, Growth Acceleration, New Buyers/Suppliers, Onboarding, Absence). Coverage compares records BEFORE the engine ran with records AFTER the engine finished; with no engine, there is nothing to compare.
+Do NOT apply to any query where no analytical engine is triggered, even if it is not Mode A. This includes simple totals, sums, counts, averages, rankings / Top-N, and filtered lookups. For these queries: no before_count / after_count CTEs, no record_count column added for coverage, and no coverage columns in the final SELECT.
+Example: “What is the total shipment value of chilli exported to Vietnam in the last 12 months?” is a simple total — Data Coverage Engine NOT applied.
 
 Definitions:
 records_before_engine = number of imports_exports rows that pass the resolved question filters for the analysis period(s): time window(s), product/HS, geography, direction, port, and explicit entity filters. COUNT(*) of raw rows, before any engine logic, NULL handling, aggregation, or UNION ALL.
@@ -3043,7 +3045,7 @@ Average price logic, if applicable: if price is triggered, state that the Unit-S
 
 Ordering and limiting: state the exact ordering metric, sort direction, and limit logic. ORDER BY must match the user’s wording and Core Base Prompt default N rules.
 
-Data coverage: for non-Mode-A queries, state which question filters define records_before_engine and at which engine step records_after_engine is counted (before any Top-N).
+Data coverage: first state whether an analytical engine is triggered. If yes, write “Data coverage: applied (<engine name>)” and state which question filters define records_before_engine and at which engine step records_after_engine is counted (before any Top-N). If no, write exactly “Data coverage: not applied (no analytical engine triggered)” and do not plan any coverage CTEs or columns.
 
 Output shape: describe the final SELECT columns, including identifiers, computed metrics used for ranking/filtering, and minimum context columns required by the selected Core/Engine rules.
 
@@ -3115,7 +3117,7 @@ Use shipping_date for all time filters. The live column type is DATE, so inclusi
 
 Implement all logic exactly as described in the SQL Implementation Plan. If any described table, filter, grouping, metric, engine step, ordering, or output column is omitted, the query is WRONG.
 
-For non-Mode-A queries, include the before_count and after_count CTEs and build the final SELECT as before_count CROSS JOIN after_count LEFT JOIN final_result ON 1 = 1, repeating the result ordering in the outer ORDER BY. The counting CTEs must not change any engine's filters or data.
+ONLY when the SQL Implementation Plan says “Data coverage: applied”, include the before_count and after_count CTEs and build the final SELECT as before_count CROSS JOIN after_count LEFT JOIN final_result ON 1 = 1, repeating the result ordering in the outer ORDER BY. The counting CTEs must not change any engine's filters or data. When the plan says “Data coverage: not applied”, do NOT add before_count, after_count, coverage record_count, or any coverage column.
 
 Enforce universal case insensitivity for all text comparisons, joins, and grouping keys by wrapping both the column and literal in Apply UPPER(TRIM(...)) for all text equality/join/grouping keys (countries, states, cities, company names, ports) consistently across all CTEs. Do not normalize PRODUCT_DESCRIPTION beyond UPPER(...) for fuzzy matching., and apply this consistently across all CTEs so the same entity cannot split due to casing or whitespace.
 
