@@ -4,6 +4,12 @@
 # Core chat/domain/confirmation flow kept stable.
 # Visualization support is added only after successful Prompt A/B/C execution.
 # Paste your final Prompt A, Prompt B, Prompt C, Trade Agent, Followup Agent prompts into the placeholders below.
+#
+# DATABASE: VeloDB (Apache Doris engine), reached over the MySQL protocol via PyMySQL.
+#   pip install pymysql
+#   .env:
+#     VELODB_HOST, VELODB_PORT (MySQL/query port, usually 9030), VELODB_USER,
+#     VELODB_PASSWORD, VELODB_DATABASE, VELODB_TRADE_TABLE_NAME
 
 import os
 import re
@@ -18,7 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 import requests
-import snowflake.connector
+import pymysql
 from dotenv import load_dotenv
 from dataclasses import dataclass
 from text2sql.text2sql_prompts.text2sql_prompts_all import PROMPT_A_TEMPLATE, PROMPT_B_TEMPLATE, PROMPT_C_TEMPLATE, TRADE_AGENT_PROMPT_TEMPLATE, FOLLOWUP_AGENT_PROMPT_TEMPLATE, NORMALIZE_PROMPT_TEMPLATE, PROMPT_A_SKELETON_BIBLE
@@ -61,15 +67,14 @@ PROMPT_C_MAX_TOKENS = int(os.getenv("PROMPT_C_MAX_TOKENS", "3500"))
 
 MAX_SQL_FIX_ATTEMPTS = int(os.getenv("MAX_SQL_FIX_ATTEMPTS", "3"))
 
-SNOWFLAKE_ACCOUNT = os.getenv("SNOWFLAKE_ACCOUNT", "")
-SNOWFLAKE_USER = os.getenv("SNOWFLAKE_USER", "")
-SNOWFLAKE_PASSWORD = os.getenv("SNOWFLAKE_PASSWORD", "")
-SNOWFLAKE_WAREHOUSE = os.getenv("SNOWFLAKE_WAREHOUSE", "")
-SNOWFLAKE_DATABASE = os.getenv("SNOWFLAKE_DATABASE", "")
-SNOWFLAKE_SCHEMA = os.getenv("SNOWFLAKE_SCHEMA", "PUBLIC")
-SNOWFLAKE_ROLE = os.getenv("SNOWFLAKE_ROLE", "")
+# ---------------- VeloDB (Apache Doris, MySQL protocol) ----------------
+VELODB_HOST = (os.getenv("VELODB_HOST") or "").strip()
+VELODB_PORT = int((os.getenv("VELODB_PORT") or "9030").strip())
+VELODB_USER = (os.getenv("VELODB_USER") or "").strip()
+VELODB_PASSWORD = os.getenv("VELODB_PASSWORD") or ""
+VELODB_DATABASE = (os.getenv("VELODB_DATABASE") or "").strip()
+TRADE_TABLE_NAME = (os.getenv("VELODB_TRADE_TABLE_NAME"))
 
-TRADE_TABLE_NAME = os.getenv("TRADE_TABLE_NAME", "imports_exports")
 HS_PROBE_MONTHS = int(os.getenv("HS_PROBE_MONTHS", "3"))
 
 HS2_DOMAIN_MAP = {
@@ -120,6 +125,7 @@ NON_PRODUCT_TERMS = {
 # PROMPTS / CONTEXT PLACEHOLDERS
 # =========================================================
 SCHEMA_CONTEXT = f"""SCHEMA_CONTEXT (for grounding only)
+Engine: VeloDB (Apache Doris) - MySQL-compatible SQL dialect
 Table: {TRADE_TABLE_NAME}
 - SHIPPING_DATE (date): used for all time filters, comparisons, rolling windows
 - SHIPMENT_VALUE (numeric): monetary metric (default metric)
@@ -130,10 +136,11 @@ Table: {TRADE_TABLE_NAME}
 - BUYER: BUYER_COMPANY, BUYER_COUNTRY, BUYER_STATE, BUYER_CITY, BUYER_ADDRESS
 - SELLER: SELLER_COMPANY, SELLER_COUNTRY, SELLER_STATE, SELLER_CITY, SELLER_ADDRESS
 - PORTS: PORT_OF_ORIGIN, PORT_OF_DESTINATION
-- DECL_NO (text): unique row identifier; never use as grouping/logical dimension
+- DECL_NO (text): nullable shipment reference; not a logical unique key and never use as grouping/logical dimension
 """
 
-SCHEMA_DESCRIPTION = f"""Table Name: {TRADE_TABLE_NAME}
+SCHEMA_DESCRIPTION = f"""Engine: VeloDB (Apache Doris) - MySQL-compatible SQL dialect
+Table Name: {TRADE_TABLE_NAME}
 Columns:
 - SHIPPING_DATE (date)
 - QUANTITY (numeric)
@@ -155,6 +162,38 @@ Columns:
 - DECL_NO (text)
 - HS_CODE (text)
 """
+
+# Injected into Prompt A and Prompt B so the LLM writes Doris SQL instead of Snowflake SQL.
+# If a prompt template contains the placeholder {sql_dialect_notes}, it is inserted there;
+# otherwise it is prepended to the prompt.
+VELODB_SQL_DIALECT_NOTES = """TARGET SQL ENGINE: VeloDB Cloud 26.0.5.1 (Apache Doris-compatible SQL via MySQL protocol). NOT Snowflake.
+This runtime block is authoritative and MUST agree with Prompt A/B. Preserve business semantics while using only this VeloDB contract.
+
+- Output exactly ONE read-only SELECT/WITH statement.
+- Physical trade columns are lowercase.
+- Month shifts: MONTHS_ADD(date_expr, signed_months).
+- Day differences: DATEDIFF(end_date, start_date). For calendar month-boundary differences use (YEAR(end_date)*12 + MONTH(end_date)) - (YEAR(start_date)*12 + MONTH(start_date)).
+- Date truncation: DATE_TRUNC(date_expr, 'month'|'quarter'|'year').
+- Exact percentile: PERCENTILE_CONT(CAST(value_expr AS DOUBLE), percentile). Never use WITHIN GROUP or a percentile window.
+- REGR_SLOPE / REGR_INTERCEPT are supported; REGR_R2 is not. Derive r2 with guarded CORR/VAR_POP when required.
+- COUNT_IF is unavailable; use SUM(CASE WHEN condition THEN 1 ELSE 0 END).
+- Use CONCAT(...) for concatenation and GROUP_CONCAT for string aggregation. Do not use || or LISTAGG.
+- HS_CODE is a clean VARCHAR containing digits only in production. Preserve leading zeros and filter the physical hs_code directly; never wrap hs_code in REGEXP_REPLACE/REPLACE for normalization. Sanitize only user-provided HS text before SQL. Use LIKE for one prefix, SUBSTR(hs_code, 1, N) IN (...) for multiple equal-length prefixes, and = only for an exact full code.
+- Product matching uses exact substring plus a token-level NGRAM_SEARCH fallback for ASCII product tokens of length >= 4. The fuzzy branch MUST be evaluated on tokens from SPLIT_BY_STRING(REGEXP_REPLACE(UPPER(td.product_description), '[^A-Z0-9]+', ' '), ' '), never on the whole long description. The canonical threshold is 0.80 with a token-length difference of at most 2 characters. REGEXP_EXTRACT_ALL must NOT be used as the ARRAY source on this production cluster.
+- ARRAY_COUNT, SPLIT_BY_STRING, REGEXP_REPLACE, CHAR_LENGTH, ABS, and NGRAM_SEARCH(text, pattern, 2) are permitted for that canonical product predicate.
+- When both PRODUCT_DESCRIPTION and HS scope apply, they are ALWAYS combined as (PRODUCT_MATCH) AND (HS_SCOPE). Internal OR is allowed only inside PRODUCT_MATCH (exact OR fuzzy) or inside a multi-code HS set. Never use (PRODUCT_MATCH) OR (HS_SCOPE) unless the user explicitly asks for either/union semantics.
+- HS scope precedence: CURRENT explicit HS code(s) in the user/sub-question override any older remembered/resolved product HS scope. Reuse saved scope only when the current request supplies no explicit HS scope.
+- JAROWINKLER_SIMILARITY, LEVENSHTEIN, Damerau-Levenshtein, TIMESTAMPDIFF, ILIKE, and Snowflake DATEADD syntax are forbidden.
+- Ports and countries are standardized in production. Countries use exact normalized equality after canonical resolution. Ports resolve to one standardized DISTINCT stored value (exact first, contains second, NGRAM_SEARCH >= 0.90 only as typo fallback), then fact rows use exact normalized equality. Never fuzzy-match every fact row. Company matching keeps its existing rules.
+- Use single quotes for literals; unquoted identifiers when possible, backticks only if required; never double-quoted identifiers.
+- The imports_exports schema is flat: never generate GET(...), FLATTEN, ::VARIANT, or ARRAY/VARIANT access patterns. ARRAY values created transiently by SPLIT_BY_STRING for canonical product-token matching are allowed.
+- No QUALIFY: materialize window results in a CTE/subquery and filter at the next query level.
+"""
+
+def apply_sql_dialect(prompt: str) -> str:
+    if "{sql_dialect_notes}" in prompt:
+        return prompt.replace("{sql_dialect_notes}", VELODB_SQL_DIALECT_NOTES)
+    return VELODB_SQL_DIALECT_NOTES + "\n\n" + prompt
 
 
 
@@ -189,6 +228,13 @@ def current_date_iso() -> str:
 
 def current_date_pretty() -> str:
     return datetime.date.today().strftime("%B %d, %Y")
+
+def completed_month_window(months: int) -> Tuple[datetime.date, datetime.date]:
+    """[start, end) covering the last `months` completed calendar months."""
+    end = datetime.date.today().replace(day=1)
+    y, m = divmod(end.year * 12 + (end.month - 1) - months, 12)
+    start = datetime.date(y, m + 1, 1)
+    return start, end
 
 def has_real_prompt(template: str) -> bool:
     return bool(template) and "<PASTE_" not in template
@@ -338,7 +384,92 @@ def is_non_product_term(term: str) -> bool:
     return not clean or clean in NON_PRODUCT_TERMS
 
 def sanitize_sql_literal(value: str) -> str:
-    return (value or "").replace("'", "''").strip()
+    # MySQL-protocol engines treat backslash as an escape character too.
+    return (value or "").replace("\\", "\\\\").replace("'", "''").strip()
+
+# Canonical product/HS filter contract. Keep this in sync with Prompt A/B and the thinking layer.
+PRODUCT_FUZZY_NGRAM_THRESHOLD = 0.80
+PRODUCT_SCOPE_CONTRACT_HEADER = "SYSTEM_RESOLVED_PRODUCT_FILTER_CONTRACT"
+PRODUCT_MATCH_STOPWORDS = {"A", "AN", "THE", "OF", "AND", "OR", "FOR", "WITH", "IN", "ON", "TO", "BY"}
+
+def _sql_string_literal(value: str) -> str:
+    return "'" + sanitize_sql_literal(value) + "'"
+
+def product_match_tokens(product_term: str) -> List[str]:
+    norm = normalize_product_key(product_term)
+    tokens = re.findall(r"[A-Z0-9]+", norm)
+    meaningful = [t for t in tokens if t not in PRODUCT_MATCH_STOPWORDS]
+    return meaningful or tokens
+
+def build_canonical_product_match_sql(product_term: str, alias: str = "td") -> str:
+    """Return the authoritative VeloDB PRODUCT_DESCRIPTION predicate for one product phrase.
+
+    Exact substring matching is retained. For ASCII tokens length >=4, a token-level
+    NGRAM_SEARCH fallback approximates the old Snowflake Jaro-Winkler recall without
+    comparing the short term to the entire long shipment description.
+    """
+    norm = normalize_product_key(product_term)
+    if not norm:
+        return "1 = 1"
+    phrase_lit = _sql_string_literal(norm)
+    exact_phrase = f"UPPER({alias}.product_description) LIKE CONCAT('%', {phrase_lit}, '%')"
+    tokens = product_match_tokens(norm)
+    if not tokens:
+        return exact_phrase
+
+    token_predicates = []
+    for token in tokens:
+        token_lit = _sql_string_literal(token)
+        exact_token = f"UPPER({alias}.product_description) LIKE CONCAT('%', {token_lit}, '%')"
+        if token.isascii() and token.isalnum() and len(token) >= 4:
+            min_len = max(2, len(token) - 2)
+            max_len = len(token) + 2
+            fuzzy_token = (
+                "(ARRAY_COUNT(tok -> ("
+                f"CHAR_LENGTH(tok) BETWEEN {min_len} AND {max_len} "
+                f"AND NGRAM_SEARCH(tok, {token_lit}, 2) >= {PRODUCT_FUZZY_NGRAM_THRESHOLD:.2f}"
+                "), "
+                f"SPLIT_BY_STRING(REGEXP_REPLACE(UPPER({alias}.product_description), '[^A-Z0-9]+', ' '), ' ')) > 0)"
+            )
+            token_predicates.append(f"({exact_token} OR {fuzzy_token})")
+        else:
+            token_predicates.append(exact_token)
+
+    if len(tokens) == 1:
+        return token_predicates[0]
+
+    # Multi-word products: exact phrase OR all meaningful tokens, each with its own
+    # exact/fuzzy token match. This keeps required product words conjunctive.
+    return f"({exact_phrase} OR ({' AND '.join(token_predicates)}))"
+
+def build_canonical_hs_scope_sql(hs_codes: List[str], alias: str = "td") -> str:
+    """Build the authoritative HS predicate for clean digit-only VARCHAR hs_code.
+
+    Production invariant: the physical column already contains only digits and preserves
+    leading zeros. Sanitize only user input; never normalize hs_code inside SQL.
+    2/4/6-digit values are hierarchical prefixes; 8/10-digit values are full codes.
+    """
+    codes = [c for c in [normalize_hs_token(x) for x in (hs_codes or [])] if c]
+    codes = sorted(set(codes))
+    if not codes:
+        return "1 = 1"
+
+    lengths = {len(c) for c in codes}
+    if len(codes) > 1 and len(lengths) == 1:
+        n = next(iter(lengths))
+        literals = ", ".join(_sql_string_literal(c) for c in codes)
+        if n in {2, 4, 6}:
+            return f"SUBSTR({alias}.hs_code, 1, {n}) IN ({literals})"
+        return f"{alias}.hs_code IN ({literals})"
+
+    parts = []
+    for code in codes:
+        lit = _sql_string_literal(code)
+        if len(code) in {2, 4, 6}:
+            parts.append(f"{alias}.hs_code LIKE CONCAT({lit}, '%')")
+        else:
+            parts.append(f"{alias}.hs_code = {lit}")
+    return parts[0] if len(parts) == 1 else "(" + " OR ".join(parts) + ")"
 
 def trim_json_for_memory(value: Any, max_list_items: int = RESULT_ROWS_MEMORY_LIMIT, max_str_len: int = 5000) -> Any:
     if isinstance(value, str):
@@ -389,6 +520,7 @@ def new_session_state() -> Dict[str, Any]:
             "pending_product_term": None,
             "pending_product_terms": [],
             "pending_hs_code": None,
+            "pending_explicit_hs_codes": [],
             "pending_domain_disambiguation": None,
             "product_hs_memory": {},
             "selected_hs_codes": [],
@@ -575,41 +707,120 @@ def extract_product_or_hs(text: str) -> Dict[str, Optional[str]]:
     return {"hs_code": None, "product": (text or "").strip()}
 
 def normalize_hs_token(code: str) -> Optional[str]:
-    raw = re.sub(r"[.\-\s]", "", (code or "").strip())
+    raw = re.sub(r"[^0-9]", "", (code or "").strip())
     if not re.fullmatch(r"\d{1,10}", raw):
         return None
     if len(raw) <= 2:
         return raw.zfill(2)
     return raw
 
-def extract_explicit_hs_code(text: str) -> Optional[str]:
-    return extract_product_or_hs(text).get("hs_code")
+def extract_explicit_hs_codes(text: str) -> List[str]:
+    """Extract HS code/prefixes explicitly supplied in the CURRENT user turn.
 
-def run_hs2_probe_sql(product_term: str) -> List[Dict[str, Any]]:
-    safe_term = sanitize_sql_literal(product_term)
-    if not safe_term:
+    Examples supported:
+      HS09
+      HS-09
+      HS 5201
+      HS codes 19, 20, 21 and 35
+      chilli-HS19,20,21,35
+
+    This parser is intentionally conservative: ordinary numbers such as dates,
+    top-N counts, and time windows are ignored unless introduced by an HS marker.
+    A message consisting only of HS digits is also accepted for the HS-only setup flow.
+    """
+    raw = (text or "").strip()
+    if not raw:
         return []
+
+    found: List[str] = []
+    # Capture one HS list immediately following an explicit HS/HS CODE(S) marker.
+    # Separators may be comma, slash, ampersand, or the word "and".
+    pattern = re.compile(
+        r"(?i)\bhs(?:\s*codes?)?\s*[-:]?\s*"
+        r"((?:\d{1,10})(?:\s*(?:,|/|&|\band\b)\s*\d{1,10})*)"
+    )
+    for match in pattern.finditer(raw):
+        for token in re.findall(r"\d{1,10}", match.group(1)):
+            norm = normalize_hs_token(token)
+            if norm and norm not in found:
+                found.append(norm)
+
+    if not found and re.fullmatch(r"\d{2,10}", raw):
+        norm = normalize_hs_token(raw)
+        if norm:
+            found.append(norm)
+    return found
+
+
+def extract_explicit_hs_code(text: str) -> Optional[str]:
+    codes = extract_explicit_hs_codes(text)
+    return codes[0] if codes else None
+
+def _build_hs2_probe_sql(product_term: str, use_fuzzy: bool) -> Tuple[str, List[Any]]:
+    # %s placeholders are filled by PyMySQL (safe quoting/escaping).
+    tokens = product_match_tokens(product_term)
+    if not tokens:
+        tokens = [normalize_product_key(product_term)] if normalize_product_key(product_term) else []
+
+    product_clauses: List[str] = []
+    product_params: List[Any] = []
+    for token in tokens:
+        token = token.upper()
+        like_clause = "UPPER(td.product_description) LIKE %s"
+        product_params.append(f"%{token}%")
+        if use_fuzzy and token.isascii() and token.isalnum() and len(token) >= 4:
+            min_len = max(2, len(token) - 2)
+            max_len = len(token) + 2
+            product_clauses.append(
+                "(" + like_clause + " OR (ARRAY_COUNT(tok -> ("
+                f"CHAR_LENGTH(tok) BETWEEN {min_len} AND {max_len} "
+                "AND NGRAM_SEARCH(tok, %s, 2) >= 0.80), "
+                "SPLIT_BY_STRING(REGEXP_REPLACE(UPPER(td.product_description), '[^A-Z0-9]+', ' '), ' ')) > 0))"
+            )
+            product_params.append(token)
+        else:
+            product_clauses.append(like_clause)
+
+    product_sql = " AND ".join(product_clauses) if product_clauses else "1 = 0"
     sql = f"""
 SELECT
-    LEFT(TRIM(td.HS_CODE), 2) AS HS2,
+    SUBSTR(td.hs_code, 1, 2) AS HS2,
     COUNT(*) AS RECORD_COUNT
 FROM {TRADE_TABLE_NAME} AS td
-WHERE td.HS_CODE IS NOT NULL
-  AND TRIM(td.HS_CODE) <> ''
-  AND td.PRODUCT_DESCRIPTION IS NOT NULL
-  AND td.SHIPPING_DATE IS NOT NULL
-  AND td.SHIPPING_DATE >= DATEADD(MONTH, -{HS_PROBE_MONTHS}, DATE_TRUNC('MONTH', CURRENT_DATE()))
-  AND td.SHIPPING_DATE < DATE_TRUNC('MONTH', CURRENT_DATE())
-  AND (
-      UPPER(td.PRODUCT_DESCRIPTION) LIKE '%' || UPPER('{safe_term}') || '%'
-      OR JAROWINKLER_SIMILARITY(UPPER(td.PRODUCT_DESCRIPTION), UPPER('{safe_term}')) > 80
-  )
-GROUP BY LEFT(TRIM(td.HS_CODE), 2)
+WHERE td.hs_code IS NOT NULL
+  AND td.hs_code <> ''
+  AND td.product_description IS NOT NULL
+  AND td.shipping_date IS NOT NULL
+  AND td.shipping_date >= CAST(%s AS DATE)
+  AND td.shipping_date < CAST(%s AS DATE)
+  AND ({product_sql})
+GROUP BY SUBSTR(td.hs_code, 1, 2)
 ORDER BY RECORD_COUNT DESC, HS2
 """.strip()
-    ok, rows, cols, err = run_snowflake(sql)
+    return sql, product_params
+
+
+def run_hs2_probe_sql(product_term: str) -> List[Dict[str, Any]]:
+    term = (product_term or "").strip()
+    if not term:
+        return []
+    start, end = completed_month_window(HS_PROBE_MONTHS)
+
+    # First try the same canonical token-level fuzzy product semantics used by final SQL.
+    sql, product_params = _build_hs2_probe_sql(term, use_fuzzy=True)
+    params = (start.isoformat(), end.isoformat(), *product_params)
+    ok, rows, cols, err = run_sql(sql, params)
+
+    # Conservative compatibility fallback if token-array functions are unavailable.
+    if not ok:
+        print("HS PROBE token fuzzy match failed, retrying with LIKE-only product matching:", err)
+        sql, product_params = _build_hs2_probe_sql(term, use_fuzzy=False)
+        params = (start.isoformat(), end.isoformat(), *product_params)
+        ok, rows, cols, err = run_sql(sql, params)
+
     print("HS PROBE PRODUCT:", product_term)
     print("HS PROBE SQL:", sql)
+    print("HS PROBE PARAMS:", params)
     print("HS PROBE OK:", ok)
     print("HS PROBE ROWS:", rows)
     print("HS PROBE ERROR:", err)
@@ -703,6 +914,24 @@ def parse_domain_selection_from_text(text: str, pending: Dict[str, Any]) -> Opti
 def get_product_memory(session: Dict[str, Any], product_term: str) -> Optional[Dict[str, Any]]:
     return session["active_focus"].get("product_hs_memory", {}).get(normalize_product_key(product_term))
 
+
+def get_mentioned_memory_products(session: Dict[str, Any], text: str) -> List[str]:
+    """Return remembered product names explicitly mentioned in the current text.
+
+    This deterministic backstop protects session-scope precedence even if the Trade
+    Agent forgets to return product_terms for a message such as chilli-HS19,20,21,35.
+    """
+    q_norm = normalize_product_key(text)
+    out: List[str] = []
+    for item in (session["active_focus"].get("product_hs_memory", {}) or {}).values():
+        term = (item or {}).get("product_term")
+        key = normalize_product_key(term or "")
+        if not key:
+            continue
+        if re.search(r"(?<![A-Z0-9])" + re.escape(key) + r"(?![A-Z0-9])", q_norm):
+            out.append(term)
+    return dedupe_preserve(out)
+
 def save_product_scope(session: Dict[str, Any], product_term: str, scopes: List[Dict[str, Any]]):
     selected_hs = flatten_scope_hs_codes(scopes)
     key = normalize_product_key(product_term)
@@ -728,41 +957,86 @@ def get_unknown_product_terms(session: Dict[str, Any], product_terms: List[str])
             unknown_terms.append(clean)
     return dedupe_preserve(unknown_terms)
 
-def build_product_scopes_context(original_query: str, session: Dict[str, Any], product_terms: Optional[List[str]] = None) -> str:
+def build_product_scopes_context(
+    original_query: str,
+    session: Dict[str, Any],
+    product_terms: Optional[List[str]] = None,
+    explicit_hs_overrides: Optional[Dict[str, List[str]]] = None,
+) -> str:
+    """Append one authoritative, idempotent product/HS filter contract.
+
+    Precedence is deterministic:
+      1) HS code(s) explicitly supplied in the CURRENT user turn,
+      2) the latest saved session scope for that product,
+      3) no contract (the normal product-scope resolution flow handles it).
+
+    Current explicit HS scope never gets overwritten by older product_hs_memory.
+    The LLM receives the already-resolved SQL predicate instead of reconstructing the
+    AND/OR relationship on every call. Repeated calls replace the old contract rather
+    than appending duplicates.
+    """
     memory = session["active_focus"].get("product_hs_memory", {}) or {}
+    base_query = (original_query or "").split(f"\n\n{PRODUCT_SCOPE_CONTRACT_HEADER}", 1)[0].rstrip()
+
     cleaned_terms = []
     for term in product_terms or []:
         if isinstance(term, str) and term.strip() and not is_non_product_term(term):
             cleaned_terms.append(re.sub(r"\s+", " ", term.strip()))
     if not cleaned_terms:
-        q_norm = normalize_product_key(original_query)
+        q_norm = normalize_product_key(base_query)
         for item in memory.values():
             term = item.get("product_term")
             if term and normalize_product_key(term) in q_norm:
                 cleaned_terms.append(term)
     cleaned_terms = dedupe_preserve(cleaned_terms)
 
-    lines = []
+    override_map = explicit_hs_overrides or {}
+    blocks = []
     for term in cleaned_terms:
-        item = memory.get(normalize_product_key(term))
-        if not item:
-            continue
-        scopes = item.get("selected_scopes") or []
-        scope_texts = []
-        for scope in scopes:
-            domain = scope.get("domain") or "Selected domain"
-            codes = [c for c in [normalize_hs_token(x) for x in scope.get("selected_hs_codes", [])] if c]
-            if codes:
-                scope_texts.append(f"{domain}: HS {', '.join(sorted(set(codes)))}")
-        if scope_texts:
-            lines.append(f"- {term}: " + "; ".join(scope_texts) + ".")
+        term_key = normalize_product_key(term)
+        override_codes = [
+            c for c in [normalize_hs_token(x) for x in override_map.get(term_key, [])] if c
+        ]
+        if override_codes:
+            # CURRENT user instruction wins over any previously remembered scope.
+            hs_codes = sorted(set(override_codes))
         else:
-            hs_codes = [c for c in [normalize_hs_token(x) for x in item.get("selected_hs_codes", [])] if c]
-            if hs_codes:
-                lines.append(f"- {term}: restrict PRODUCT_DESCRIPTION matching for this product to HS_CODE prefixes/codes {', '.join(sorted(set(hs_codes)))}.")
-    if not lines:
-        return original_query
-    return f"{original_query}\n\nSystem user-confirmed product HS scopes:\n" + "\n".join(lines)
+            item = memory.get(term_key)
+            if not item:
+                continue
+            hs_codes = flatten_scope_hs_codes(item.get("selected_scopes") or [])
+            if not hs_codes:
+                hs_codes = [c for c in [normalize_hs_token(x) for x in item.get("selected_hs_codes", [])] if c]
+            hs_codes = sorted(set(hs_codes))
+        if not hs_codes:
+            continue
+
+        product_sql = build_canonical_product_match_sql(term, alias="td")
+        hs_sql = build_canonical_hs_scope_sql(hs_codes, alias="td")
+        blocks.append(
+            f"Product: {term}\n"
+            f"Selected HS scope: {', '.join(hs_codes)}\n"
+            "Authoritative predicate (preserve these semantics exactly):\n"
+            "(\n"
+            f"  ({product_sql})\n"
+            "  AND\n"
+            f"  ({hs_sql})\n"
+            ")"
+        )
+
+    if not blocks:
+        return base_query
+
+    contract = (
+        f"{PRODUCT_SCOPE_CONTRACT_HEADER} (AUTHORITATIVE; INTERNAL)\n"
+        "HS precedence: an HS code/scope explicitly supplied in the CURRENT user request overrides any older session scope for that product. If the current request supplies no HS scope, the latest saved product scope may be reused.\n"
+        "The product-to-HS scopes below already reflect that precedence. Do not infer, broaden, narrow, or reconstruct them.\n"
+        "For each product, the PRODUCT_DESCRIPTION match and selected HS scope are conjunctive: PRODUCT_MATCH AND HS_SCOPE.\n"
+        "Never change that outer AND to OR. OR is permitted only inside the product predicate for exact-vs-fuzzy matching, or inside the HS predicate when several HS prefixes/codes are listed.\n"
+        "If the SQL repeats the filter in more than one CTE, every occurrence must preserve exactly the same semantics. Prefer one scoped_data/base_scope CTE and derive downstream calculations from it.\n\n"
+        + "\n\n".join(blocks)
+    )
+    return f"{base_query}\n\n{contract}"
 
 def is_common_question_while_pending(text: str) -> bool:
     q = (text or "").strip().lower()
@@ -950,12 +1224,13 @@ def generate_post_execution_followups(session: Dict[str, Any]) -> List[str]:
 def build_prompt_a(user_query: str) -> str:
     if not has_real_prompt(PROMPT_A_TEMPLATE):
         raise RuntimeError("PROMPT_A_TEMPLATE not configured")
-    return PROMPT_A_TEMPLATE.replace("{current_date}", current_date_pretty()).replace("{user_query}", user_query)
+    prompt = PROMPT_A_TEMPLATE.replace("{current_date}", current_date_pretty()).replace("{user_query}", user_query)
+    return apply_sql_dialect(prompt)
 
 def build_prompt_b(user_query: str, interpretation: str, plan: str, attempt_history: str, latest_sql: str, latest_error: str, attempt_index: int) -> str:
     if not has_real_prompt(PROMPT_B_TEMPLATE):
         raise RuntimeError("PROMPT_B_TEMPLATE not configured")
-    return (
+    prompt = (
         PROMPT_B_TEMPLATE
         .replace("{current_date}", current_date_pretty())
         .replace("{user_query}", user_query)
@@ -967,6 +1242,7 @@ def build_prompt_b(user_query: str, interpretation: str, plan: str, attempt_hist
         .replace("{latest_error}", latest_error)
         .replace("{latest_attempt_index}", str(attempt_index))
     )
+    return apply_sql_dialect(prompt)
 
 def build_prompt_c(user_query: str, interpretation: str, plan: str, executed_sql: str, rows: List[Dict[str, Any]], cols: List[str]) -> str:
     if not has_real_prompt(PROMPT_C_TEMPLATE):
@@ -1012,29 +1288,164 @@ def parse_prompt_a_output(text: str) -> Dict[str, str]:
     return {"interpretation_summary": interp, "sql_plan": plan, "sql": sql, "raw": raw}
 
 def parse_prompt_b_output(text: str) -> str:
-    raw = strip_sql_end(text or "")
-    m = re.search(r"(?is)\b(WITH\b[\s\S]*?;|\bSELECT\b[\s\S]*?;)", raw)
-    return m.group(1).strip() if m else raw.strip()
+    raw = strip_sql_end(text or "").strip()
+    if not raw:
+        return ""
+    m = re.search(r"(?is)\b(?:WITH|SELECT)\b", raw)
+    if not m:
+        return ""
+    sql = raw[m.start():].strip()
+    # Prompt B is required to emit one statement. If it adds trailing prose after
+    # a semicolon, keep only the first SQL statement.
+    if ";" in sql:
+        sql = sql.split(";", 1)[0].rstrip()
+    return sql
 
-def get_snowflake_conn():
-    return snowflake.connector.connect(
-        user=SNOWFLAKE_USER,
-        password=SNOWFLAKE_PASSWORD,
-        account=SNOWFLAKE_ACCOUNT,
-        warehouse=SNOWFLAKE_WAREHOUSE,
-        database=SNOWFLAKE_DATABASE,
-        schema=SNOWFLAKE_SCHEMA,
-        role=SNOWFLAKE_ROLE if SNOWFLAKE_ROLE else None,
+# Known production compatibility repair: on this VeloDB cluster,
+# REGEXP_EXTRACT_ALL is not an ARRAY value suitable for ARRAY_COUNT.  Convert the
+# canonical product-token source to SPLIT_BY_STRING(REGEXP_REPLACE(...)), which is
+# array-typed and preserves the same token-level NGRAM semantics.
+_REGEXP_EXTRACT_PRODUCT_ARRAY_RE = re.compile(
+    r"REGEXP_EXTRACT_ALL\(\s*UPPER\(\s*([A-Za-z_][A-Za-z0-9_]*\.product_description)\s*\)\s*,\s*'\(\[A-Z0-9\]\+\)'\s*\)",
+    re.IGNORECASE,
+)
+
+def _replace_array_exists_with_scalar_count(sql: str) -> str:
+    """Replace ARRAY_EXISTS(lambda, array) with (ARRAY_COUNT(lambda, array) > 0).
+
+    Doris/VeloDB ARRAY_EXISTS returns ARRAY<BOOLEAN>, so it cannot be used directly
+    as a WHERE predicate. This balanced-parenthesis rewrite is deterministic and only
+    touches ARRAY_EXISTS calls.
+    """
+    text = sql or ""
+    lower = text.lower()
+    out = []
+    i = 0
+    token = "array_exists("
+    while True:
+        pos = lower.find(token, i)
+        if pos < 0:
+            out.append(text[i:])
+            break
+        out.append(text[i:pos])
+        open_pos = pos + len("array_exists")
+        depth = 0
+        quote = None
+        j = open_pos
+        while j < len(text):
+            ch = text[j]
+            if quote:
+                if ch == quote:
+                    if j + 1 < len(text) and text[j + 1] == quote:
+                        j += 2
+                        continue
+                    quote = None
+                j += 1
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if j >= len(text):
+            out.append(text[pos:])
+            break
+        inner = text[open_pos + 1:j]
+        out.append(f"(ARRAY_COUNT({inner}) > 0)")
+        i = j + 1
+    return "".join(out)
+
+
+# Production invariant: hs_code is clean digit-only VARCHAR. Canonicalize stale
+# model output before execution so prompt drift cannot re-introduce row-level
+# regex/replacement normalization or LEFT-vs-SUBSTR variation.
+def enforce_static_velodb_sql_contract(sql: str) -> str:
+    s = sql or ""
+
+    # REGEXP_REPLACE(TRIM(alias.hs_code), '[^0-9]', '') -> alias.hs_code
+    s = re.sub(
+        r"(?is)REGEXP_REPLACE\(\s*TRIM\(\s*([A-Za-z_][A-Za-z0-9_]*\.)?hs_code\s*\)\s*,\s*'\[\^0-9\]'\s*,\s*''\s*\)",
+        lambda m: f"{m.group(1) or ''}hs_code",
+        s,
+    )
+    # REGEXP_REPLACE(alias.hs_code, '[^0-9]', '') -> alias.hs_code
+    s = re.sub(
+        r"(?is)REGEXP_REPLACE\(\s*([A-Za-z_][A-Za-z0-9_]*\.)?hs_code\s*,\s*'\[\^0-9\]'\s*,\s*''\s*\)",
+        lambda m: f"{m.group(1) or ''}hs_code",
+        s,
+    )
+    # Common legacy triple-REPLACE normalization -> direct hs_code.
+    s = re.sub(
+        r"(?is)REPLACE\(\s*REPLACE\(\s*REPLACE\(\s*([A-Za-z_][A-Za-z0-9_]*\.)?hs_code\s*,\s*'\.'\s*,\s*''\s*\)\s*,\s*'-'\s*,\s*''\s*\)\s*,\s*' '\s*,\s*''\s*\)",
+        lambda m: f"{m.group(1) or ''}hs_code",
+        s,
+    )
+    # Canonical prefix extraction uses SUBSTR for hs_code.
+    s = re.sub(
+        r"(?is)LEFT\(\s*(([A-Za-z_][A-Za-z0-9_]*\.)?hs_code)\s*,\s*(\d+)\s*\)",
+        lambda m: f"SUBSTR({m.group(1)}, 1, {m.group(3)})",
+        s,
+    )
+    return s
+
+def apply_known_velodb_compatibility_repairs(sql: str, error: str) -> str:
+    current = sql or ""
+    err = (error or "").lower()
+    if "lambda argument must be array" in err and "regexp_extract_all" in current.lower():
+        current = _REGEXP_EXTRACT_PRODUCT_ARRAY_RE.sub(
+            r"SPLIT_BY_STRING(REGEXP_REPLACE(UPPER(\1), '[^A-Z0-9]+', ' '), ' ')",
+            current,
+        )
+    if (
+        "array<boolean>" in err
+        or "target type=boolean" in err
+        or "can not cast from origin type" in err
+    ) and "array_exists" in current.lower():
+        current = _replace_array_exists_with_scalar_count(current)
+    return current
+
+# =========================================================
+# VELODB EXECUTION
+# =========================================================
+READ_ONLY_SQL_RE = re.compile(r"(?is)^\s*(?:(?:--[^\n]*\n|/\*.*?\*/)\s*)*(SELECT|WITH)\b")
+
+def get_velodb_conn():
+    if not VELODB_HOST:
+        raise RuntimeError("VELODB_HOST is not set")
+    return pymysql.connect(
+        host=VELODB_HOST,
+        port=VELODB_PORT,
+        user=VELODB_USER,
+        password=VELODB_PASSWORD,
+        database=VELODB_DATABASE or None,
+        charset="utf8mb4",
+        autocommit=True,
     )
 
+def prepare_sql_for_execution(sql: str) -> str:
+    s = (sql or "").strip()
+    while s.endswith(";"):
+        s = s[:-1].rstrip()
+    return s
 
-def run_snowflake(sql: str) -> Tuple[bool, List[Dict[str, Any]], List[str], str]:
+def run_sql(sql: str, params: Optional[Tuple[Any, ...]] = None) -> Tuple[bool, List[Dict[str, Any]], List[str], str]:
+    """Execute one read-only query on VeloDB. Returns (ok, rows_as_dicts, column_names, error)."""
     conn = None
     cur = None
     try:
-        conn = get_snowflake_conn()
+        clean_sql = prepare_sql_for_execution(sql)
+        if not clean_sql:
+            return False, [], [], "Empty SQL"
+        if not READ_ONLY_SQL_RE.match(clean_sql):
+            return False, [], [], "Only a single read-only SELECT/WITH query is allowed."
+        conn = get_velodb_conn()
         cur = conn.cursor()
-        cur.execute(sql)
+        # With params=None PyMySQL sends the SQL as-is, so LIKE '%...%' in LLM SQL is safe.
+        cur.execute(clean_sql, params)
         cols = [d[0] for d in cur.description] if cur.description else []
         rows = cur.fetchall() if cur.description else []
         dict_rows = [dict(zip(cols, r)) for r in rows]
@@ -1052,6 +1463,9 @@ def run_snowflake(sql: str) -> Tuple[bool, List[Dict[str, Any]], List[str], str]
                 conn.close()
         except Exception:
             pass
+
+# Backward-compatible alias for any code that still imports the old name.
+run_snowflake = run_sql
 
 def format_attempt_history(attempts: List[Dict[str, str]]) -> str:
     lines = []
@@ -1088,7 +1502,7 @@ def execute_prompt_pipeline(final_query_text: str) -> Dict[str, Any]:
         a_prompt = build_prompt_a(final_query_text)
         a_raw = call_gemini(a_prompt, max_tokens=PROMPT_A_MAX_TOKENS, temperature=0.0)
         a_parts = parse_prompt_a_output(a_raw)
-        sql_to_run = (a_parts.get("sql") or "").strip()
+        sql_to_run = enforce_static_velodb_sql_contract((a_parts.get("sql") or "").strip())
         dbg("SQL FROM PROMPT A", sql_to_run)
         if not sql_to_run:
             return {
@@ -1106,7 +1520,7 @@ def execute_prompt_pipeline(final_query_text: str) -> Dict[str, Any]:
 
         attempts = []
         for attempt_idx in range(1, MAX_SQL_FIX_ATTEMPTS + 1):
-            ok, rows, cols, err = run_snowflake(sql_to_run)
+            ok, rows, cols, err = run_sql(sql_to_run)
             if ok:
                 rows = convert_decimals(rows)
                 c_prompt = build_prompt_c(
@@ -1152,6 +1566,13 @@ def execute_prompt_pipeline(final_query_text: str) -> Dict[str, Any]:
 
             attempts.append({"sql": sql_to_run, "error": err})
             dbg(f"SQL FAILED (attempt {attempt_idx})", err)
+
+            local_repair = apply_known_velodb_compatibility_repairs(sql_to_run, err)
+            if local_repair != sql_to_run:
+                sql_to_run = local_repair
+                dbg("LOCAL VELODB COMPATIBILITY REPAIR", sql_to_run)
+                continue
+
             if attempt_idx == MAX_SQL_FIX_ATTEMPTS:
                 return {
                     "stage": "sql_execution_failure",
@@ -1176,7 +1597,7 @@ def execute_prompt_pipeline(final_query_text: str) -> Dict[str, Any]:
                 attempt_index=attempt_idx,
             )
             b_raw = call_gemini(b_prompt, max_tokens=PROMPT_B_MAX_TOKENS, temperature=0.0)
-            sql_to_run = parse_prompt_b_output(b_raw)
+            sql_to_run = enforce_static_velodb_sql_contract(parse_prompt_b_output(b_raw))
 
         return {
             "stage": "unknown_failure",
@@ -1217,6 +1638,7 @@ def handle_pending_domain_selection(req: ChatRequest, session: Dict[str, Any], p
         session["active_focus"]["pending_domain_disambiguation"] = None
         session["active_focus"]["pending_product_term"] = None
         session["active_focus"]["pending_hs_code"] = None
+        session["active_focus"]["pending_explicit_hs_codes"] = []
         append_turn(session, "user", raw_message)
 
         selected_hs = flatten_scope_hs_codes(selected_scopes)
@@ -1242,7 +1664,7 @@ def handle_pending_domain_selection(req: ChatRequest, session: Dict[str, Any], p
         session["active_focus"]["pending_query_text"] = scoped_query
         session["active_focus"]["pending_product_terms"] = product_terms
         session["state"] = STATE_AWAITING_CONFIRMATION
-        return {"session_id": req.session_id, "state": session["state"], "messages": [msg_answer(assistant_text), msg_confirm(scoped_query)]}
+        return {"session_id": req.session_id, "state": session["state"], "messages": [msg_answer(assistant_text), msg_confirm(original_query)]}
 
     if is_common_question_while_pending(raw_message):
         normalized = normalize_user_message(raw_message)
@@ -1338,13 +1760,27 @@ def _chat_impl(req: ChatRequest, session: Dict[str, Any]):
             return {"session_id": req.session_id, "state": session["state"], "messages": [msg_answer(assistant_text), msg_followup(followups, title="Suggested questions:")]}
         q = raw_message.strip()
         append_turn(session, "user", q)
-        session["active_focus"]["pending_query_text"] = build_product_scopes_context(q, session)
-        session["active_focus"]["pending_product_term"] = session["active_focus"].get("product_name")
-        session["active_focus"]["pending_product_terms"] = [session["active_focus"].get("product_name")] if session["active_focus"].get("product_name") else []
-        session["active_focus"]["pending_hs_code"] = session["active_focus"].get("hs_code")
+        followup_explicit_hs = extract_explicit_hs_codes(q)
+        active_product = session["active_focus"].get("product_name")
+        followup_terms = [active_product] if active_product else []
+        followup_overrides = (
+            {normalize_product_key(active_product): followup_explicit_hs}
+            if active_product and followup_explicit_hs else None
+        )
+        session["active_focus"]["pending_query_text"] = build_product_scopes_context(
+            q, session, followup_terms, explicit_hs_overrides=followup_overrides
+        )
+        session["active_focus"]["pending_product_term"] = active_product
+        session["active_focus"]["pending_product_terms"] = followup_terms
+        session["active_focus"]["pending_explicit_hs_codes"] = followup_explicit_hs
+        session["active_focus"]["pending_hs_code"] = (
+            ",".join(followup_explicit_hs) if followup_explicit_hs and not active_product
+            else session["active_focus"].get("hs_code")
+        )
         session["state"] = STATE_AWAITING_CONFIRMATION
-        return {"session_id": req.session_id, "state": session["state"], "messages": [msg_confirm(session["active_focus"]["pending_query_text"])]}
+        return {"session_id": req.session_id, "state": session["state"], "messages": [msg_confirm(q)]}
 
+    current_explicit_hs_codes = extract_explicit_hs_codes(raw_message)
     normalized = normalize_user_message(raw_message)
     append_turn(session, "user", normalized)
 
@@ -1403,7 +1839,20 @@ def _chat_impl(req: ChatRequest, session: Dict[str, Any]):
     product_terms = [p for p in product_terms if isinstance(p, str) and p.strip() and not is_non_product_term(p)]
     if product_term and not is_non_product_term(product_term) and product_term not in product_terms:
         product_terms.append(product_term)
+    # Deterministic backstop: if a remembered product is visibly named in this turn,
+    # preserve it even if the Trade Agent omitted it (especially product+explicit-HS turns).
+    for remembered_product in get_mentioned_memory_products(session, raw_message):
+        if remembered_product not in product_terms:
+            product_terms.append(remembered_product)
     product_terms = dedupe_preserve(product_terms)
+
+    # Never let an agent rewrite silently drop CURRENT explicit HS codes. If its clean
+    # final query does not preserve the full explicit set, execute/confirm the raw user
+    # wording instead; the internal contract will still supply the canonical predicate.
+    if current_explicit_hs_codes and final_query_text:
+        final_hs = set(extract_explicit_hs_codes(final_query_text))
+        if not set(current_explicit_hs_codes).issubset(final_hs):
+            final_query_text = raw_message
 
     messages: List[Dict[str, Any]] = [msg_answer(assistant_text)]
     append_turn(session, "assistant", assistant_text)
@@ -1413,7 +1862,7 @@ def _chat_impl(req: ChatRequest, session: Dict[str, Any]):
         followups = safe_fallback_followups(session)
     store_followups(session, followups)
 
-    if not hs_code and product_terms:
+    if not hs_code and not current_explicit_hs_codes and product_terms:
         response = start_next_unknown_product_scope(session, req.session_id, final_query_text or normalized, product_terms, setup_only=False)
         if response:
             return response
@@ -1438,13 +1887,27 @@ def _chat_impl(req: ChatRequest, session: Dict[str, Any]):
             append_turn(session, "assistant", f"Clarification: {clarification_q}")
             return {"session_id": req.session_id, "state": session["state"], "messages": messages}
 
-        scoped_query = build_product_scopes_context(final_query_text, session, product_terms)
+        # CURRENT explicit HS scope has highest precedence over product_hs_memory.
+        # Store it as pending until the user confirms; on Proceed it becomes the new
+        # latest session scope for the product (so future product-only turns reuse it).
+        explicit_scope_overrides = None
+        if current_explicit_hs_codes and product_terms:
+            explicit_scope_overrides = {
+                normalize_product_key(term): current_explicit_hs_codes for term in product_terms
+            }
+        scoped_query = build_product_scopes_context(
+            final_query_text,
+            session,
+            product_terms,
+            explicit_hs_overrides=explicit_scope_overrides,
+        )
         session["active_focus"]["pending_query_text"] = scoped_query
         session["active_focus"]["pending_product_term"] = product_terms[0] if product_terms else product_term
         session["active_focus"]["pending_product_terms"] = product_terms
+        session["active_focus"]["pending_explicit_hs_codes"] = current_explicit_hs_codes
         session["active_focus"]["pending_hs_code"] = hs_code
         session["state"] = STATE_AWAITING_CONFIRMATION
-        messages.append(msg_confirm(scoped_query))
+        messages.append(msg_confirm(final_query_text))
         messages.append(msg_followup(followups, title="Next best questions:"))
         return {"session_id": req.session_id, "state": session["state"], "messages": messages}
 
@@ -1482,6 +1945,7 @@ def _confirm_impl(session_id: str, session: Dict[str, Any], decision: str):
         session["active_focus"]["pending_product_term"] = None
         session["active_focus"]["pending_product_terms"] = []
         session["active_focus"]["pending_hs_code"] = None
+        session["active_focus"]["pending_explicit_hs_codes"] = []
         session["state"] = STATE_IDLE
         assistant_text = "Cancelled. Ask another trade question anytime."
         append_turn(session, "assistant", assistant_text)
@@ -1492,17 +1956,28 @@ def _confirm_impl(session_id: str, session: Dict[str, Any], decision: str):
     final_query_text = session["active_focus"].get("pending_query_text") or ""
     pending_hs_code = session["active_focus"].get("pending_hs_code")
     pending_product_terms = session["active_focus"].get("pending_product_terms") or []
+    pending_explicit_hs_codes = session["active_focus"].get("pending_explicit_hs_codes") or []
 
     session["active_focus"]["pending_query_text"] = None
     session["active_focus"]["pending_product_term"] = None
     session["active_focus"]["pending_product_terms"] = []
     session["active_focus"]["pending_hs_code"] = None
+    session["active_focus"]["pending_explicit_hs_codes"] = []
 
-    if pending_hs_code:
+    if pending_explicit_hs_codes and pending_product_terms:
+        # The user explicitly changed the product's HS scope in this turn.
+        # On Proceed this becomes the latest session scope (choice A).
+        explicit_scopes = [{"domain": "User-explicit HS", "selected_hs_codes": pending_explicit_hs_codes}]
+        for term in pending_product_terms:
+            save_product_scope(session, term, explicit_scopes)
+        final_query_text = build_product_scopes_context(final_query_text, session, pending_product_terms)
+    elif pending_hs_code and not pending_product_terms:
+        # HS-only query: keep it HS-only; do not invent/attach a product.
         session["active_focus"]["hs_code"] = pending_hs_code
         session["active_focus"]["product_name"] = None
-        session["active_focus"]["selected_hs_codes"] = []
+        session["active_focus"]["selected_hs_codes"] = pending_explicit_hs_codes
     elif pending_product_terms:
+        # No HS in the current turn: reuse the latest saved scope for each product.
         final_query_text = build_product_scopes_context(final_query_text, session, pending_product_terms)
 
     result = execute_prompt_pipeline(final_query_text)

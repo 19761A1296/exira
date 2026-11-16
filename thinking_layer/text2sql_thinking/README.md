@@ -51,8 +51,8 @@ existing analytical engine covers (e.g. buyer concentration, HHI, dependency sha
         └────────┬─────────┘
                  ▼
         ┌──────────────────┐   error    ┌──────────────────┐
-        │    Snowflake     │ ─────────► │ Prompt B         │
-        │                  │ ◄───────── │ (fix SQL)        │
+        │      VeloDB       │ ─────────► │ Prompt B         │
+        │  (Apache Doris)  │ ◄───────── │ (fix VeloDB SQL) │
         └────────┬─────────┘  retry     └──────────────────┘
                  │ success        (max 3 attempts in total)
                  ▼
@@ -68,10 +68,15 @@ existing analytical engine covers (e.g. buyer concentration, HHI, dependency sha
 
 | File | What it holds |
 |---|---|
-| `text2sql_thinking_tool.py` | `run()`, normalize, Gemini call, Snowflake runner, parsers |
+| `text2sql_thinking_tool.py` | `run()`, normalize, Gemini call, VeloDB/PyMySQL runner, parsers |
 | `text2sql_thinking_prompts/text2sql_thinking_prompts_all.py` | Skeleton, Normalize, Prompt A, B, C (thinking versions) |
 | `cli.py` | Terminal tester |
 | `__init__.py` | Exports `run` and `PROMPT_A_SKELETON_BIBLE_THINKING` |
+
+
+## VeloDB migration
+
+This Thinking Text2SQL is migrated independently from the normal Text2SQL path. Prompt A and Prompt B are VeloDB-native, and the runner executes through PyMySQL against `VELODB_*` environment variables. The prompt contract targets the validated VeloDB Cloud 26.0.5.1 behavior used by the main Text2SQL migration: `MONTHS_ADD`, `DATEDIFF(end,start)`, `DATE_TRUNC(date, unit)`, aggregate `PERCENTILE_CONT(value,p)`, `GROUP_CONCAT`, `SUM(CASE...)` instead of `COUNT_IF`, and LIKE/NGRAM candidate-resolution rules instead of Snowflake Jaro-Winkler. Thinking mode still has no predefined analytical-engine layer and no automatic Data Coverage CTEs.
 
 ## Usage
 

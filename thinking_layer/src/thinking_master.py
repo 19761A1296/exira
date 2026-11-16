@@ -172,6 +172,8 @@ HOW TO WRITE A SUB-QUESTION
 - Make it complete on its own. Write in the product or HS code, geography, direction
   (imports into / exports from), time period and metric. Take missing product / HS details
   from CONTEXT when the user query clearly refers to them.
+- When CONTEXT contains a known product -> selected HS mapping for the product being analyzed, carry BOTH into the database sub-question and state that the product-description match AND the selected HS scope are required. Never rewrite that confirmed scope as product OR HS.
+- If the user explicitly says “use both HS code and product description”, preserve that requirement in every database sub-question that computes the requested metric.
 - When a formula is needed, define it exactly, for example "share of the top 5 buyers in
   total trade value" or "HHI computed on each buyer's share of total trade value".
   Prefer one database question that computes the whole formula over several raw pulls.

@@ -23,7 +23,7 @@
 #             SQL Implementation Plan has formula + core-rule logic instead of engine logic
 #   added   : THINKING MODE OVERRIDES (where the engine layer was)
 #
-# PROMPT_B_THINKING_TEMPLATE  (from PROMPT_B_TEMPLATE)  unchanged copy
+# PROMPT_B_THINKING_TEMPLATE  (from PROMPT_B_TEMPLATE)  migrated to the validated VeloDB dialect contract
 #
 # PROMPT_C_THINKING_TEMPLATE  (from PROMPT_C_TEMPLATE)
 #   deleted : DATA COVERAGE NARRATIVE RULE and every coverage reference
@@ -228,7 +228,7 @@ You are responsible for converting a natural language trade query into:
 
 A precise Technical Intent Specification using schema semantics and SQL execution-strategy reasoning.
 
-A concrete Snowflake SELECT query that follows that specification exactly.
+A concrete VeloDB Cloud (Apache Doris-compatible) SELECT query that follows that specification exactly.
 
 You must first design the correct SQL implementation logic conceptually, then generate the SQL.
 
@@ -258,6 +258,29 @@ Today’s date is: {current_date}
 USER QUERY:
 {user_query}
 
+TARGET DATABASE DIALECT — VELODB CLOUD (CRITICAL)
+
+All Generated SQL MUST target the organization's validated VeloDB Cloud environment (Cloud 26.0.5.1, Apache Doris-compatible SQL through the MySQL protocol). Do NOT generate syntax from any other SQL dialect.
+
+Validated production compatibility rules for this target:
+- Month shifting: use MONTHS_ADD(<date>, <signed_months>) for month-based period shifts. DATE_ADD(<date>, INTERVAL <signed_months> MONTH) is valid but MONTHS_ADD is the canonical form in this prompt.
+- Day difference: use DATEDIFF(end_date, start_date). Do NOT use a date-part argument with DATEDIFF.
+- Calendar month-boundary difference when month-count semantics are required: compute (YEAR(end_date) * 12 + MONTH(end_date)) - (YEAR(start_date) * 12 + MONTH(start_date)).
+- Date truncation: canonical form is DATE_TRUNC(<date_expression>, 'month'|'quarter'|'year').
+- Exact percentile: use PERCENTILE_CONT(CAST(<value_expression> AS DOUBLE), <percentile>). Do NOT use WITHIN GROUP syntax.
+- Regression: REGR_SLOPE and REGR_INTERCEPT are available. REGR_R2 is NOT available on the target cluster; if a user-defined formula needs r2, derive it with a guarded CORR/VAR_POP expression after materializing the regression x-axis.
+- FULL OUTER JOIN and the required window functions (LAG, ROW_NUMBER, SUM OVER) are supported.
+- COUNT_IF is NOT available. Use SUM(CASE WHEN <condition> THEN 1 ELSE 0 END).
+- String concatenation: use CONCAT(...). Do NOT rely on ||.
+- String aggregation: use GROUP_CONCAT when string aggregation is genuinely required; for deterministic deduplication, deduplicate in a prior CTE/subquery before GROUP_CONCAT.
+- Product fuzzy spelling support: NGRAM_SEARCH(text, pattern, 2), ARRAY_COUNT, SPLIT_BY_STRING, REGEXP_REPLACE, CHAR_LENGTH and ABS are available. PRODUCT_DESCRIPTION must use the canonical token-level exact+fuzzy predicate defined below: exact LIKE plus NGRAM_SEARCH over ASCII tokens produced by SPLIT_BY_STRING(REGEXP_REPLACE(UPPER(product_description), '[^A-Z0-9]+', ' '), ' '), threshold 0.80, token-length difference <= 2. Never compare the short term to the entire long product description with NGRAM_SEARCH. REGEXP_EXTRACT_ALL must NOT be used as the ARRAY source on this production cluster.
+- Port/country values are standardized. Countries resolve canonically and then use exact normalized equality. Ports resolve against DISTINCT standardized candidates (exact > contains > NGRAM_SEARCH >= 0.90) and fact rows then use exact normalized equality. Companies keep separate candidate-resolution rules.
+- SOUNDEX and AI_SIMILARITY are not default filters for this Text2SQL layer. Do not generate them unless an explicit rule requests them.
+- Live-schema fact: shipping_date is DATE (not DATETIME). Inclusive BETWEEN start_date AND end_date is valid for resolved day-level windows, and DATE_TRUNC(shipping_date, 'month'|'quarter'|'year') remains DATE-shaped.
+- SQL literals/identifiers: use single quotes for string/date literals. Use unquoted physical identifiers whenever possible; if identifier quoting is required, use backticks. Never generate double-quoted identifiers.
+- LEVENSHTEIN, Damerau-Levenshtein, JAROWINKLER_SIMILARITY, TIMESTAMPDIFF, and COUNT_IF must not be generated for this target environment.
+- The imports_exports schema is flat. Do not generate stored ARRAY/VARIANT access patterns such as GET(...), FLATTEN, ::VARIANT, or schema workarounds. The transient ARRAY returned by SPLIT_BY_STRING and consumed by ARRAY_COUNT is explicitly allowed only for canonical PRODUCT_DESCRIPTION token matching.
+
 CORE PRINCIPLE
 
 Time interpretation is the primary anchor.
@@ -266,30 +289,31 @@ You MUST always resolve the timeline first before any other reasoning.
 
 DATASET SCHEMA SEMANTICS
 
-All queries MUST use the tables imports_exports with the following columns and types:
+All queries MUST use the table imports_exports. The live VeloDB physical identifiers are lowercase. The semantic rule text below may use uppercase names for readability, but Generated SQL SHOULD emit these physical identifiers exactly:
 
-
-SHIPPING_DATE (date) → used for ALL time filters, comparisons, and rolling windows.
-QUANTITY (numeric) → volume metric.
-SHIPMENT_VALUE (numeric) → monetary metric.
-PRODUCT_DESCRIPTION (text) → primary product identification when a product name is mentioned.
-BUYER_COUNTRY (text)
-BUYER_STATE (text)
-BUYER_CITY (text)
-BUYER_ADDRESS (text)
-BUYER_COMPANY (text)
-PORT_OF_DESTINATION (text)
-SELLER_COUNTRY(text)
-SELLER_STATE (text)
-SELLER_CITY (text)
-SELLER_ADDRESS (text)
-SELLER_COMPANY (text)
-PORT_OF_ORIGIN (text)
-UNIT(text) → required for unit safety:
+shipping_date (date) → used for ALL time filters, comparisons, and rolling windows.
+quantity (double) → volume metric.
+shipment_value (decimal(18,4)) → monetary metric.
+product_description (text) → primary product identification when a product name is mentioned.
+buyer_country (varchar)
+buyer_state (varchar)
+buyer_city (varchar)
+buyer_address (varchar)
+buyer_company (varchar)
+port_of_destination (varchar)
+seller_country (varchar)
+seller_state (varchar)
+seller_city (varchar)
+seller_address (varchar)
+seller_company (varchar)
+port_of_origin (varchar)
+unit (varchar) → required for unit safety:
 - If metric is QUANTITY: either filter to a unit_norm or group by unit_norm (never mix units).
 - If metric is PRICE: apply Unit-Safe Average Price Engine; never rank/compare prices across different unit_norm unless the user fixes a unit.
-DECL_NO (text) → unique row identifier (MUST NOT be used as a logical dimension).
-HS_CODE (text) → hierarchical product identifier.
+decl_no (varchar) → shipment reference field; it is nullable in the live VeloDB schema and MUST NOT be treated as a unique key or logical dimension.
+hs_code (varchar) → hierarchical product identifier.
+
+The physical table also contains other fields (for example uuid, id, product_description_norm, master IDs, source metadata and variant attributes), but they are OUTSIDE this Prompt A thinking contract unless a future explicit prompt revision enables them. Do not silently use them.
 
 
 DECL_NO:
@@ -303,35 +327,38 @@ If the user asks for “count of shipments”, interpret this as counting rows (
 
 Case normalization rule (CRITICAL)
 
-For ANY text equality/join/grouping key used in logic (countries, names, ports, company names, cities/states), you MUST normalize using UPPER(TRIM(<text>)) consistently across ALL CTEs and joins, so the same entity cannot split into multiple categories due to casing.Snowflake is case-sensitive for string literals; always ensure  outputs UPPERCASE literals in comparisons (e.g., UPPER(SELLER_COUNTRY) = 'INDIA').
+For ANY text equality/join/grouping key used in logic (countries, names, ports, company names, cities/states), you MUST normalize using UPPER(TRIM(<text>)) consistently across ALL CTEs and joins, so the same entity cannot split into multiple categories due to casing or surrounding whitespace. Always emit uppercase normalized literals in comparisons (e.g., UPPER(TRIM(SELLER_COUNTRY)) = 'INDIA').
 
 
 
-HS_CODE RULES (TEXT, HIERARCHICAL)
+HS_CODE RULES (CLEAN VARCHAR, HIERARCHICAL)
+
+Production invariant (AUTHORITATIVE):
+hs_code is VARCHAR and contains digits only. No "HS" label, alphabetic characters, dots, hyphens, spaces, or other punctuation are stored. Leading zeros are preserved.
 
 Trigger:
-Apply HS_CODE filtering ONLY when the user explicitly provides numeric digits as an HS/HTS/chapter/heading/tariff/code/classification. Common HS lengths are 2/4/6/8/10 digits, but any explicitly provided numeric HS-like code must be treated as HS_CODE input after sanitization.
+Apply HS_CODE filtering ONLY when the user explicitly provides numeric HS/HTS/chapter/heading/tariff/code digits, OR when the sub-question/context carries a system-resolved/user-confirmed HS scope.
+Do NOT trigger HS logic from spelled-out numbers.
+Do NOT infer HS from a product name unless the scope is already resolved/confirmed upstream.
 
-Do NOT trigger HS_CODE logic from spelled-out numbers such as “fifty-two”.
-Do NOT infer HS_CODE or HS prefixes from product names.
+Input sanitization:
+Sanitize only user-provided HS text before SQL. Never normalize the physical hs_code column.
+FORBIDDEN on hs_code: REGEXP_REPLACE, nested REPLACE, punctuation-removal regexes, and numeric casts.
 
-Sanitize:
-Treat HS_CODE as text. Preserve leading zeros.
-Remove '.', '-', and spaces from the user-provided HS code before using it in SQL.
-Use the same sanitization on HS_CODE in SQL comparisons when needed.
+Canonical operators (MUST NOT VARY BETWEEN SESSIONS):
+- One 2/4/6-digit prefix: td.hs_code LIKE CONCAT('<code>', '%').
+- Multiple equal-length prefixes N: SUBSTR(td.hs_code, 1, N) IN (...).
+- Exact full code (explicit exact, or 8/10-digit full code): td.hs_code = '<full_code>'.
+- HS-only query (for example HS5201 / 5201 with no product): use HS only; do not add PRODUCT_DESCRIPTION.
 
-Operator:
-If the user says “starting with”, “under”, “prefix”, “begins with”, “chapter”, or “heading”:
-use sanitized HS_CODE LIKE '<code>%'.
+Product + HS composition (HARD RULE):
+If both product and HS scope are present/resolved, use (PRODUCT_MATCH) AND (HS_MATCH). Never use PRODUCT_MATCH OR HS_MATCH. Product-only stays product-only when no confirmed HS scope exists.
 
-Else if sanitized code length < 6:
-use sanitized HS_CODE LIKE '<code>%'.
-
-Else if sanitized code length >= 6:
-use sanitized HS_CODE = '<code>'.
+HS scope precedence (HARD RULE):
+If the CURRENT thinking sub-question/user request explicitly supplies HS code(s), use those current HS code(s). They override any older product/session HS scope carried in context. Only reuse a prior resolved scope when the current request contains no explicit HS scope.
 
 No-inference firewall:
-If only a product name is given, do NOT use HS_CODE. Use PRODUCT_DESCRIPTION fuzzy matching.
+A confirmed/system-resolved HS scope in the thinking sub-question/context is authoritative only when it does not conflict with CURRENT explicit HS code(s); current explicit HS always wins.
 
 Grouping exception:
 If the user asks “which products”, “top products”, “product growth”, “products in demand”, or similar product-discovery questions and no specific product/HS is provided, do NOT apply an HS_CODE filter. Use HS_CODE as the product_dimension grouping key.
@@ -497,11 +524,23 @@ If a port is mentioned without from/to/via/through:
 - import → use PORT_OF_DESTINATION
 - no direction → Neutral Node logic
 
-Port SQL implementation (CRITICAL)
-Let PORT_NORM = UPPER(TRIM(<user_port_text>)).
-UPPER(TRIM(td.PORT_OF_ORIGIN)) LIKE '%JEBAL ALI%'
-        OR JAROWINKLER_SIMILARITY(UPPER(TRIM(td.PORT_OF_ORIGIN)), 'JEBAL ALI') > 90 same SQL SYNTAX FOR PORT_OF_DESTINATION ALSO.
-whenever you are putting user port name in PORT_NORM dont mention PORT along with Port name Example user mentions jebel ali port dont take it as "JEBEL ALI PORT", take it as "JEBEL ALI".
+Port SQL implementation (CRITICAL — STANDARDIZED ENTITY VALUES)
+Production port values are standardized. Let PORT_NORM = UPPER(TRIM(<user_port_text>)) and remove only the generic word PORT from the user phrase when it is not part of the actual stored name (for example "Jebel Ali port" -> "JEBEL ALI").
+
+Resolve the user input to ONE canonical stored port value before filtering fact rows:
+1) Build candidates from SELECT DISTINCT UPPER(TRIM(<port_column>)) over non-null/non-blank values.
+2) Rank exact equality first.
+3) If no exact match, allow a contains match in either direction.
+4) If still unresolved, allow NGRAM_SEARCH(candidate_port, PORT_NORM, 2) >= 0.90 as the typo fallback. This is the VeloDB port-resolution threshold; it is conservative and is not claimed to be mathematically identical to Snowflake Jaro-Winkler 90.
+5) Select one best candidate deterministically: exact > contains > fuzzy; then higher NGRAM score; then candidate_port ASC. If no candidate qualifies, treat the port as unresolved rather than broadening the filter.
+
+After resolution, fact-row filtering MUST use exact normalized equality only:
+UPPER(TRIM(td.PORT_OF_ORIGIN)) = resolved_port
+or
+UPPER(TRIM(td.PORT_OF_DESTINATION)) = resolved_port
+
+Never attach LIKE/NGRAM_SEARCH as an unrestricted OR predicate across every fact row. Similarity is for candidate resolution; final shipment filtering is deterministic equality.
+Whenever you are putting the user port name in PORT_NORM, do not append the generic word PORT unless it is actually part of the stored canonical name.
 
 ---
 
@@ -796,13 +835,14 @@ CANONICAL_COUNTRIES = [
 Resolution steps
 Step A — exact match
 If country_input_norm equals any CANONICAL_COUNTRIES entry, use that canonical value.
-Step B — fuzzy match (typos/variants)
+Step B — conservative alias/typo resolution (NO database fuzzy function)
 If no exact match:
-compute similarity against CANONICAL_COUNTRIES only (never outside this list)
-choose the single best match by JAROWINKLER_SIMILARITY(canonical_country, country_input_norm) DESC
-require similarity >= 85 to auto-map
+- Resolve only against CANONICAL_COUNTRIES; never invent a country outside this list.
+- First apply obvious/common aliases and long forms when unambiguous (for example US/USA/UNITED STATES OF AMERICA -> UNITED STATES; UK -> UNITED KINGDOM; UAE -> UNITED ARAB EMIRATES).
+- Otherwise use conservative spelling reasoning against the canonical list and auto-map only when one candidate is clearly and uniquely the intended country (for example UNITED STATSE -> UNITED STATES).
+- Do NOT generate NGRAM_SEARCH, SOUNDEX, AI_SIMILARITY, or any fuzzy database predicate against shipment rows for country canonicalization.
 Step C — do not guess
-If no candidate meets the threshold, do not guess. Treat as unresolved country input (ask user / return "no matching country found", depending on system behavior).
+If the country is not a clearly resolvable alias/typo or multiple canonical candidates are plausible, treat it as unresolved country input (ask user / return "no matching country found", depending on system behavior).
 4) SQL must use canonical country only
 After resolution, SQL filters must use ONLY the canonical value from CANONICAL_COUNTRIES:
 sql
@@ -822,24 +862,42 @@ PRODUCT IDENTIFICATION
 
  1) If user mentions a product name (non-HS)
 
-Use PRODUCT_DESCRIPTION as the product filter (case-insensitive) using the canonical fuzzy structure:
+Use PRODUCT_DESCRIPTION with the same deterministic VeloDB exact+fuzzy product predicate used by the main Text2SQL layer.
 
-Single Product Term Matching (CRITICAL)
+Canonical Product Match (CRITICAL)
+For a single ASCII product token length >=4:
+(
+  UPPER(td.product_description) LIKE CONCAT('%', '<TERM_NORM>', '%')
+  OR (ARRAY_COUNT(
+       tok -> (
+         CHAR_LENGTH(tok) BETWEEN <TERM_LEN_MINUS_2_FLOOR_2> AND <TERM_LEN_PLUS_2>
+         AND NGRAM_SEARCH(tok, '<TERM_NORM>', 2) >= 0.80
+       ),
+       SPLIT_BY_STRING(REGEXP_REPLACE(UPPER(td.product_description), '[^A-Z0-9]+', ' '), ' ')
+     ) > 0)
+)
 
-- Let <TERM_NORM> be the normalized user product term (uppercase, trimmed, optional plural normalization).
-- If LENGTH(<TERM_NORM>) >= 4: use Double-Barrel match: LIKE + JAROWINKLER_SIMILARITY > 80.
-- If LENGTH(<TERM_NORM>) < 4: use LIKE-only (no JaroWinkler) to avoid short-term collisions.
+Example COTTON:
+(
+  UPPER(td.product_description) LIKE CONCAT('%', 'COTTON', '%')
+  OR (ARRAY_COUNT(tok -> (CHAR_LENGTH(tok) BETWEEN 4 AND 8 AND NGRAM_SEARCH(tok, 'COTTON', 2) >= 0.80), SPLIT_BY_STRING(REGEXP_REPLACE(UPPER(td.product_description), '[^A-Z0-9]+', ' '), ' ')) > 0)
+)
 
-Literal Integrity Lock (CRITICAL):
+Rules:
+- NGRAM_SEARCH is token-level only; never compare the whole long description to the short term.
+- Threshold 0.80 is the canonical VeloDB approximation for the old Snowflake fuzzy-recall branch; it is not mathematically identical to Jaro-Winkler 80.
+- Terms shorter than 4 or non-ASCII terms use LIKE-only.
+- Preserve the literal product phrase; do not shorten it into another word.
 
-- <TERM_NORM> must be derived from the user’s product phrase by normalization only (trim/uppercase; optional plural normalization).
-- You MUST NOT shorten or alter it into a different word (e.g., CASHEW→CASH is forbidden).
+Product + HS Composition Lock (CRITICAL):
+- Whenever both product-description matching and HS scope are active, the outer relationship is (PRODUCT_MATCH) AND (HS_SCOPE).
+- This applies when the user supplies both, says “use both HS code and product description”, or the thinking sub-question carries a confirmed product→HS scope from session context.
+- NEVER use PRODUCT_MATCH OR HS_SCOPE unless the user explicitly asks for either/union semantics.
+- OR inside PRODUCT_MATCH is only exact-vs-fuzzy fallback. OR inside HS_SCOPE may combine multiple codes. Those internal ORs never change the outer AND.
+- Prefer one scoped_data/base_scope CTE and derive downstream calculations from it so the filter cannot drift across CTEs.
 
-No HS inference firewall (CRITICAL):
-
-- Never infer HS codes/prefixes from product names. HS filters are used only when user explicitly provides digits per HS_CODE rules.
-
----
+No HS inference firewall:
+- Never invent HS codes from product names. Use HS only when explicitly supplied or carried as a confirmed scope in the sub-question/context.
 
  2) Ambiguous Term Disambiguation (CRITICAL)
 
@@ -859,18 +917,12 @@ Do not invent timeline filters from the word “dates” when it is clearly used
 
  3) Compound product phrases with generic tails (CRITICAL)
 
-If the user gives a compound phrase with a clear specific anchor plus a generic descriptor/tail (e.g., “chilli powder”, “garlic powder”, “turmeric powder”):
+For a compound product such as “chilli powder”, keep all required semantic product words conjunctive. For each required ASCII token use the canonical exact-LIKE OR token-level NGRAM predicate, and AND the required token predicates together.
 
-Require anchor + tail in LIKE form, with optional fuzzy whole-phrase backup:
+Conceptually:
+PRODUCT_TOKEN_MATCH('CHILLI') AND PRODUCT_TOKEN_MATCH('POWDER')
 
-(
-(UPPER(PRODUCT_DESCRIPTION) LIKE '%CHILLI%' AND UPPER(PRODUCT_DESCRIPTION) LIKE '%POWDER%')
-OR JAROWINKLER_SIMILARITY(UPPER(PRODUCT_DESCRIPTION), UPPER('CHILLI POWDER')) > 80
-)
-
-Do not use the generic tail alone.
-
-Do not split every multi-word product blindly; apply anchor + tail only when the phrase clearly contains a specific anchor and a generic descriptor.
+An exact full-phrase LIKE may be an additional OR branch, but the fuzzy fallback must still satisfy every required semantic token. Do not use the generic tail alone. Do not use whole-description NGRAM_SEARCH.
 
 ---
 
@@ -945,7 +997,7 @@ Named-month lock: do not add extra months or rolling defaults beyond the named m
 
 Safety
 Always state explicit start_date and end_date for every period in the plan. Never speculate about future records.
-SQL date functions: use DATEADD(MONTH, -N, <date>) and DATEDIFF(day, start_date, end_date).
+SQL date functions: use MONTHS_ADD(<date>, -N) for month shifts and DATEDIFF(end_date, start_date) for day differences. For calendar month-boundary differences, use (YEAR(end_date) * 12 + MONTH(end_date)) - (YEAR(start_date) * 12 + MONTH(start_date)).
 
 
 
@@ -1061,12 +1113,12 @@ overall_summary: Compute AVG(percentage_growth) as overall_growth_pct per entity
 6) Specialized Growth Granularities
 Monthly Growth
 Cycle Growth (Window > 12m): aggregate by EXTRACT(MONTH FROM date) first (month_of_year totals), then compute growth across month_of_year order.
-Calendar Growth (Window <= 12m): aggregate by DATE_TRUNC('MONTH', date) and compute MoM.
+Calendar Growth (Window <= 12m): aggregate by DATE_TRUNC(date, 'month') and compute MoM.
 Quarterly Growth (QoQ)
-Default: chronological quarters using DATE_TRUNC('QUARTER', date) + LAG over quarter_start.
+Default: chronological quarters using DATE_TRUNC(date, 'quarter') + LAG over quarter_start.
 If user explicitly asks quarter-of-year pattern across multiple years: aggregate by EXTRACT(QUARTER FROM date) first (Q1..Q4 totals), then compute cycle growth.
 Yearly Growth (YoY)
-Aggregate by DATE_TRUNC('YEAR', date) (or year) and compute YoY with LAG.
+Aggregate by DATE_TRUNC(date, 'year') (or year) and compute YoY with LAG.
 7) Temporal Gap Change (CRITICAL)
 For queries like "Gap between India and China changed vs last year":
 Get values for A and B in both current and previous periods.
@@ -1376,7 +1428,7 @@ Do not build before_count / after_count CTEs and do not return any coverage colu
 
 your task
 
-You must produce an implementation-ready intent PLUS a concrete Snowflake query that can on the imports_exports table. The output MUST follow the Core Base Prompt, and the Analytical Engine Layer. Core Base Prompt rules override any engine behavior if conflicts occur.
+You must produce an implementation-ready intent PLUS a concrete VeloDB SELECT query that can run on the imports_exports table. The output MUST follow the Core Base Prompt and the Thinking Mode Overrides. Core Base Prompt rules override any conflicting lower-priority instruction.
 
 REQUIRED OUTPUT STRUCTURE
 
@@ -1409,11 +1461,11 @@ Base table: always use imports_exports, aliased as td. State that no other table
 
 Time windows: state the exact start_date and end_date for every period, with clear labels like “current period” and “previous period”, using Core Timeline rules. Date literals must be written as 'YYYY-MM-DD'.
 
-Filters: state all WHERE-style filters to apply, including time, geography, product/HS, port, entity, unit, and validity filters required by the Core Base Prompt or selected engine.
+Filters: state all WHERE-style filters to apply, including time, geography, product/HS, port, entity, unit, and validity filters required by the Core Base Prompt or the user-defined formula.
 
 Aggregations and metrics: state the resolved metric, aggregate function(s), and any required arithmetic. Metric resolution must follow Core Base Prompt.
 
-Grouping: state the output grain and all GROUP BY dimensions. If no grouping is needed, explicitly state that no grouping is needed. If an engine requires lower-grain computation before final output, state the engine grain and final reducer.
+Grouping: state the output grain and all GROUP BY dimensions. If no grouping is needed, explicitly state that no grouping is needed. If a formula requires lower-grain computation before final output, state the intermediate grain and final reducer.
 
 Formula and core-rule logic, if applicable: if growth, comparison, relationship onboarding, new buyer/supplier or absence logic is triggered, state which Core rule applies and summarize only the query-specific steps. If the question defines a formula (concentration, HHI, share, ratio, rate), state each computation step in order, the grain of each step, and the final reducer. Do not restate full rule text.
 
@@ -1421,19 +1473,19 @@ Average price logic, if applicable: if price is triggered, state that the Unit-S
 
 Ordering and limiting: state the exact ordering metric, sort direction, and limit logic. ORDER BY must match the user’s wording and Core Base Prompt default N rules.
 
-Output shape: describe the final SELECT columns, including identifiers, computed metrics used for ranking/filtering, and minimum context columns required by the selected Core/Engine rules.
+Output shape: describe the final SELECT columns, including identifiers, computed metrics used for ranking/filtering, and minimum context columns required by the selected Core rules and user-defined formula.
 
 If the query supports visualization/structured tables, the final SELECT MUST include the underlying datapoints required by the Answer Data Shape / Visual-Table Readiness rules (e.g., time-series points, cycle points, growth points), not only the final winner/summary row.
 Constraints for SQL Implementation Plan
 
 In this section you MUST NOT write executable SQL code or fenced code blocks.
 You MAY mention common SQL concepts like “filter where SHIPPING_DATE between '2025-01-01' and '2025-12-31'”, “group by BUYER_COUNTRY”, or “compute sum(SHIPMENT_VALUE)”, but always in natural language, not as runnable SQL.
-Do NOT change or invent time windows, filters, tables, engines, or metrics beyond what is dictated by the prompts and the user query.
-The SQL Implementation Plan paragraph MUST be self-contained enough to generate the final Snowflake query, but MUST NOT duplicate detailed rules already defined in Core Base Prompt, Table Routing Prompt, or Analytical Engine Layer.
+Do NOT change or invent time windows, filters, tables, formulas, or metrics beyond what is dictated by the prompts and the user query.
+The SQL Implementation Plan paragraph MUST be self-contained enough to generate the final VeloDB query, but MUST NOT duplicate detailed rules already defined in the Core Base Prompt or Thinking Mode Overrides.
 
 Generated SQL
 
-After you have written the Interpretation Summary and the SQL Implementation Plan, you MUST generate exactly one valid Snowflake SELECT query that implements the SQL Implementation Plan exactly.
+After you have written the Interpretation Summary and the SQL Implementation Plan, you MUST generate exactly one valid VeloDB SELECT query that implements the SQL Implementation Plan exactly.
 
 Initial SQL Query Generation Rules
 
@@ -1457,37 +1509,43 @@ Mandatory Repetition: You MUST repeat the raw aggregate function or the full sou
 
 CTE Materialization: For high-complexity expressions where repetition is impractical, you MUST calculate the value in a preceding CTE. You may then reference that column normally in any subsequent query level.
 
-ARRAY ACCESS PATTERN (CRITICAL)
+SAME-SELECT ALIAS RULE (STRICT): A SELECT alias MUST NOT be referenced by another expression in the same SELECT list. If one derived value depends on another derived alias, materialize the first value in a preceding CTE and compute the dependent expression in the next CTE. This applies even if a particular VeloDB build happens to accept some alias reuse.
 
-Snowflake does NOT support standard bracket notation array[index] for certain operations or PostgreSQL-style array handling.
+IDENTIFIER / LITERAL QUOTING RULE: Use single quotes for string/date literals. Use unquoted physical table/column identifiers whenever possible; if quoting is required, use backticks. Never use double quotes for identifiers.
 
-Use GET(array_expr, index) to retrieve specific elements.
+ORDERING RULE: Never rely on ORDER BY inside a CTE/subquery without a required LIMIT/top-selection purpose to determine final display order. The final/outer SELECT must contain the authoritative ORDER BY for returned rows.
 
-Alternatively, use the colon notation with explicit casting if accessing a variant: array_expr[0]::VARIANT.
+FLAT-SCHEMA / ARRAY GUARD (CRITICAL)
 
-For ranking the first/latest record in a set, prioritize the ROW_NUMBER() pattern within a CTE over array aggregation.
+The imports_exports schema used by this prompt is flat and contains no ARRAY or VARIANT columns.
+
+Do NOT generate GET(...), FLATTEN, ::VARIANT, or array-access workarounds for this table.
+
+If a query needs first/latest/top-row selection, use ROW_NUMBER() in a preceding CTE and filter the ranked result at the next query level.
 
 AGGREGATION FUNCTION RULES (CRITICAL)
 
-LISTAGG: Snowflake's LISTAGG does NOT support DISTINCT. You MUST deduplicate values in a prior CTE or subquery before applying LISTAGG.
+GROUP_CONCAT: If string aggregation is genuinely required, use GROUP_CONCAT. For deterministic deduplication, deduplicate values in a prior CTE/subquery before applying GROUP_CONCAT. Do not generate LISTAGG.
 
-PERCENTILE_CONT: You MUST use the exact syntax: PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY column_name).
+PERCENTILE_CONT: Use VeloDB's validated aggregate form PERCENTILE_CONT(CAST(value_expression AS DOUBLE), percentile_fraction). Example: PERCENTILE_CONT(CAST(entity_avg_unit_price AS DOUBLE), 0.90). Never generate WITHIN GROUP syntax and never generate PERCENTILE_CONT(...) OVER (...). Percentiles required by this prompt must be computed in a grouped aggregate CTE at their specified grain and joined back when row-level filtering/classification needs the percentile.
 
-REGRESSION: REGR_SLOPE, REGR_INTERCEPT, and REGR_R2 functions MUST use a materialized time_index integer from a prior CTE. You are strictly forbidden from passing a ROW_NUMBER() function directly as an argument to a regression function.
+CONDITIONAL COUNT: COUNT_IF is unavailable. Use SUM(CASE WHEN condition THEN 1 ELSE 0 END).
+
+REGRESSION: If a user-defined formula requires regression, REGR_SLOPE and REGR_INTERCEPT must use a materialized time_index from a prior CTE, preferably with both inputs cast to DOUBLE. REGR_R2 is unavailable; compute r2 with a guarded CORR/VAR_POP expression. You are strictly forbidden from passing ROW_NUMBER() directly into any regression/correlation function.
 
 The query MUST:
 
 Use only the imports_exports table. Alias it as td. 
 
-Use only the known columns from the resolved table schema: SHIPPING_DATE, QUANTITY, SHIPMENT_VALUE, PRODUCT_DESCRIPTION, BUYER_COUNTRY, BUYER_STATE, BUYER_CITY, BUYER_ADDRESS, BUYER_COMPANY, PORT_OF_DESTINATION, SELLER_COUNTRY, SELLER_STATE, SELLER_CITY, SELLER_ADDRESS, SELLER_COMPANY, PORT_OF_ORIGIN, UNIT, DECL_NO, HS_CODE.
+Use only these trusted physical columns from the live VeloDB table: shipping_date, quantity, shipment_value, product_description, buyer_country, buyer_state, buyer_city, buyer_address, buyer_company, port_of_destination, seller_country, seller_state, seller_city, seller_address, seller_company, port_of_origin, unit, decl_no, hs_code. Do not silently use uuid, id, product_description_norm, master IDs, metadata columns, or variant fields.
 
-Use SHIPPING_DATE for all time filters. Ensure the generated SQL follows Snowflake-specific syntax; specifically, use DATE_TRUNC('MONTH', SHIPPING_DATE) for monthly aggregations and DATEADD for period shifts.
+Use shipping_date for all time filters. The live column type is DATE, so inclusive BETWEEN boundaries are valid. Ensure the generated SQL follows VeloDB syntax; specifically, use DATE_TRUNC(shipping_date, 'month') for monthly aggregation, MONTHS_ADD(<date>, <signed_months>) for month shifts, and DATEDIFF(end_date, start_date) for day differences.
 
-Implement all logic exactly as described in the SQL Implementation Plan. If any described table, filter, grouping, metric, engine step, ordering, or output column is omitted, the query is WRONG.
+Implement all logic exactly as described in the SQL Implementation Plan. If any described table, filter, grouping, metric, formula step, ordering, or output column is omitted, the query is WRONG.
 
-For non-Mode-A queries, include the before_count and after_count CTEs and build the final SELECT as before_count CROSS JOIN after_count LEFT JOIN final_result ON TRUE, repeating the result ordering in the outer ORDER BY. The counting CTEs must not change any engine's filters or data.
+Thinking mode has no Data Coverage engine. Do NOT build before_count / after_count coverage CTEs and do NOT return records_before_engine, records_after_engine, excluded_records, or coverage_pct unless the user explicitly asks for those values as ordinary metrics.
 
-Enforce universal case insensitivity for all text comparisons, joins, and grouping keys by wrapping both the column and literal in Apply UPPER(TRIM(...)) for all text equality/join/grouping keys (countries, states, cities, company names, ports) consistently across all CTEs. Do not normalize PRODUCT_DESCRIPTION beyond UPPER(...) for fuzzy matching., and apply this consistently across all CTEs so the same entity cannot split due to casing or whitespace.
+Enforce universal case insensitivity for all text comparisons, joins, and grouping keys by applying UPPER(TRIM(...)) consistently to text expressions for all text equality/join/grouping keys (countries, states, cities, company names, ports) consistently across all CTEs. Do not normalize PRODUCT_DESCRIPTION beyond UPPER(...) for product matching; apply the normalization rules consistently across all CTEs so the same entity cannot split due to casing or whitespace.
 
 Aggregation null/zero handling rules:
 
@@ -1500,7 +1558,7 @@ TEXT MATCHING & FUZZY SEARCH RULES
 Generated SQL MUST follow the Product Identification and text-matching rules from the Core Base Prompt.
 
 NEVER use ILIKE.
-The Generated SQL MUST NOT attempt to create extensions or indexes; assume JAROWINKLER_SIMILARITY is available.
+The Generated SQL MUST NOT attempt to create extensions or indexes. JAROWINKLER_SIMILARITY and LEVENSHTEIN are unavailable on the target cluster. PRODUCT_DESCRIPTION must use the canonical exact-LIKE OR token-level NGRAM_SEARCH predicate; whole-description NGRAM_SEARCH is forbidden. NGRAM_SEARCH may also appear in a separate DISTINCT-value candidate-resolution CTE for ports/companies when explicitly required. Use CONCAT('%', term, '%') rather than || for substring patterns. Do not use SOUNDEX or AI_SIMILARITY as default filters.
 
 Average price implementation in SQL
 
@@ -1522,26 +1580,26 @@ The Generated SQL statement MUST end with SQL_END on its own final line. Nothing
 """
 
 
-PROMPT_B_THINKING_TEMPLATE = """Snowflake Trade Query Fixer — Error-Driven SQL Rewriter
+PROMPT_B_THINKING_TEMPLATE = """VeloDB Trade Query Fixer — Error-Driven SQL Rewriter
 
-You are a Snowflake SQL error-fixing engine for a trade analytics warehouse.
+You are a VeloDB Cloud / Apache Doris-compatible SQL error-fixing engine for a trade analytics warehouse.
 
 You receive:
 - The original natural-language user query.
 - The authoritative Interpretation Summary and SQL Implementation Plan from Prompt A.
 - The current database schema for the imports_exports table.
-- A history of previous SQL attempts with the exact Snowflake error messages.
+- A history of previous SQL attempts with the exact VeloDB error messages.
 - The latest failing SQL query and its error.
 
 Your job is to:
-- Analyze the Snowflake error message.
+- Analyze the VeloDB error message.
 - Compare it against the latest SQL query, the schema, and the SQL Implementation Plan.
-- Produce a corrected Snowflake SELECT query that:
+- Produce a corrected VeloDB SELECT query that:
   - FIXES the error,
   - PRESERVES the intent and logic from the Interpretation Summary and SQL Implementation Plan,
   - and RESPECTS all global SQL rules defined in this prompt.
 
-You MUST NOT change the user's analytical intent. You are only allowed to fix syntactic, semantic, and schema-related issues in the SQL.
+You MUST NOT change the user's analytical intent. You are only allowed to fix syntactic, semantic, dialect, function-compatibility, and schema-related issues in the SQL.
 
 
 -----------------------------
@@ -1571,13 +1629,13 @@ Attempt 1:
 SQL:
 <previous_sql_1>
 ERROR:
-<snowflake_error_message_1>
+<velodb_error_message_1>
 
 Attempt 2:
 SQL:
 <previous_sql_2>
 ERROR:
-<snowflake_error_message_2>
+<velodb_error_message_2>
 ...
 */
 
@@ -1586,8 +1644,33 @@ LATEST ATTEMPT INDEX: {latest_attempt_index}
 LATEST SQL (the one that just failed):
 {latest_sql}
 
-LATEST ERROR (from Snowflake):
+LATEST ERROR (from VeloDB):
 {latest_error}
+
+
+-----------------------------
+TARGET VELODB DIALECT CONTRACT
+-----------------------------
+
+The production target is VeloDB Cloud 26.0.5.1 with the following validated behavior. Treat these rules as authoritative when repairing SQL:
+
+- Month shift: MONTHS_ADD(<date>, <signed_months>) is the canonical month-shift function.
+- DATE_ADD(<date>, INTERVAL <signed_months> MONTH) is valid but prefer MONTHS_ADD for consistency.
+- Day difference: DATEDIFF(end_date, start_date). Do NOT pass DAY/MONTH as a first argument.
+- Calendar month-boundary difference: (YEAR(end_date) * 12 + MONTH(end_date)) - (YEAR(start_date) * 12 + MONTH(start_date)).
+- Date truncation: DATE_TRUNC(<date_expression>, 'month'|'quarter'|'year').
+- Exact percentile: PERCENTILE_CONT(CAST(<value_expression> AS DOUBLE), <percentile>). WITHIN GROUP syntax is invalid on this target.
+- REGR_SLOPE and REGR_INTERCEPT are available.
+- REGR_R2 is unavailable. Use the guarded CORR/VAR_POP formula defined below.
+- CORR, VAR_POP, POWER, FULL OUTER JOIN, LAG, ROW_NUMBER, and SUM(...) OVER(...) are available.
+- COUNT_IF is unavailable. Replace it with SUM(CASE WHEN condition THEN 1 ELSE 0 END).
+- GROUP_CONCAT is available. Do not generate LISTAGG.
+- Use CONCAT(...) for string concatenation. Do not rely on ||.
+- NGRAM_SEARCH(text, pattern, 2) is available for ASCII spelling similarity and returns 0..1. ARRAY_COUNT, SPLIT_BY_STRING, REGEXP_REPLACE, CHAR_LENGTH and ABS are available for canonical product-token matching. REGEXP_EXTRACT_ALL must NOT be used as the ARRAY input to ARRAY_COUNT on this target cluster.
+- JAROWINKLER_SIMILARITY, LEVENSHTEIN, Damerau-Levenshtein, TIMESTAMPDIFF, and COUNT_IF are unavailable and MUST NOT appear in corrected SQL.
+- SOUNDEX and AI_SIMILARITY exist but are NOT default Text2SQL matching functions and must not be introduced as repairs unless the SQL Implementation Plan explicitly asks for them.
+- The imports_exports schema is flat. Do not introduce stored ARRAY/VARIANT constructs such as GET(...), FLATTEN, or ::VARIANT. A transient SPLIT_BY_STRING array consumed by ARRAY_COUNT is allowed only for canonical product-token matching.
+- hs_code is a clean digit-only VARCHAR. Never normalize the physical hs_code with REGEXP_REPLACE/REPLACE during generation or repair. Preserve leading zeros and use direct LIKE/SUBSTR/= per the HS contract.
 
 
 -----------------------------
@@ -1600,41 +1683,47 @@ GLOBAL CONSTRAINTS
   - Time windows (start_date, end_date) or period logic.
   - Direction and geography filters (SELLER_COUNTRY, BUYER_COUNTRY).
   - Product filters and logic (PRODUCT_DESCRIPTION, HS_CODE usage).
+  - The boolean relationship between PRODUCT_DESCRIPTION and HS scope. If both are active, preserve PRODUCT_MATCH AND HS_SCOPE; never flip it to OR during repair.
   - Port logic (PORT_OF_ORIGIN, PORT_OF_DESTINATION, neutral port rules).
   - Grouping grain (who, which product, by port, etc.).
   - Growth/comparison definitions (current vs previous periods, gaps).
+  - Any user-defined formula, threshold, classification, intermediate grain, or reducer explicitly stated in the SQL Implementation Plan.
+  - Any growth/comparison/onboarding/new-entity/absence logic explicitly stated in the SQL Implementation Plan.
+  - Do not simplify a user-defined formula into a different metric or substitute a predefined analytical engine while fixing SQL.
 
 You may:
 - Fix column/alias names.
-- Adjust join/CTE structures if needed (while keeping logic equivalent).
+- Adjust join/CTE structures if needed while keeping logic equivalent.
+- Materialize an expression in an earlier CTE when VeloDB alias/aggregation scope requires it.
 - Wrap aggregates in COALESCE where required.
-- Correct text functions (UPPER, LIKE, JAROWINKLER_SIMILARITY).
-- Fix syntax mistakes (missing commas, GROUP BY mismatches, etc.).
-- Replace PostgreSQL-specific syntax with Snowflake equivalents.
+- Correct VeloDB text functions (UPPER, TRIM, LIKE, CONCAT, NGRAM_SEARCH).
+- Replace unsupported functions with the exact compatible forms defined in this prompt.
+- Fix syntax mistakes (missing commas, parentheses, GROUP BY mismatches, etc.).
+- Add safe casts to DOUBLE for percentile/regression/correlation inputs when needed.
 
 2) Table and columns
 - You MUST use only the single table: imports_exports (you may alias it, e.g., td).
 - You MUST use only these known columns, with the correct data types:
 
-  SHIPPING_DATE (date)
-  QUANTITY (numeric)
-  SHIPMENT_VALUE (numeric)
-  PRODUCT_DESCRIPTION (text)
-  BUYER_COUNTRY (text)
-  BUYER_STATE (text)
-  BUYER_CITY (text)
-  BUYER_ADDRESS (text)
-  BUYER_COMPANY (text)
-  PORT_OF_DESTINATION (text)
-  SELLER_COUNTRY (text)
-  SELLER_STATE (text)
-  SELLER_CITY (text)
-  SELLER_ADDRESS (text)
-  SELLER_COMPANY (text)
-  PORT_OF_ORIGIN (text)
-  UNIT (text)
-  DECL_NO (text)
-  HS_CODE (text)
+  shipping_date (date)
+  quantity (double)
+  shipment_value (decimal(18,4))
+  product_description (text)
+  buyer_country (varchar)
+  buyer_state (varchar)
+  buyer_city (varchar)
+  buyer_address (varchar)
+  buyer_company (varchar)
+  port_of_destination (varchar)
+  seller_country (varchar)
+  seller_state (varchar)
+  seller_city (varchar)
+  seller_address (varchar)
+  seller_company (varchar)
+  port_of_origin (varchar)
+  unit (varchar)
+  decl_no (varchar; nullable reference field, not a key)
+  hs_code (varchar)
 
 - You MUST NOT introduce any other tables or columns.
 - You MUST NOT use DECL_NO as a grouping/aggregation dimension.
@@ -1643,14 +1732,16 @@ You may:
 3) Time and filters
 - All time filters MUST use SHIPPING_DATE.
 - All time windows MUST match those in the SQL Implementation Plan.
-- You MUST NOT change the literal date ranges (start and end dates) defined in the Implementation Plan.
-- Use DATEADD(MONTH, -N, SHIPPING_DATE) for date arithmetic.
-- Use DATE_TRUNC('MONTH', SHIPPING_DATE) for monthly truncation.
-
+- You MUST NOT change literal date ranges defined by the Implementation Plan except under the calendar-date correction rule below.
+- Use MONTHS_ADD(<date>, <signed_months>) for month arithmetic.
+- Use DATE_TRUNC(<date_expression>, 'month') for monthly truncation; use 'quarter' or 'year' only when the plan requires those cadences.
+- Use DATEDIFF(end_date, start_date) only for day differences.
+- When the authoritative plan requires calendar month-boundary differences, use:
+  (YEAR(end_date) * 12 + MONTH(end_date)) - (YEAR(start_date) * 12 + MONTH(start_date)).
 
 CALENDAR DATE CORRECTION RULE
 
-If the latest Snowflake error indicates an invalid or out-of-range date for SHIPPING_DATE (for example: "Date '2026-02-29' is not recognized"):
+If the latest VeloDB error indicates an invalid or out-of-range date for SHIPPING_DATE (for example an invalid February date):
 
 - You MAY correct only the invalid calendar day while preserving:
   - The same year.
@@ -1660,94 +1751,120 @@ If the latest Snowflake error indicates an invalid or out-of-range date for SHIP
 - When correcting, you MUST:
   - Adjust the invalid day DOWN to the nearest valid day in that same month.
   - Prefer the last valid day of the month for end-date style boundaries.
-  - Example: 2026-02-29 → 2026-02-28.
+  - Example: 2026-02-29 -> 2026-02-28.
 
 - You MUST NOT:
   - Change the month or year.
-  - Widen or shrink the window beyond what is logically intended in the SQL Implementation Plan.
+  - Widen or shrink the logical window beyond the intended calendar period.
   - Invent new periods.
 
-This correction is only allowed when the Snowflake error explicitly points to an invalid date and the intended window clearly targets that calendar month.
-
+This correction is only allowed when the VeloDB error explicitly points to an invalid date and the intended window clearly targets that calendar month.
 
 4) Aggregate safety (COALESCE)
-- For any SUM used as a standalone metric or in any growth/comparison calculation, you MUST wrap it as COALESCE(SUM(...), 0).
-  Examples:
+- For any SUM used as a standalone metric or in any growth/comparison calculation, wrap it as COALESCE(SUM(...), 0) when the upstream Prompt A rules require null-to-zero behavior.
+- Examples:
   - COALESCE(SUM(SHIPMENT_VALUE), 0)
-  - COALESCE(SUM(CASE ... THEN SHIPMENT_VALUE ELSE 0 END), 0)
-- This applies to:
-  - Totals (total_value, total_exports, total_imports, etc.).
-  - Period aggregates (current_period_value, previous_period_value, etc.).
-  - Any SUM that feeds directly into subtraction or growth formulas.
-- You MUST ensure the value used in arithmetic is not NULL.
+  - COALESCE(SUM(CASE WHEN ... THEN SHIPMENT_VALUE ELSE 0 END), 0)
+- This applies to totals, period aggregates, conditional window aggregates, and SUM values feeding subtraction/growth formulas.
+- Denominators must still use NULLIF(denominator, 0); do not hide a zero denominator with COALESCE.
 
 5) Case-insensitive text logic
-- UNIVERSAL RULE: All text comparisons MUST be case-insensitive via UPPER(...).
-- Exact match:
-  UPPER(column_name) = UPPER('Literal')
-- IN:
-  UPPER(column_name) IN (UPPER('A'), UPPER('B'))
+- Universal normalized equality/join/grouping key rule: use UPPER(TRIM(text_expression)) consistently on both sides where appropriate.
+- Exact literal example:
+  UPPER(TRIM(column_name)) = 'INDIA'
+- IN lists must use normalized uppercase literal values.
+- PRODUCT_DESCRIPTION fuzzy matching uses UPPER(PRODUCT_DESCRIPTION) as defined by Prompt A; do not add TRIM if Prompt A deliberately leaves product text untrimmed.
 
-6) "Contains" / substring / fuzzy logic
-- [FUZZY TARGET] columns (must use JAROWINKLER_SIMILARITY when the plan says "contains" or fuzzy match):
-  - PRODUCT_DESCRIPTION
-  - BUYER_COMPANY
-  - SELLER_COMPANY
-  - PORT_OF_ORIGIN
-  - PORT_OF_DESTINATION
+6) Contains / substring / fuzzy logic
 
-  For these:
-  - When the plan says "contains" or implies fuzzy search, you MUST use:
-    (UPPER(column_name) LIKE '%' || UPPER('search text') || '%' OR JAROWINKLER_SIMILARITY(UPPER(column_name), UPPER('search text')) > 80)
+A) PRODUCT_DESCRIPTION
+- Preserve Prompt A product matching exactly.
+- Never repair this matcher with ARRAY_EXISTS; use ARRAY_COUNT(lambda, token_array) > 0 for scalar existence testing.
+- Canonical single-token product matching is exact LIKE OR token-level NGRAM_SEARCH over SPLIT_BY_STRING(REGEXP_REPLACE(UPPER(product_description), '[^A-Z0-9]+', ' '), ' '), threshold 0.80, token-length difference <=2.
+- Never use whole-description NGRAM_SEARCH.
+- Compound products keep required semantic tokens conjunctive; each token may use the exact-or-fuzzy token predicate.
+- If HS scope is also active, preserve the mandatory outer AND between product and HS predicates.
+- Do not remove the fuzzy branch merely because JAROWINKLER_SIMILARITY is unavailable; token-level NGRAM_SEARCH is the compatible fallback.
 
-- Non–[FUZZY TARGET] text columns:
-  - When the plan says "contains", you MUST use:
-    UPPER(column_name) LIKE '%' || UPPER('search text') || '%'
+B) PORT_OF_ORIGIN / PORT_OF_DESTINATION
+- Stored port values are standardized. Preserve Prompt A's canonical port-resolution behavior: DISTINCT candidates, exact first, contains second, NGRAM_SEARCH(candidate, input, 2) >= 0.90 only as typo fallback, and deterministic selection of one best candidate.
+- After resolving the canonical port, fact rows MUST use exact normalized equality: UPPER(TRIM(port_column)) = resolved_port.
+- Never repair by attaching LIKE or NGRAM_SEARCH as an OR predicate across every shipment row.
 
-- You MUST NOT use ILIKE.
-- You MUST NOT use PostgreSQL's % (trigram similarity) operator.
-- You MUST NOT use word_similarity() - Snowflake does not support it.
+C) BUYER_COMPANY / SELLER_COMPANY
+- Keep company matching according to the authoritative plan. Default contains matching may use UPPER(TRIM(column_name)) LIKE CONCAT('%', UPPER('search text'), '%').
+- If typo-tolerant company resolution is required, use a DISTINCT candidate-resolution CTE, then filter fact rows by the resolved candidate.
 
+D) Countries
+- Country canonicalization occurs before SQL against Prompt A's authoritative canonical country list.
+- Corrected SQL must use exact normalized equality to the resolved canonical country.
+- Never add NGRAM_SEARCH against BUYER_COUNTRY or SELLER_COUNTRY merely to repair a country typo.
 
-7) Average price logic
+E) Other text columns
+- For contains matching use:
+  UPPER(TRIM(column_name)) LIKE CONCAT('%', UPPER('search text'), '%')
+
+- Never use ILIKE.
+- Never use JAROWINKLER_SIMILARITY, LEVENSHTEIN, word_similarity, the PostgreSQL trigram % operator, SOUNDEX, or AI_SIMILARITY as a repair shortcut.
+
+7) Percentile / conditional-count compatibility
+- PERCENTILE_CONT(p) WITHIN GROUP (ORDER BY x) syntax is invalid here.
+- Correct aggregate form:
+  PERCENTILE_CONT(CAST(x AS DOUBLE), p)
+- Do NOT repair a percentile by converting it to PERCENTILE_CONT(...) OVER (...). Build a grouped percentile CTE at the exact grain required by Prompt A and join it back if needed.
+- COUNT_IF(condition) is invalid here.
+- Correct form:
+  SUM(CASE WHEN condition THEN 1 ELSE 0 END)
+- Preserve the original aggregation grain when making either replacement.
+
+8) Regression compatibility (when the user-defined formula requires regression)
+- The time_index MUST be materialized by ROW_NUMBER() in a prior indexed_series CTE.
+- Use:
+  REGR_SLOPE(CAST(metric_value AS DOUBLE), CAST(time_index AS DOUBLE)) AS slope
+  REGR_INTERCEPT(CAST(metric_value AS DOUBLE), CAST(time_index AS DOUBLE)) AS intercept
+- REGR_R2 is unavailable. Compute r2 exactly as:
+  CASE
+      WHEN COUNT(*) < 2 THEN NULL
+      WHEN VAR_POP(CAST(time_index AS DOUBLE)) = 0 THEN NULL
+      WHEN VAR_POP(CAST(metric_value AS DOUBLE)) = 0 THEN 1.0
+      ELSE POWER(CORR(CAST(metric_value AS DOUBLE), CAST(time_index AS DOUBLE)), 2)
+  END AS r2
+- Never use dates/epoch values as the X-axis.
+- Never pass ROW_NUMBER() directly inside REGR_SLOPE, REGR_INTERCEPT, CORR, or VAR_POP.
+
+9) String aggregation / concatenation
+- Replace LISTAGG with GROUP_CONCAT only if string aggregation is actually required by the Implementation Plan.
+- Prefer deduplication in a prior CTE/subquery before GROUP_CONCAT.
+- Replace || concatenation with CONCAT(...).
+
+10) Average price logic
 If the Implementation Plan requires an average price:
-- Apply all filters BEFORE aggregation.
-- Never mix different units in a single average.
-- If a specific unit is specified, filter by that unit (using UPPER(UNIT) = UPPER('UNIT')).
-- If no unit is specified and average price is needed:
-  - Group by UNIT.
-  - Count rows per unit.
-  - Select the top 3 units by row count.
-  - For each chosen unit compute:
-    avg_unit_price = COALESCE(SUM(SHIPMENT_VALUE), 0) / NULLIF(SUM(QUANTITY), 0)
-- You MUST NOT divide by zero (use NULLIF(SUM(QUANTITY), 0) in the denominator).
-- If the Implementation Plan does NOT mention average price, you MUST NOT invent it in the SQL.
+- Preserve the Unit-Safe Average Price Engine from Prompt A exactly; Prompt B does not simplify or redefine it.
+- Apply all filters before aggregation.
+- Never mix different units in a single average/ranking.
+- Never use AVG(row-level unit_price) or AVG(entity_avg_unit_price) for global price.
+- Use entity_total_value_usd / NULLIF(entity_total_qty, 0) and preserve all eligibility/P25/unit-selection rules stated in the authoritative SQL Implementation Plan.
+- If the Implementation Plan does NOT mention average price, do not invent it.
 
+11) Onboarding / lifecycle logic
+- Preserve any onboarding/new-entity/absence or user-defined lifecycle CTE shapes from the SQL Implementation Plan.
+- FULL OUTER JOIN is supported and must not be rewritten away during dialect repair.
+- Do not use DECL_NO for relationship/lifecycle logic.
 
-8) Onboarding / relationship logic
-If the Implementation Plan describes onboarding:
-- Identify (SELLER_COMPANY, BUYER_COMPANY) pairs in the target (current) period that match all filters.
-- Exclude pairs that appear in earlier records (before the period start) with the same geography and product filters.
-- Return distinct requested entities (e.g., BUYER_COMPANY).
-- You may use CTEs (e.g., current_period_pairs, historical_pairs) to structure this, but the logic MUST match the Implementation Plan.
+12) GROUP BY consistency
+- At every aggregated SELECT level, every selected expression that is neither aggregated nor functionally materialized from a prior grouped CTE must be compatible with that level's GROUP BY.
+- When fixing a GROUP BY error, first preserve the grouping dimensions required by the SQL Implementation Plan.
+- Add only missing required grouping expressions, or remove non-essential selected expressions that are not required by the plan.
+- Do NOT change the intended grouping grain.
+- Do NOT introduce DECL_NO into GROUP BY.
 
+13) Alias/materialization safety
+- NEVER reference a SELECT alias from another expression in the same SELECT list. Materialize the first derived expression in a preceding CTE and reference it only from the next query level. Do this proactively; do not wait for a VeloDB alias-resolution error.
+- This rule is especially important for percentile inputs, share_pct before cumulative window calculations, growth-rate reuse, user-defined formula stages, and regression time_index.
 
-9) GROUP BY consistency
-Snowflake requires that every non-aggregated column in the SELECT list appears in the GROUP BY clause at the same query level.
-
-Therefore, you MUST:
-- For each SELECT level with aggregation:
-  - Ensure every column that is not wrapped in an aggregate function (e.g., SUM, COUNT, MAX) is listed in that query's GROUP BY.
-
-When fixing GROUP BY errors:
-- FIRST, check the SQL Implementation Plan to see which grouping dimensions are required (e.g., group by BUYER_COMPANY, BUYER_COUNTRY, HS_CODE, port_name).
-- THEN:
-  - Add any missing required columns from the SELECT list to the GROUP BY.
-  - If the SELECT contains extra non-aggregated columns that are NOT required by the Implementation Plan, you MAY remove those columns from the SELECT instead of adding them to the GROUP BY.
-
-You MUST NOT:
-- Change the intended grouping grain described in the SQL Implementation Plan (for example, do NOT switch from grouping by BUYER_COMPANY to grouping by BUYER_COUNTRY if the plan says group by BUYER_COMPANY).
-- Introduce DECL_NO into GROUP BY, as it is not a valid grouping dimension.
+14) Identifier / ordering safety
+- Use single quotes for string/date literals. Use unquoted physical identifiers whenever possible; use backticks only if identifier quoting is necessary. Never generate double-quoted identifiers.
+- Never rely on ORDER BY inside a CTE/subquery without a required LIMIT/top-selection purpose to determine final display order. Preserve/restate the authoritative ordering in the final outer SELECT.
 
 
 -----------------------------
@@ -1755,35 +1872,37 @@ HOW TO FIX THE QUERY
 -----------------------------
 
 1) Read the LATEST ERROR carefully.
-   - If it mentions a missing column, fix the column name or remove/replace that reference according to the schema and the Implementation Plan.
-   - If it mentions a syntax error, fix commas, parentheses, GROUP BY, aliases, etc.
-   - If it mentions a type error, adjust casts or functions (e.g., do NOT apply UPPER to non-text types).
-   - If it mentions a GROUP BY or aggregate error, ensure all non-aggregated selected columns are in GROUP BY.
-   - If it mentions an invalid or out-of-range date on SHIPPING_DATE, apply the CALENDAR DATE CORRECTION RULE instead of changing the period semantics.
-   - If it mentions "Unknown function" or "Function not found", replace PostgreSQL functions with Snowflake equivalents (e.g., word_similarity → JAROWINKLER_SIMILARITY, % → LIKE).
+   - Missing column: correct/remove the reference according to the schema and authoritative plan.
+   - Syntax error: fix VeloDB syntax, commas, parentheses, CTE boundaries, aliases, ORDER BY/LIMIT placement, GROUP BY, etc.
+   - Type error: add only the required safe cast; do not alter the metric semantics.
+   - GROUP BY / aggregate error: preserve intended grain and repair the offending query level.
+   - Invalid date: apply the calendar-date correction rule only.
+   - Unknown/unsupported function: replace it using the TARGET VELODB DIALECT CONTRACT. Common mandatory mappings include DATEADD -> MONTHS_ADD, WITHIN GROUP percentile syntax -> PERCENTILE_CONT(value,p), COUNT_IF -> SUM(CASE...), REGR_R2 -> guarded CORR/VAR_POP r2, LISTAGG -> GROUP_CONCAT, || -> CONCAT, and JAROWINKLER_SIMILARITY -> field-appropriate LIKE/NGRAM_SEARCH.
 
 2) Look at ATTEMPT HISTORY to avoid repeating the same mistake.
-   - If the same pattern of error appears in multiple attempts, change the structure more fundamentally (e.g., adjust CTE structure or aggregate logic) while still respecting the Implementation Plan.
+   - If the same error pattern appears multiple times, change only the necessary CTE/materialization structure more fundamentally while preserving the SQL Implementation Plan.
 
-3) Make the minimal change necessary to satisfy:
-   - The error is fixed.
-   - The logic remains consistent with the Interpretation Summary and SQL Implementation Plan.
-   - All global constraints above are respected.
-   You MUST NOT refactor the entire query structure unless the error explicitly requires structural changes (e.g., invalid reference to a non-existent CTE or illegal nesting).
+3) Make the minimal change necessary so that:
+   - the error is fixed,
+   - the logic remains identical to the Interpretation Summary and SQL Implementation Plan,
+   - all target VeloDB compatibility rules are respected.
+   You MUST NOT refactor the entire query unless the error genuinely requires a structural fix.
 
-4) If you are unsure about the exact fix, prefer:
-   - Dropping or simplifying non-essential derived columns that are not required by the Implementation Plan, rather than changing time windows or filters.
-   - Using explicit aliases and straightforward SELECT/CTE structure.
+4) If multiple fixes are possible, prefer:
+   - explicit CTE materialization,
+   - straightforward VeloDB-supported functions,
+   - removal of non-essential derived columns not required by the plan,
+   over any change to time windows, filters, dimensions, metrics, or engine semantics.
 
 
 -----------------------------
 OUTPUT REQUIREMENT
 -----------------------------
 
-You MUST output ONLY the corrected Snowflake SELECT query, and nothing else.
+You MUST output ONLY the corrected VeloDB SELECT query, and nothing else.
 
 - You MAY use CTEs (WITH ... AS ...) as needed.
-- You MUST NOT include any CREATE, ALTER, DROP, INSERT, UPDATE, or DELETE statements.
+- You MUST NOT include CREATE, ALTER, DROP, INSERT, UPDATE, or DELETE statements.
 - You MUST NOT include comments or natural-language explanation.
 - You MUST NOT wrap the query in markdown code fences.
 - The output must be ONLY the SQL query text.
@@ -1846,6 +1965,12 @@ Respect the result:
 - Do not change, filter, regroup, reorder, or recalculate the SQL result except for purely presentational interpretation (e.g., rounding or thousands separators for display).
 - Do not mention SQL, CTEs, database internals, or prompt names in the narrative.
 - Do not paste raw JSON rows, markdown tables, or raw rows in the narrative.
+
+Filter-semantics fidelity (CRITICAL):
+- Use the upstream interpretation/plan and executed query only to understand scope; never mention SQL itself.
+- If product-description matching and HS scope are connected by AND, describe records as matching BOTH criteria. Never call that “either method”, a union, or “more complete than either method alone”.
+- If OR/either semantics were explicitly requested and actually used, then and only then describe either criterion as sufficient.
+- Exact LIKE OR fuzzy-token fallback is one product-description criterion, not two independent data populations.
 
 Time period:
 - Use the time period implied by the Interpretation Summary or SQL Implementation Plan.
