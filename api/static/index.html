@@ -434,12 +434,13 @@ function onboarding(v){
 
 // company picker
 function companies(v){
-  h(`<h1>Your companies</h1><p class="lead">Each company keeps its own profile and up to 10 sessions. ${v.companies.length} of 5 used.</p><div class="list" id="cl"></div>`);
+  const limit = v.company_limit ?? 5, canDelete = v.can_delete_companies !== false;
+  h(`<h1>${limit <= 1 ? "Your company" : "Your companies"}</h1><p class="lead">${limit <= 1 ? "Your company keeps its profile and up to 10 sessions." : "Each company keeps its own profile and up to 10 sessions."} ${v.companies.length} of ${limit} used.</p><div class="list" id="cl"></div>`);
   if (!v.companies.length) h(`<p class="empty">No companies yet. Add one to get started.</p>`);
   $("cl").innerHTML = v.companies.map(c => `<div class="item"><div><strong>${esc(c.company_name)}</strong>
       <div class="meta">Slot ${c.slot} · ${c.session_count} session${c.session_count === 1 ? "" : "s"} · last used ${esc((c.last_used_at || c.created_at || "").slice(0, 10))}</div>
       <div id="rep${c.company_id}"></div></div>
-      <div class="row"><button class="primary" data-open="${c.company_id}">Open</button><button data-rep="${c.company_id}">Report</button><button class="danger" data-del="${c.company_id}">Delete</button></div></div>`).join("");
+      <div class="row"><button class="primary" data-open="${c.company_id}">Open</button><button data-rep="${c.company_id}">Report</button>${canDelete ? `<button class="danger" data-del="${c.company_id}">Delete</button>` : ""}</div></div>`).join("");
   if (v.company_slots_free > 0) h(`<div class="row" style="margin-top:1rem"><button class="signal" id="add">Add a company · ${v.company_slots_free} slot${v.company_slots_free === 1 ? "" : "s"} free</button></div>`);
   on("add", () => action("POST", `${W()}/onboarding/start`, {}, "Opening onboarding…"));
   document.querySelectorAll("[data-open]").forEach(b => b.onclick = () => action("POST", `${W()}/companies/${b.dataset.open}/open`, null, "Opening the company…"));

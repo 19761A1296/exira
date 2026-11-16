@@ -107,7 +107,8 @@ def onb_build_profile(company_name: str, scraped_info: str):
     cid = db.create_company(S.userid, company_name=name,
                             company_profile=summary or "", onboarding_report=S.report or {})
     if cid is None:
-        error("That company could not be added — you may already have 5, or a company with that name.")
+        error("That company could not be added — your company limit is reached, "
+              "or a company with that name already exists.")
         return
 
     S.company_id = cid
@@ -157,7 +158,9 @@ def _need_step(*steps):
 def start():
     """'+ Add a company'."""
     if db.company_slots_free(S.userid) <= 0:
-        raise UserError("All 5 company slots are used. Delete one first.")
+        if db.company_is_fixed(S.userid):
+            raise UserError("Your account already has its company. It can't be changed.")
+        raise UserError("All company slots are used. Delete one first.")
     S.onb_step = "input"
     S.onb_text = ""
     S.onb_urls = ""

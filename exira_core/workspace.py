@@ -113,6 +113,8 @@ def open_company(company_id: int):
 def delete_company(company_id: int):
     _need_user()
     _own_company(company_id)
+    if db.company_is_fixed(S.userid):
+        raise UserError("Your company is fixed once onboarded and can't be deleted.")
     db.delete_company(company_id)
     if S.company_id == company_id:
         S.company_id = None
@@ -408,6 +410,8 @@ def view(debug: bool = False) -> dict:
     if S.userid and stage == "company_picker":
         v["companies"] = db.list_companies(S.userid)
         v["company_slots_free"] = db.company_slots_free(S.userid)
+        v["company_limit"] = db.company_limit(S.userid)
+        v["can_delete_companies"] = not db.company_is_fixed(S.userid)
 
     if S.company_id is not None and stage == "session_picker":
         v["sessions"] = db.list_sessions(S.company_id)

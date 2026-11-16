@@ -2,7 +2,7 @@
 
     user id  →  pick a company  →  pick a session  →  chat
 
-A user may hold up to 5 companies, and each company up to 10 sessions. A
+A new user holds one company (older users up to 5), each with up to 10 sessions. A
 session keeps its own summary, persona, scope and its newest 20 answers, so
 reopening one days later picks up where it left off.
 
@@ -38,7 +38,10 @@ def when(row: dict) -> str:
 def add_company(userid: str) -> int | None:
     """Run onboarding and store the result as a new company. None if it fails."""
     if db.company_slots_free(userid) <= 0:
-        print("You already have 5 companies. Delete one first.")
+        if db.company_is_fixed(userid):
+            print("Your account already has its company. It can't be changed.")
+        else:
+            print("All company slots are used. Delete one first.")
         return None
 
     print("\nTell me about the company. Either field alone is enough.")
@@ -71,6 +74,8 @@ def choose_company(userid: str) -> int | None:
     while True:
         companies = db.list_companies(userid)
         free = db.company_slots_free(userid)
+        limit = db.company_limit(userid)
+        fixed = limit <= 1          # one-company users can't delete or replace it
 
         if not companies:
             print("\nNo companies yet. Let's add your first one.")
@@ -79,7 +84,7 @@ def choose_company(userid: str) -> int | None:
                 return None
             continue
 
-        print(f"\nYour companies ({len(companies)} of 5)")
+        print(f"\nYour {'company' if fixed else 'companies'} ({len(companies)} of {limit})")
         for i, c in enumerate(companies, 1):
             print(f"  {i}. {c['company_name']}")
             print(f"     company {c['slot']} · {c['session_count']} of 10 sessions"
@@ -87,7 +92,8 @@ def choose_company(userid: str) -> int | None:
 
         if free:
             print(f"  a. Add a company ({free} slot{'s' if free != 1 else ''} free)")
-        print("  d. Delete a company")
+        if not fixed:
+            print("  d. Delete a company")
         print("  q. Quit")
 
         choice = ask("Select> ").lower()
@@ -99,7 +105,7 @@ def choose_company(userid: str) -> int | None:
             add_company(userid)
             continue
 
-        if choice == "d":
+        if choice == "d" and not fixed:
             target = ask("  Which number to delete? ")
             if target.isdigit() and 1 <= int(target) <= len(companies):
                 victim = companies[int(target) - 1]

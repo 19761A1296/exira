@@ -1105,8 +1105,8 @@ def onb_build_profile(
 
     if cid is None:
         st.error(
-            "That company could not be added — you may already have 5, "
-            "or a company with that name."
+            "That company could not be added — your company limit is reached, "
+            "or a company with that name already exists."
         )
         return
 
@@ -3700,12 +3700,16 @@ def resume_session(session_id: int):
 def page_company_picker():
     S.companies = db.list_companies(S.userid)
     free = db.company_slots_free(S.userid)
+    limit = db.company_limit(S.userid)
+    fixed = limit <= 1            # one-company users can't delete or replace it
 
     _hero(
-        "Your companies",
+        "Your company" if fixed else "Your companies",
+        "Your company keeps its profile and up to 10 separate sessions."
+        if fixed else
         "Each company keeps its own profile and up to 10 separate sessions. "
         "Pick one to carry on, or add another.",
-        f"{len(S.companies)} of 5 used",
+        f"{len(S.companies)} of {limit} used",
     )
 
     if not S.companies:
@@ -3734,8 +3738,8 @@ def page_company_picker():
                     open_company(company["company_id"])
                     st.rerun()
 
-                if st.button("Delete", key=f"delco_{company['company_id']}",
-                             use_container_width=True):
+                if not fixed and st.button("Delete", key=f"delco_{company['company_id']}",
+                                           use_container_width=True):
                     db.delete_company(company["company_id"])
                     S.companies = db.list_companies(S.userid)
                     st.rerun()
@@ -3780,8 +3784,8 @@ def page_company_picker():
             onb_reset_for_retry()
             S.stage = "onboarding"
             st.rerun()
-    else:
-        st.caption("All 5 company slots are in use. Delete one to add another.")
+    elif not fixed:
+        st.caption(f"All {limit} company slots are in use. Delete one to add another.")
 
 
 def page_session_picker():

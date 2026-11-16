@@ -1,7 +1,7 @@
 """info_database.py — storage for users, companies, sessions and answers.
 
     users      one row per person
-      └─ companies   up to 5 per user      slot 1..5    the company card
+      └─ companies   1 per new user (older users: up to 5)   the company card
            ├─ onboarding_reports   exactly one per company, written once
            └─ sessions   up to 10 per company  slot 1..10   summary, persona, scope
                 └─ answers   newest 20 per session         question + answer
@@ -47,7 +47,8 @@ DB_NAME = Path(__file__).parent / "exira.db"
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 IS_PG = bool(DATABASE_URL)
 
-MAX_COMPANIES = 5
+MAX_COMPANIES = 5               # hard ceiling (slot 1..5); older users keep this
+NEW_USER_MAX_COMPANIES = 1      # users created from now on get exactly one company
 MAX_SESSIONS = 10
 MAX_ANSWERS = 20
 
@@ -168,9 +169,10 @@ _FK_INT_PG = "BIGINT"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
-    user_id      TEXT PRIMARY KEY,
-    created_at   TEXT NOT NULL,
-    last_seen_at TEXT
+    user_id       TEXT PRIMARY KEY,
+    created_at    TEXT NOT NULL,
+    last_seen_at  TEXT,
+    max_companies INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS companies (
@@ -254,6 +256,11 @@ def _migrate(conn):
         conn.execute("ALTER TABLE sessions ADD COLUMN engine_sid TEXT")
     if "trace" not in _columns(conn, "answers"):
         conn.execute("ALTER TABLE answers ADD COLUMN trace TEXT")
+    if "max_companies" not in _columns(conn, "users"):
+        # users that exist before this change keep the old limit of 5
+        conn.execute("ALTER TABLE users ADD COLUMN max_companies INTEGER")
+        conn.execute("UPDATE users SET max_companies = ? WHERE max_companies IS NULL",
+                     (MAX_COMPANIES,))
 
 
 # ───────────────────────── users ─────────────────────────
@@ -271,9 +278,9 @@ def ensure_user(user_id) -> str:
     user_id = str(user_id)
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO users (user_id, created_at) VALUES (?, ?)"
+            "INSERT INTO users (user_id, created_at, max_companies) VALUES (?, ?, ?)"
             " ON CONFLICT DO NOTHING",
-            (user_id, _now()))
+            (user_id, _now(), NEW_USER_MAX_COMPANIES))
         conn.execute(
             "UPDATE users SET last_seen_at = ? WHERE user_id = ?",
             (_now(), user_id))
@@ -297,15 +304,38 @@ def delete_user(user_id) -> bool:
 
 # ───────────────────────── companies ─────────────────────────
 
+def _company_limit(conn, user_id) -> int:
+    row = conn.execute(
+        "SELECT max_companies FROM users WHERE user_id = ?", (str(user_id),)
+    ).fetchone()
+    if row is None:
+        return NEW_USER_MAX_COMPANIES          # not created yet -> will be a new user
+    if row["max_companies"] is None:
+        return MAX_COMPANIES                   # older row without the column filled
+    return max(0, min(int(row["max_companies"]), MAX_COMPANIES))
+
+
+def company_limit(user_id) -> int:
+    """How many companies this user may have: 1 for new users, 5 for older ones."""
+    with get_conn() as conn:
+        return _company_limit(conn, user_id)
+
+
+def company_is_fixed(user_id) -> bool:
+    """One-company users: their company is set at onboarding and can't be deleted."""
+    return company_limit(user_id) <= 1
+
+
 def create_company(user_id, company_name, company_profile="",
                    onboarding_report="") -> int | None:
-    """New company in the lowest free slot. None when the user has 5 already."""
+    """New company in the lowest free slot. None when the user's limit is reached."""
     user_id = ensure_user(user_id)
     now = _now()
 
     with get_conn() as conn:
         _lock_parent(conn, "users", "user_id", user_id)
-        slot = _next_slot(conn, "companies", "user_id", user_id, MAX_COMPANIES)
+        limit = _company_limit(conn, user_id)
+        slot = _next_slot(conn, "companies", "user_id", user_id, limit)
         if slot is None:
             return None
 
@@ -428,7 +458,8 @@ def company_slots_free(user_id) -> int:
         row = conn.execute(
             "SELECT COUNT(*) AS n FROM companies WHERE user_id = ?", (str(user_id),)
         ).fetchone()
-    return MAX_COMPANIES - row["n"]
+        limit = _company_limit(conn, user_id)
+    return max(0, limit - row["n"])
 
 
 # ───────────────────────── sessions ─────────────────────────
