@@ -1,12 +1,18 @@
 import os
-import snowflake.connector
-from dotenv import load_dotenv
-import pandas as pd
+import re
 
+import pandas as pd
+import pymysql
+from dotenv import load_dotenv
 
 load_dotenv()
 
-TABLE_NAME = os.getenv("TRADE_TABLE_NAME")
+TABLE_NAME         = os.getenv("VELODB_TRADE_TABLE_NAME", "").strip()
+COMPANY_TABLE_NAME = os.getenv("VELODB_COMPANY_TABLE_NAME", "").strip()
+
+COL_S_COMPANY = "SELLER_COMPANY"
+COL_B_COMPANY = "BUYER_COMPANY"
+
 SELECTED_COLUMNS = [
     "TTYPE",
     "SELLER_COMPANY","SELLER_ADDRESS","SELLER_CITY","SELLER_STATE","SELLER_COUNTRY","PORT_OF_ORIGIN","COUNTRY_OF_ORIGIN",
@@ -21,76 +27,46 @@ SELECTED_COLUMNS = [
 SELECTED_COLUMNS_STR = ", ".join(SELECTED_COLUMNS)
 
 
-
-
-
-import os
-import snowflake.connector
-import re 
-
-TABLE_NAME    = os.getenv("TRADE_TABLE_NAME")
-COL_S_COMPANY = "SELLER_COMPANY"
-COL_B_COMPANY = "BUYER_COMPANY"
-
-
 def _get_conn():
-    return snowflake.connector.connect(
-        account=os.environ["SNOWFLAKE_ACCOUNT"],
-        user=os.environ["SNOWFLAKE_USER"],
-        password=os.environ["SNOWFLAKE_PASSWORD"],
-        warehouse=os.getenv("SNOWFLAKE_WAREHOUSE"),
-        database=os.getenv("SNOWFLAKE_DATABASE"),
-        schema=os.getenv("SNOWFLAKE_SCHEMA", "PUBLIC"),
-        role=os.getenv("SNOWFLAKE_ROLE"),
+    # VeloDB (Apache Doris) speaks the MySQL protocol
+    return pymysql.connect(
+        host=os.environ["VELODB_HOST"].strip(),
+        port=int(os.environ["VELODB_PORT"]),
+        user=os.environ["VELODB_USER"].strip(),
+        password=os.environ["VELODB_PASSWORD"],
+        database=os.getenv("VELODB_DATABASE", "").strip() or None,
+        charset="utf8mb4",
+        connect_timeout=30,
     )
 
 
 def companies_list(company_name, limit=500, country=None, hs2=None):
-    
+    # hs2 is kept for signature compatibility; the company master table has no HS data
     q = (company_name or "").strip().upper()
     if not q:
         return []
 
     def esc(text):
+        # backslash is the default LIKE escape character in VeloDB/Doris
         return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
     params = {"company": f"%{esc(q)}%"}
 
     country = (country or "").strip().upper()
-    hs2 = re.sub(r"\D", "", hs2 or "")[:2]
-
-    seller_extra = ""
-    buyer_extra = ""
-
+    country_clause = ""
     if country:
         params["country"] = f"%{esc(country)}%"
-        seller_extra += " AND UPPER(TRIM(SELLER_COUNTRY)) LIKE %(country)s ESCAPE '\\\\'"
-        buyer_extra  += " AND UPPER(TRIM(BUYER_COUNTRY))  LIKE %(country)s ESCAPE '\\\\'"
-
-    if hs2:
-        params["hs2"] = hs2
-        hs_clause = " AND LEFT(TRIM(HS_CODE), 2) = %(hs2)s"
-        seller_extra += hs_clause
-        buyer_extra += hs_clause
+        country_clause = " AND UPPER(TRIM(selected_country)) LIKE %(country)s"
 
     limit = max(1, min(int(limit), 1000))
 
     query = f"""
-        SELECT name FROM (
-            SELECT DISTINCT {COL_S_COMPANY} AS name
-            FROM {TABLE_NAME}
-            WHERE {COL_S_COMPANY} IS NOT NULL
-            AND UPPER({COL_S_COMPANY}) LIKE %(company)s ESCAPE '\\\\'
-            {seller_extra}
-
-            UNION
-
-            SELECT DISTINCT {COL_B_COMPANY} AS name
-            FROM {TABLE_NAME}
-            WHERE {COL_B_COMPANY} IS NOT NULL
-            AND UPPER({COL_B_COMPANY}) LIKE %(company)s ESCAPE '\\\\'
-            {buyer_extra}
-        )
+        SELECT DISTINCT TRIM(name) AS name
+        FROM {COMPANY_TABLE_NAME}
+        WHERE name IS NOT NULL
+          AND TRIM(name) <> ''
+          AND UPPER(name) LIKE %(company)s
+          {country_clause}
         ORDER BY name
         LIMIT {limit}
     """
@@ -127,10 +103,7 @@ def run_query(query):
             rows = cur.fetchall()
             columns = [desc[0] for desc in cur.description]
 
-        df = pd.DataFrame(rows, columns=columns)
-
-        return df
-
+        return pd.DataFrame(rows, columns=columns)
     finally:
         conn.close()
 
