@@ -64,6 +64,9 @@ class Engine:
         return engine.start_session()["session_id"]
 
     def send(self, sid: str, message: str, source: str | None = None) -> dict:
+        # TESTING: send the query to text2sql in UPPER case
+        message = (message or "").upper()
+        print(f"[ENGINE SEND] {message}")
         return self._unwrap(engine.chat(
             engine.ChatRequest(session_id=sid, message=message, source=source)
         ))

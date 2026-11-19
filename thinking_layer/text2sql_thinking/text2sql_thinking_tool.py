@@ -129,18 +129,19 @@ TRADE_TABLE_NAME = (os.getenv("VELODB_TRADE_TABLE_NAME"))
 # =========================================================
 SCHEMA_DESCRIPTION = f"""Engine: VeloDB Cloud 26.0.5.1 (Apache Doris-compatible SQL via MySQL protocol)
 Table Name: {TRADE_TABLE_NAME}
-Physical columns:
+Physical columns allowed for thinking Text2SQL:
 - shipping_date (DATE)
 - quantity (DOUBLE)
 - shipment_value (DECIMAL(18,4))
-- product_description (text)
-- buyer_country, buyer_state, buyer_city, buyer_address, buyer_company (varchar)
-- port_of_destination (varchar)
-- seller_country, seller_state, seller_city, seller_address, seller_company (varchar)
-- port_of_origin (varchar)
-- unit (varchar)
+- product_description_norm (text; ONLY product-description field used by thinking Text2SQL; already uppercase, whitespace-clean, and special-character-normalized)
+- buyer_country, buyer_state, buyer_city, buyer_address, buyer_company (varchar; uppercase + whitespace-clean)
+- port_of_destination (varchar; uppercase + whitespace-clean)
+- seller_country, seller_state, seller_city, seller_address, seller_company (varchar; uppercase + whitespace-clean)
+- port_of_origin (varchar; uppercase + whitespace-clean)
+- unit (varchar; uppercase + whitespace-clean)
 - decl_no (varchar, nullable shipment reference; not a logical unique key)
-- hs_code (varchar)
+- hs_code (varchar; digit-only, leading zeros preserved)
+Raw product_description may physically exist in VeloDB but MUST NOT be used by thinking Text2SQL.
 """
 
 # =========================================================
@@ -159,12 +160,16 @@ This hard runtime guard MUST agree with the native VeloDB rules inside Prompt A/
 - REGR_SLOPE / REGR_INTERCEPT are available; REGR_R2 is not. Derive r2 with guarded CORR/VAR_POP when needed.
 - COUNT_IF is unavailable; use SUM(CASE WHEN condition THEN 1 ELSE 0 END).
 - Use CONCAT(...) and GROUP_CONCAT; do not use || or LISTAGG.
-- HS_CODE is a clean digit-only VARCHAR in production. Preserve leading zeros and filter hs_code directly; never normalize the physical column with REGEXP_REPLACE/REPLACE. Sanitize only user-provided HS text before SQL. Use LIKE for one prefix, SUBSTR(hs_code, 1, N) IN (...) for multiple equal-length prefixes, and = for an exact full code.
-- PRODUCT_DESCRIPTION uses exact LIKE plus a token-level NGRAM_SEARCH fallback for ASCII product tokens length >=4. Build a real token ARRAY with SPLIT_BY_STRING(REGEXP_REPLACE(UPPER(td.product_description), '[^A-Z0-9]+', ' '), ' '), require token-length difference <=2, and use NGRAM_SEARCH(token, pattern, 2) >= 0.80. Never run NGRAM_SEARCH against the entire long product_description. REGEXP_EXTRACT_ALL must NOT be used as the ARRAY source on this production cluster.
-- ARRAY_COUNT, SPLIT_BY_STRING, REGEXP_REPLACE, CHAR_LENGTH, ABS and NGRAM_SEARCH are allowed for that canonical product predicate.
-- When both product-description matching and HS scope are active, combine them as (PRODUCT_MATCH) AND (HS_SCOPE), never OR unless the user explicitly asks for either/union semantics.
-- HS scope precedence: CURRENT explicit HS code(s) in the user/sub-question override any older remembered/resolved product HS scope. Reuse saved scope only when the current request supplies no explicit HS scope.
-- Ports and countries are standardized in production. Countries use exact normalized equality after canonical resolution. Ports resolve against DISTINCT standardized candidates (exact first, contains second, NGRAM_SEARCH >= 0.90 only as typo fallback), then fact rows use exact normalized equality. Never fuzzy-match every fact row. Company matching keeps its existing rules.
+- HS_CODE is a clean digit-only VARCHAR. Preserve leading zeros and keep the physical hs_code bare. Never wrap hs_code in REGEXP_REPLACE/REPLACE, SUBSTR, LEFT, or casts for filtering. Sanitize only user-provided HS text. Use hs_code LIKE '<prefix>%' for one hierarchical prefix, a parenthesized OR of direct LIKE predicates for multiple prefixes, and =/IN only for exact full codes.
+- PRODUCT_DESCRIPTION_NORM is the ONLY product-description column allowed for thinking Text2SQL. Raw product_description may physically exist but MUST NOT be referenced. product_description_norm is already uppercase, whitespace-clean, and special-character-normalized.
+- Product matching uses exact substring plus token-level NGRAM_SEARCH for ASCII product tokens length >=4. Use SPLIT_BY_STRING(td.product_description_norm, ' ') directly, require token-length difference <=2, and NGRAM_SEARCH(token, pattern, 2) >= 0.80. Never wrap product_description_norm in UPPER/LOWER/TRIM/REGEXP_REPLACE and never run NGRAM_SEARCH against the entire long description.
+- ARRAY_COUNT, SPLIT_BY_STRING, CHAR_LENGTH, ABS and NGRAM_SEARCH are permitted for that canonical product predicate. REGEXP_EXTRACT_ALL must NOT be used as the ARRAY source on this production cluster.
+- All stored text dimensions used by thinking Text2SQL are already uppercase and whitespace-clean. Keep columns bare in equality, LIKE, joins, DISTINCT, GROUP BY, COUNT(DISTINCT), and window partitions. Normalize only user-provided literals before SQL generation.
+- When both product-description matching and HS scope are active for one product, combine them as (PRODUCT_MATCH) AND (HS_SCOPE).
+- For multiple product-specific mappings, preserve each pair independently and combine complete pairs with OR: (PRODUCT_1 AND HS_1) OR (PRODUCT_2 AND HS_2) ... . Never flatten HS codes across products.
+- SYSTEM_RESOLVED_PRODUCT_FILTER_CONTRACT, when present in the incoming question/context, is authoritative. Preserve every product-specific pair and overall predicate exactly.
+- HS precedence: CURRENT explicit user HS > current-query company-profile resolver scope supplied in the authoritative contract > older remembered/resolved scope.
+- Ports and countries are standardized in production. Countries use direct equality after canonical resolution. Ports resolve against DISTINCT stored candidates (exact first, contains second, NGRAM_SEARCH >= 0.90 only as typo fallback), then fact rows use direct equality. Never fuzzy-match every fact row. Company matching keeps its existing rules, but final comparisons use bare canonical columns.
 - JAROWINKLER_SIMILARITY, LEVENSHTEIN, Damerau-Levenshtein, TIMESTAMPDIFF, ILIKE and Snowflake DATEADD are forbidden.
 - Use single quotes for literals; unquoted identifiers when possible, backticks only if required; never double-quoted identifiers.
 - The imports_exports schema is flat: no GET(...), FLATTEN, ::VARIANT, or stored ARRAY/VARIANT workarounds. Transient arrays from SPLIT_BY_STRING for canonical product-token matching are allowed.
@@ -374,6 +379,28 @@ def call_gemini(prompt: str, max_tokens: int, temperature: float = 0.0) -> str:
         raise RuntimeError(f"Unexpected OpenRouter response: {str(data)[:500]}") from exc
 
 
+PRODUCT_SCOPE_CONTRACT_HEADER = "SYSTEM_RESOLVED_PRODUCT_FILTER_CONTRACT"
+
+def split_authoritative_product_scope_contract(text: str) -> Tuple[str, str]:
+    """Normalize only the human query; preserve an upstream authoritative scope contract byte-for-byte."""
+    raw = text or ""
+    marker = "\n\n" + PRODUCT_SCOPE_CONTRACT_HEADER
+    if marker in raw:
+        base, contract = raw.split(marker, 1)
+        return base.rstrip(), PRODUCT_SCOPE_CONTRACT_HEADER + contract
+    if raw.startswith(PRODUCT_SCOPE_CONTRACT_HEADER):
+        return "", raw
+    return raw, ""
+
+def reattach_authoritative_product_scope_contract(base_query: str, contract: str) -> str:
+    base = (base_query or "").strip()
+    contract = (contract or "").strip()
+    if not contract:
+        return base
+    if not base:
+        return contract
+    return base + "\n\n" + contract
+
 # =========================================================
 # NORMALIZE
 # =========================================================
@@ -487,22 +514,28 @@ def format_attempt_history(attempts: List[Dict[str, str]]) -> str:
     return "\n".join(lines).strip()
 
 
-# Known production compatibility repair: on this VeloDB cluster,
-# REGEXP_EXTRACT_ALL is not an ARRAY value suitable for ARRAY_COUNT.  Convert the
-# canonical product-token source to SPLIT_BY_STRING(REGEXP_REPLACE(...)), which is
-# array-typed and preserves the same token-level NGRAM semantics.
+# Known production compatibility repair/backstop.
+# The optimized production contract is:
+#   * product_description_norm is the only product field used by thinking Text2SQL,
+#   * stored text dimensions are already uppercase + whitespace-clean,
+#   * hierarchical HS prefix filters keep hs_code bare and use direct LIKE predicates.
 _REGEXP_EXTRACT_PRODUCT_ARRAY_RE = re.compile(
-    r"REGEXP_EXTRACT_ALL\(\s*UPPER\(\s*([A-Za-z_][A-Za-z0-9_]*\.product_description)\s*\)\s*,\s*'\(\[A-Z0-9\]\+\)'\s*\)",
+    r"REGEXP_EXTRACT_ALL\(\s*(?:UPPER\(\s*)?([A-Za-z_][A-Za-z0-9_]*\.)?(?:product_description_norm|product_description)\s*\)?\s*,\s*'\(\[A-Z0-9\]\+\)'\s*\)",
     re.IGNORECASE,
 )
 
-def _replace_array_exists_with_scalar_count(sql: str) -> str:
-    """Replace ARRAY_EXISTS(lambda, array) with (ARRAY_COUNT(lambda, array) > 0).
+_CANONICAL_TEXT_COLUMNS = (
+    "product_description_norm",
+    "buyer_country", "buyer_state", "buyer_city", "buyer_address", "buyer_company",
+    "port_of_destination",
+    "seller_country", "seller_state", "seller_city", "seller_address", "seller_company",
+    "port_of_origin", "unit",
+)
+_CANONICAL_TEXT_COLUMN_ALT = "|".join(re.escape(c) for c in _CANONICAL_TEXT_COLUMNS)
 
-    Doris/VeloDB ARRAY_EXISTS returns ARRAY<BOOLEAN>, so it cannot be used directly
-    as a WHERE predicate. This balanced-parenthesis rewrite is deterministic and only
-    touches ARRAY_EXISTS calls.
-    """
+
+def _replace_array_exists_with_scalar_count(sql: str) -> str:
+    """Replace ARRAY_EXISTS(lambda, array) with (ARRAY_COUNT(lambda, array) > 0)."""
     text = sql or ""
     lower = text.lower()
     out = []
@@ -546,53 +579,82 @@ def _replace_array_exists_with_scalar_count(sql: str) -> str:
     return "".join(out)
 
 
-# Production invariant: hs_code is clean digit-only VARCHAR. Canonicalize stale
-# model output before execution so prompt drift cannot re-introduce row-level
-# regex/replacement normalization or LEFT-vs-SUBSTR variation.
+def _rewrite_hs_prefix_in_to_like(match: re.Match) -> str:
+    """SUBSTR/LEFT(hs_code,1,N) IN (...) -> parenthesized OR of bare hs_code LIKE."""
+    col = match.group("col")
+    n = int(match.group("n"))
+    items = match.group("items")
+    codes = re.findall(r"'([0-9]+)'", items)
+    if not codes or any(len(code) != n for code in codes):
+        return match.group(0)
+    return "(" + " OR ".join(f"{col} LIKE '{code}%'" for code in codes) + ")"
+
+
 def enforce_static_velodb_sql_contract(sql: str) -> str:
+    """Canonicalize stale model SQL to the optimized thinking production access contract."""
     s = sql or ""
 
-    # REGEXP_REPLACE(TRIM(alias.hs_code), '[^0-9]', '') -> alias.hs_code
+    # Raw product_description physically exists but is forbidden for thinking Text2SQL.
+    s = re.sub(r"(?i)\bproduct_description\b", "product_description_norm", s)
+
+    # product_description_norm is already normalized; remove stale row-level cleanup.
+    s = re.sub(
+        r"(?is)REGEXP_REPLACE\(\s*(?:UPPER\(\s*)?(?P<col>(?:[A-Za-z_][A-Za-z0-9_]*\.)?product_description_norm)\s*\)?\s*,\s*'\[\^A-Z0-9\]\+'\s*,\s*' '\s*\)",
+        lambda m: m.group("col"),
+        s,
+    )
+
+    col_pat = rf"(?P<col>(?:[A-Za-z_][A-Za-z0-9_]*\.)?(?:{_CANONICAL_TEXT_COLUMN_ALT}))"
+    for pat in (
+        rf"(?is)UPPER\(\s*TRIM\(\s*{col_pat}\s*\)\s*\)",
+        rf"(?is)TRIM\(\s*UPPER\(\s*{col_pat}\s*\)\s*\)",
+        rf"(?is)UPPER\(\s*{col_pat}\s*\)",
+        rf"(?is)LOWER\(\s*{col_pat}\s*\)",
+        rf"(?is)TRIM\(\s*{col_pat}\s*\)",
+    ):
+        s = re.sub(pat, lambda m: m.group("col"), s)
+
+    # hs_code is clean digit-only VARCHAR: remove stale physical-column normalization.
     s = re.sub(
         r"(?is)REGEXP_REPLACE\(\s*TRIM\(\s*([A-Za-z_][A-Za-z0-9_]*\.)?hs_code\s*\)\s*,\s*'\[\^0-9\]'\s*,\s*''\s*\)",
         lambda m: f"{m.group(1) or ''}hs_code",
         s,
     )
-    # REGEXP_REPLACE(alias.hs_code, '[^0-9]', '') -> alias.hs_code
     s = re.sub(
         r"(?is)REGEXP_REPLACE\(\s*([A-Za-z_][A-Za-z0-9_]*\.)?hs_code\s*,\s*'\[\^0-9\]'\s*,\s*''\s*\)",
         lambda m: f"{m.group(1) or ''}hs_code",
         s,
     )
-    # Common legacy triple-REPLACE normalization -> direct hs_code.
     s = re.sub(
         r"(?is)REPLACE\(\s*REPLACE\(\s*REPLACE\(\s*([A-Za-z_][A-Za-z0-9_]*\.)?hs_code\s*,\s*'\.'\s*,\s*''\s*\)\s*,\s*'-'\s*,\s*''\s*\)\s*,\s*' '\s*,\s*''\s*\)",
         lambda m: f"{m.group(1) or ''}hs_code",
         s,
     )
-    # Canonical prefix extraction uses SUBSTR for hs_code.
-    s = re.sub(
-        r"(?is)LEFT\(\s*(([A-Za-z_][A-Za-z0-9_]*\.)?hs_code)\s*,\s*(\d+)\s*\)",
-        lambda m: f"SUBSTR({m.group(1)}, 1, {m.group(3)})",
-        s,
+
+    # Stale multi-prefix filters are rewritten to bare hs_code LIKE predicates.
+    hs_prefix_in_re = re.compile(
+        r"(?is)(?:SUBSTR\(\s*(?P<col>(?:[A-Za-z_][A-Za-z0-9_]*\.)?hs_code)\s*,\s*1\s*,\s*(?P<n>\d+)\s*\)|LEFT\(\s*(?P=col)\s*,\s*(?P=n)\s*\))\s+IN\s*\((?P<items>[^)]*)\)"
     )
+    s = hs_prefix_in_re.sub(_rewrite_hs_prefix_in_to_like, s)
+
     return s
 
+
 def apply_known_velodb_compatibility_repairs(sql: str, error: str) -> str:
-    current = sql or ""
+    current = enforce_static_velodb_sql_contract(sql or "")
     err = (error or "").lower()
     if "lambda argument must be array" in err and "regexp_extract_all" in current.lower():
-        current = _REGEXP_EXTRACT_PRODUCT_ARRAY_RE.sub(
-            r"SPLIT_BY_STRING(REGEXP_REPLACE(UPPER(\1), '[^A-Z0-9]+', ' '), ' ')",
-            current,
-        )
+        def _replace_regexp_extract(m: re.Match) -> str:
+            alias = m.group(1) or ""
+            return f"SPLIT_BY_STRING({alias}product_description_norm, ' ')"
+        current = _REGEXP_EXTRACT_PRODUCT_ARRAY_RE.sub(_replace_regexp_extract, current)
     if (
         "array<boolean>" in err
         or "target type=boolean" in err
         or "can not cast from origin type" in err
     ) and "array_exists" in current.lower():
         current = _replace_array_exists_with_scalar_count(current)
-    return current
+    return enforce_static_velodb_sql_contract(current)
 
 # =========================================================
 # VELODB
@@ -738,9 +800,13 @@ def run(question: str) -> Dict[str, Any]:
         return done("pipeline_exception", narrative="No question given.", error="Empty question")
 
     try:
-        question = normalize_message(raw_question)
+        base_question, scope_contract = split_authoritative_product_scope_contract(raw_question)
+        normalized_base = normalize_message(base_question)
+        question = reattach_authoritative_product_scope_contract(normalized_base, scope_contract)
         # dbg("QUERY", raw_question)
         # dbg("NORMALIZED", question)
+        if scope_contract:
+            dbg("AUTHORITATIVE PRODUCT SCOPE CONTRACT PRESERVED", scope_contract)
         a_raw = call_gemini(build_prompt_a(question), max_tokens=PROMPT_A_MAX_TOKENS, temperature=0.0)
         a_parts = parse_prompt_a_output(a_raw)
         sql_to_run = enforce_static_velodb_sql_contract((a_parts.get("sql") or "").strip())

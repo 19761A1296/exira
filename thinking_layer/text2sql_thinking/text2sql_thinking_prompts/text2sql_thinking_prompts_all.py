@@ -273,13 +273,13 @@ Validated production compatibility rules for this target:
 - COUNT_IF is NOT available. Use SUM(CASE WHEN <condition> THEN 1 ELSE 0 END).
 - String concatenation: use CONCAT(...). Do NOT rely on ||.
 - String aggregation: use GROUP_CONCAT when string aggregation is genuinely required; for deterministic deduplication, deduplicate in a prior CTE/subquery before GROUP_CONCAT.
-- Product fuzzy spelling support: NGRAM_SEARCH(text, pattern, 2), ARRAY_COUNT, SPLIT_BY_STRING, REGEXP_REPLACE, CHAR_LENGTH and ABS are available. PRODUCT_DESCRIPTION must use the canonical token-level exact+fuzzy predicate defined below: exact LIKE plus NGRAM_SEARCH over ASCII tokens produced by SPLIT_BY_STRING(REGEXP_REPLACE(UPPER(product_description), '[^A-Z0-9]+', ' '), ' '), threshold 0.80, token-length difference <= 2. Never compare the short term to the entire long product description with NGRAM_SEARCH. REGEXP_EXTRACT_ALL must NOT be used as the ARRAY source on this production cluster.
+- Product fuzzy spelling support: NGRAM_SEARCH(text, pattern, 2), ARRAY_COUNT, SPLIT_BY_STRING, CHAR_LENGTH and ABS are available. PRODUCT_DESCRIPTION_NORM is the ONLY product-description column allowed for thinking Text2SQL. It is already uppercase, whitespace-clean, and special-character-normalized in storage. Use exact LIKE on product_description_norm plus NGRAM_SEARCH over tokens produced directly by SPLIT_BY_STRING(product_description_norm, ' '), threshold 0.80, token-length difference <= 2. Never wrap product_description_norm in UPPER, LOWER, TRIM, REGEXP_REPLACE, or other normalization functions. Never compare the short term to the entire long PRODUCT_DESCRIPTION_NORM with NGRAM_SEARCH. REGEXP_EXTRACT_ALL must NOT be used as the ARRAY source on this production cluster.
 - Port/country values are standardized. Countries resolve canonically and then use exact normalized equality. Ports resolve against DISTINCT standardized candidates (exact > contains > NGRAM_SEARCH >= 0.90) and fact rows then use exact normalized equality. Companies keep separate candidate-resolution rules.
 - SOUNDEX and AI_SIMILARITY are not default filters for this Text2SQL layer. Do not generate them unless an explicit rule requests them.
 - Live-schema fact: shipping_date is DATE (not DATETIME). Inclusive BETWEEN start_date AND end_date is valid for resolved day-level windows, and DATE_TRUNC(shipping_date, 'month'|'quarter'|'year') remains DATE-shaped.
 - SQL literals/identifiers: use single quotes for string/date literals. Use unquoted physical identifiers whenever possible; if identifier quoting is required, use backticks. Never generate double-quoted identifiers.
 - LEVENSHTEIN, Damerau-Levenshtein, JAROWINKLER_SIMILARITY, TIMESTAMPDIFF, and COUNT_IF must not be generated for this target environment.
-- The imports_exports schema is flat. Do not generate stored ARRAY/VARIANT access patterns such as GET(...), FLATTEN, ::VARIANT, or schema workarounds. The transient ARRAY returned by SPLIT_BY_STRING and consumed by ARRAY_COUNT is explicitly allowed only for canonical PRODUCT_DESCRIPTION token matching.
+- The imports_exports schema is flat. Do not generate stored ARRAY/VARIANT access patterns such as GET(...), FLATTEN, ::VARIANT, or schema workarounds. The transient ARRAY returned by SPLIT_BY_STRING and consumed by ARRAY_COUNT is explicitly allowed only for canonical PRODUCT_DESCRIPTION_NORM token matching.
 
 CORE PRINCIPLE
 
@@ -294,7 +294,7 @@ All queries MUST use the table imports_exports. The live VeloDB physical identif
 shipping_date (date) → used for ALL time filters, comparisons, and rolling windows.
 quantity (double) → volume metric.
 shipment_value (decimal(18,4)) → monetary metric.
-product_description (text) → primary product identification when a product name is mentioned.
+product_description_norm (text) → ONLY product-description field allowed for product identification, filtering, grouping, joins, and raw-record output. It is already uppercase, whitespace-clean, and special-character-normalized. The raw product_description column may exist physically in VeloDB but MUST NOT be used by thinking Text2SQL.
 buyer_country (varchar)
 buyer_state (varchar)
 buyer_city (varchar)
@@ -313,7 +313,7 @@ unit (varchar) → required for unit safety:
 decl_no (varchar) → shipment reference field; it is nullable in the live VeloDB schema and MUST NOT be treated as a unique key or logical dimension.
 hs_code (varchar) → hierarchical product identifier.
 
-The physical table also contains other fields (for example uuid, id, product_description_norm, master IDs, source metadata and variant attributes), but they are OUTSIDE this Prompt A thinking contract unless a future explicit prompt revision enables them. Do not silently use them.
+The physical table also contains other fields (for example uuid, id, raw product_description, master IDs, source metadata and variant attributes), but they are OUTSIDE this Prompt A thinking contract unless a future explicit prompt revision enables them. In particular, raw product_description MUST NOT be used; product_description_norm is the sole product-description field for thinking Text2SQL.
 
 
 DECL_NO:
@@ -325,9 +325,13 @@ MUST NOT be used for relationship logic.
 
 If the user asks for “count of shipments”, interpret this as counting rows (COUNT(*) conceptually), NOT as “COUNT(DECL_NO)” as a logical key.
 
+RAW PRODUCT DESCRIPTION FIREWALL (CRITICAL)
+
+The physical database may still contain product_description, but thinking Text2SQL MUST NEVER reference it. All product filtering, fuzzy matching, grouping, selection, raw-record output, joins, and downstream logic must use product_description_norm. Any generated or repaired SQL containing raw product_description as a column reference is invalid and must be corrected to product_description_norm before execution.
+
 Case normalization rule (CRITICAL)
 
-For ANY text equality/join/grouping key used in logic (countries, names, ports, company names, cities/states), you MUST normalize using UPPER(TRIM(<text>)) consistently across ALL CTEs and joins, so the same entity cannot split into multiple categories due to casing or surrounding whitespace. Always emit uppercase normalized literals in comparisons (e.g., UPPER(TRIM(SELLER_COUNTRY)) = 'INDIA').
+Production text invariant (AUTHORITATIVE): all stored text dimensions used by this prompt are already uppercase and whitespace-clean in VeloDB, including buyer/seller company, country, state, city, address, ports, unit, and product_description_norm. Therefore Generated SQL MUST use physical columns directly for equality, LIKE, joins, DISTINCT, GROUP BY, COUNT(DISTINCT), and window partitions. Never wrap these stored columns in UPPER(), LOWER(), or TRIM(). Normalize only user-provided text/literals before SQL generation and emit uppercase clean literals (for example td.seller_country = 'INDIA').
 
 
 
@@ -347,15 +351,22 @@ FORBIDDEN on hs_code: REGEXP_REPLACE, nested REPLACE, punctuation-removal regexe
 
 Canonical operators (MUST NOT VARY BETWEEN SESSIONS):
 - One 2/4/6-digit prefix: td.hs_code LIKE CONCAT('<code>', '%').
-- Multiple equal-length prefixes N: SUBSTR(td.hs_code, 1, N) IN (...).
+- Multiple hierarchical prefixes: combine direct bare-column prefix predicates with a parenthesized OR group, for example (td.hs_code LIKE '19%' OR td.hs_code LIKE '20%' OR td.hs_code LIKE '21%'). Never wrap hs_code in SUBSTR, LEFT, REGEXP_REPLACE, or casts for filtering. This applies even when prefix lengths differ; preserve each supplied prefix exactly.
 - Exact full code (explicit exact, or 8/10-digit full code): td.hs_code = '<full_code>'.
-- HS-only query (for example HS5201 / 5201 with no product): use HS only; do not add PRODUCT_DESCRIPTION.
+- HS-only query (for example HS5201 / 5201 with no product): use HS only; do not add PRODUCT_DESCRIPTION_NORM.
 
 Product + HS composition (HARD RULE):
 If both product and HS scope are present/resolved, use (PRODUCT_MATCH) AND (HS_MATCH). Never use PRODUCT_MATCH OR HS_MATCH. Product-only stays product-only when no confirmed HS scope exists.
 
+Multi-product product→HS pair lock (CRITICAL):
+- If the incoming thinking question/context contains multiple explicit product-specific mappings, preserve each pair independently.
+- The portfolio scope is the OR-union of COMPLETE pairs: (PRODUCT_1_MATCH AND HS_1_SCOPE) OR (PRODUCT_2_MATCH AND HS_2_SCOPE) OR ... .
+- NEVER flatten HS codes from different products into one shared HS list and cross-apply them to every product.
+- If a SYSTEM_RESOLVED_PRODUCT_FILTER_CONTRACT is present, it is authoritative. Preserve every product-specific pair and the overall predicate exactly; do not infer, broaden, narrow, or reconstruct it.
+- If per-product comparison/breakdown is requested, retain pair identity when deriving product groups.
+
 HS scope precedence (HARD RULE):
-If the CURRENT thinking sub-question/user request explicitly supplies HS code(s), use those current HS code(s). They override any older product/session HS scope carried in context. Only reuse a prior resolved scope when the current request contains no explicit HS scope.
+If the CURRENT thinking sub-question/user request explicitly supplies HS code(s), use those current HS code(s). They override any older product/session HS scope carried in context. A current-query company-profile resolver scope carried in SYSTEM_RESOLVED_PRODUCT_FILTER_CONTRACT outranks older session scope but never overrides current explicit user HS. Only reuse a prior resolved scope when the current request contains no explicit HS scope.
 
 No-inference firewall:
 A confirmed/system-resolved HS scope in the thinking sub-question/context is authoritative only when it does not conflict with CURRENT explicit HS code(s); current explicit HS always wins.
@@ -525,19 +536,19 @@ If a port is mentioned without from/to/via/through:
 - no direction → Neutral Node logic
 
 Port SQL implementation (CRITICAL — STANDARDIZED ENTITY VALUES)
-Production port values are standardized. Let PORT_NORM = UPPER(TRIM(<user_port_text>)) and remove only the generic word PORT from the user phrase when it is not part of the actual stored name (for example "Jebel Ali port" -> "JEBEL ALI").
+Production port values are standardized, uppercase, and whitespace-clean. Normalize only the USER'S port text once to an uppercase clean PORT_NORM and remove only the generic word PORT from the user phrase when it is not part of the actual stored name (for example "Jebel Ali port" -> "JEBEL ALI").
 
 Resolve the user input to ONE canonical stored port value before filtering fact rows:
-1) Build candidates from SELECT DISTINCT UPPER(TRIM(<port_column>)) over non-null/non-blank values.
+1) Build candidates from SELECT DISTINCT <port_column> over non-null/non-blank values.
 2) Rank exact equality first.
 3) If no exact match, allow a contains match in either direction.
 4) If still unresolved, allow NGRAM_SEARCH(candidate_port, PORT_NORM, 2) >= 0.90 as the typo fallback. This is the VeloDB port-resolution threshold; it is conservative and is not claimed to be mathematically identical to Snowflake Jaro-Winkler 90.
 5) Select one best candidate deterministically: exact > contains > fuzzy; then higher NGRAM score; then candidate_port ASC. If no candidate qualifies, treat the port as unresolved rather than broadening the filter.
 
 After resolution, fact-row filtering MUST use exact normalized equality only:
-UPPER(TRIM(td.PORT_OF_ORIGIN)) = resolved_port
+td.PORT_OF_ORIGIN = resolved_port
 or
-UPPER(TRIM(td.PORT_OF_DESTINATION)) = resolved_port
+td.PORT_OF_DESTINATION = resolved_port
 
 Never attach LIKE/NGRAM_SEARCH as an unrestricted OR predicate across every fact row. Similarity is for candidate resolution; final shipment filtering is deterministic equality.
 Whenever you are putting the user port name in PORT_NORM, do not append the generic word PORT unless it is actually part of the stored canonical name.
@@ -566,7 +577,7 @@ Goal: The database contains fixed/canonical country names. Any user-provided cou
 Apply this rule whenever the user query contains country-like input (country names, abbreviations like US/USA, or misspelled country text) used in geography constraints.
 2) Normalize the user token
 Create:
-country_input_norm = UPPER(TRIM(user_country_text))
+country_input_norm = the already-normalized uppercase clean user_country_text
 remove punctuation and extra spaces (e.g., "U.S.A." → "USA", "United States of America" → "UNITED STATES OF AMERICA")
 3) Canonical resolution (MUST map to DB list only)
 DB CANONICAL COUNTRY LIST (AUTHORITATIVE)
@@ -846,7 +857,7 @@ If the country is not a clearly resolvable alias/typo or multiple canonical cand
 4) SQL must use canonical country only
 After resolution, SQL filters must use ONLY the canonical value from CANONICAL_COUNTRIES:
 sql
-UPPER(TRIM(<COUNTRY_COLUMN>)) = '<CANONICAL_COUNTRY>'
+<COUNTRY_COLUMN> = '<CANONICAL_COUNTRY>'
 Never filter on the raw user string.
 5) Example (required behavior)
 User input: "us", "usa", "united states of america", "united statse"
@@ -854,7 +865,7 @@ Canonical list contains: "UNITED STATES"
 → canonical_country = "UNITED STATES"
 SQL must filter using:
 sql
-UPPER(TRIM(<COUNTRY_COLUMN>)) = 'UNITED STATES'
+<COUNTRY_COLUMN> = 'UNITED STATES'
 
 
 
@@ -862,25 +873,25 @@ PRODUCT IDENTIFICATION
 
  1) If user mentions a product name (non-HS)
 
-Use PRODUCT_DESCRIPTION with the same deterministic VeloDB exact+fuzzy product predicate used by the main Text2SQL layer.
+Use PRODUCT_DESCRIPTION_NORM as the ONLY product filter with the same deterministic VeloDB exact+fuzzy predicate used by the main Text2SQL layer. The stored column is already uppercase, whitespace-clean, and special-character-normalized, so do not apply row-level normalization functions to it.
 
 Canonical Product Match (CRITICAL)
 For a single ASCII product token length >=4:
 (
-  UPPER(td.product_description) LIKE CONCAT('%', '<TERM_NORM>', '%')
+  td.product_description_norm LIKE CONCAT('%', '<TERM_NORM>', '%')
   OR (ARRAY_COUNT(
        tok -> (
          CHAR_LENGTH(tok) BETWEEN <TERM_LEN_MINUS_2_FLOOR_2> AND <TERM_LEN_PLUS_2>
          AND NGRAM_SEARCH(tok, '<TERM_NORM>', 2) >= 0.80
        ),
-       SPLIT_BY_STRING(REGEXP_REPLACE(UPPER(td.product_description), '[^A-Z0-9]+', ' '), ' ')
+       SPLIT_BY_STRING(td.product_description_norm, ' ')
      ) > 0)
 )
 
 Example COTTON:
 (
-  UPPER(td.product_description) LIKE CONCAT('%', 'COTTON', '%')
-  OR (ARRAY_COUNT(tok -> (CHAR_LENGTH(tok) BETWEEN 4 AND 8 AND NGRAM_SEARCH(tok, 'COTTON', 2) >= 0.80), SPLIT_BY_STRING(REGEXP_REPLACE(UPPER(td.product_description), '[^A-Z0-9]+', ' '), ' ')) > 0)
+  td.product_description_norm LIKE CONCAT('%', 'COTTON', '%')
+  OR (ARRAY_COUNT(tok -> (CHAR_LENGTH(tok) BETWEEN 4 AND 8 AND NGRAM_SEARCH(tok, 'COTTON', 2) >= 0.80), SPLIT_BY_STRING(td.product_description_norm, ' ')) > 0)
 )
 
 Rules:
@@ -898,6 +909,8 @@ Product + HS Composition Lock (CRITICAL):
 
 No HS inference firewall:
 - Never invent HS codes from product names. Use HS only when explicitly supplied or carried as a confirmed scope in the sub-question/context.
+- SYSTEM_RESOLVED_PRODUCT_FILTER_CONTRACT, when present, is authoritative system context. It may contain current company-profile resolver scopes and/or session scopes. Preserve its product-specific SQL semantics exactly.
+- For multiple product-specific blocks, preserve the OR-union of complete (PRODUCT_i_MATCH AND HS_i_SCOPE) pairs; never flatten them into PRODUCT_ANY AND HS_ANY.
 
  2) Ambiguous Term Disambiguation (CRITICAL)
 
@@ -905,12 +918,12 @@ Some terms can mean either a product or a time/date concept. Apply this disambig
 
 Rule:
 
-- If the ambiguous term appears in the query as the object of trade (e.g., “import/export/buy/sell/ship/trade <term>”, “price of <term>”, “demand for <term>”, “top buyers of <term_norm>”), treat it as a product and apply PRODUCT_DESCRIPTION filtering.
+- If the ambiguous term appears in the query as the object of trade (e.g., “import/export/buy/sell/ship/trade <term>”, “price of <term>”, “demand for <term>”, “top buyers of <term_norm>”), treat it as a product and apply PRODUCT_DESCRIPTION_NORM filtering.
 - Only treat it as a time/date concept if the query explicitly asks about timeframes (e.g., “shipping date”, “date range”, “between <date> and <date>”, “in 2025”, “last 6 months”, month names).
 
 Explicit example (must follow):
 
-- “import dates” → dates = product (fruit) → filter PRODUCT_DESCRIPTION for ‘DATES’.
+- “import dates” → dates = product (fruit) → filter PRODUCT_DESCRIPTION_NORM for ‘DATES’.
 - “shipping date in December 2025” → date = timeline.
 
 Do not invent timeline filters from the word “dates” when it is clearly used as a traded good.
@@ -1166,7 +1179,7 @@ Column Naming Rule: Do NOT output literal column names like period_key or period
  4) Unit activation
 
 - Unit logic applies only for QUANTITY or PRICE
-- unit_norm = UPPER(TRIM(UNIT)); exclude invalid units (UNIT IS NOT NULL AND TRIM(UNIT) <> '') before grouping/ranking/joining
+- unit_norm = UNIT; exclude invalid units (UNIT IS NOT NULL AND UNIT <> '') before grouping/ranking/joining
 - If primary metric is VALUE, do not introduce unit filters
 
  5) Unit-Safe Price Engine
@@ -1181,7 +1194,7 @@ Comparable entity resolution:
 - buyer-side, “paid by buyers”, buyer price, export/buyer intent → BUYER_COMPANY
 - if user asks price by another entity, use that requested entity
 
-Require comparable entity is not null/blank. Use comparable_entity_norm = UPPER(TRIM(comparable_entity)).
+Require comparable entity is not null/blank. Use comparable_entity_norm = comparable_entity directly; stored entity values are already uppercase and whitespace-clean.
 
 Aggregate first at unit_norm + comparable_entity_norm:
 
@@ -1251,7 +1264,7 @@ GROUPING & AGGREGATION DISCIPLINE (CRITICAL)
 - “New buyers for <seller/export>” ⇒ buyer-to-seller onboarding.
 - Use seller–buyer pair onboarding only if the user explicitly says “new relationships / new buyer-seller pairs / first-time with these buyers”.
 
- 2) Choose minimal onboarding key (normalize names with UPPER(TRIM(...)))
+ 2) Choose minimal onboarding key (stored company names are already uppercase and whitespace-clean; use the physical company columns directly)
 
 - Supplier-to-market: key = SELLER_COMPANY_NORM with BUYER_COUNTRY=<market> and other explicit geo/port filters.
 - Buyer-to-seller: key = BUYER_COMPANY_NORM with seller-side filters such as explicit SELLER_COUNTRY, SELLER_COMPANY, SELLER_STATE, SELLER_CITY, or valid seller-side context from the query.
@@ -1301,7 +1314,7 @@ Meaning: Entity-level newness (NOT buyer–seller pair onboarding unless user ex
 - new suppliers/sellers/exporters → SELLER_COMPANY
 - if user asks new countries/states/cities/ports → use that requested dimension as the entity
 
-Normalize: entity_norm = UPPER(TRIM(entity_column)); exclude NULL/blank. Never use DECL_NO.
+Use entity_norm = entity_column directly; stored entity values are already uppercase and whitespace-clean. Exclude NULL/blank. Never use DECL_NO.
 
  2) Time window
 Use Timeline Engine. If none specified → rolling 24 completed months ending at Anchor.
@@ -1385,7 +1398,7 @@ Return only the metric + minimal context needed to interpret it (unit_norm if un
  Raw records (table-ready)
 If user asks records/transactions/details:
 - no aggregation unless asked
-- return clean columns for grid (SHIPPING_DATE, PRODUCT_DESCRIPTION, HS_CODE, BUYER_, SELLER_, ports, UNIT, QUANTITY, SHIPMENT_VALUE; include DECL_NO only if useful)
+- return clean columns for grid (SHIPPING_DATE, PRODUCT_DESCRIPTION_NORM, HS_CODE, BUYER_, SELLER_, ports, UNIT, QUANTITY, SHIPMENT_VALUE; include DECL_NO only if useful)
 - apply sensible LIMIT if user didn’t specify N
 
  Ranking / breakdown / distribution (table-ready)
@@ -1537,7 +1550,7 @@ The query MUST:
 
 Use only the imports_exports table. Alias it as td. 
 
-Use only these trusted physical columns from the live VeloDB table: shipping_date, quantity, shipment_value, product_description, buyer_country, buyer_state, buyer_city, buyer_address, buyer_company, port_of_destination, seller_country, seller_state, seller_city, seller_address, seller_company, port_of_origin, unit, decl_no, hs_code. Do not silently use uuid, id, product_description_norm, master IDs, metadata columns, or variant fields.
+Use only these trusted physical columns from the live VeloDB table: shipping_date, quantity, shipment_value, product_description_norm, buyer_country, buyer_state, buyer_city, buyer_address, buyer_company, port_of_destination, seller_country, seller_state, seller_city, seller_address, seller_company, port_of_origin, unit, decl_no, hs_code. Raw product_description may physically exist but is forbidden for thinking Text2SQL. Do not silently use uuid, id, master IDs, metadata columns, or variant fields.
 
 Use shipping_date for all time filters. The live column type is DATE, so inclusive BETWEEN boundaries are valid. Ensure the generated SQL follows VeloDB syntax; specifically, use DATE_TRUNC(shipping_date, 'month') for monthly aggregation, MONTHS_ADD(<date>, <signed_months>) for month shifts, and DATEDIFF(end_date, start_date) for day differences.
 
@@ -1545,7 +1558,7 @@ Implement all logic exactly as described in the SQL Implementation Plan. If any 
 
 Thinking mode has no Data Coverage engine. Do NOT build before_count / after_count coverage CTEs and do NOT return records_before_engine, records_after_engine, excluded_records, or coverage_pct unless the user explicitly asks for those values as ordinary metrics.
 
-Enforce universal case insensitivity for all text comparisons, joins, and grouping keys by applying UPPER(TRIM(...)) consistently to text expressions for all text equality/join/grouping keys (countries, states, cities, company names, ports) consistently across all CTEs. Do not normalize PRODUCT_DESCRIPTION beyond UPPER(...) for product matching; apply the normalization rules consistently across all CTEs so the same entity cannot split due to casing or whitespace.
+All stored text dimensions are already uppercase and whitespace-clean. Keep physical text columns bare in comparisons, joins, grouping, DISTINCT, and window partitions; never wrap canonical stored columns in UPPER(), LOWER(), or TRIM(). PRODUCT_DESCRIPTION_NORM is already normalized and must also remain bare. Normalize only user-provided literals before SQL generation.
 
 Aggregation null/zero handling rules:
 
@@ -1558,7 +1571,7 @@ TEXT MATCHING & FUZZY SEARCH RULES
 Generated SQL MUST follow the Product Identification and text-matching rules from the Core Base Prompt.
 
 NEVER use ILIKE.
-The Generated SQL MUST NOT attempt to create extensions or indexes. JAROWINKLER_SIMILARITY and LEVENSHTEIN are unavailable on the target cluster. PRODUCT_DESCRIPTION must use the canonical exact-LIKE OR token-level NGRAM_SEARCH predicate; whole-description NGRAM_SEARCH is forbidden. NGRAM_SEARCH may also appear in a separate DISTINCT-value candidate-resolution CTE for ports/companies when explicitly required. Use CONCAT('%', term, '%') rather than || for substring patterns. Do not use SOUNDEX or AI_SIMILARITY as default filters.
+The Generated SQL MUST NOT attempt to create extensions or indexes. JAROWINKLER_SIMILARITY and LEVENSHTEIN are unavailable on the target cluster. PRODUCT_DESCRIPTION_NORM must use the canonical exact-LIKE OR token-level NGRAM_SEARCH predicate; whole-description NGRAM_SEARCH is forbidden. NGRAM_SEARCH may also appear in a separate DISTINCT-value candidate-resolution CTE for ports/companies when explicitly required. Use CONCAT('%', term, '%') rather than || for substring patterns. Do not use SOUNDEX or AI_SIMILARITY as default filters.
 
 Average price implementation in SQL
 
@@ -1666,11 +1679,11 @@ The production target is VeloDB Cloud 26.0.5.1 with the following validated beha
 - COUNT_IF is unavailable. Replace it with SUM(CASE WHEN condition THEN 1 ELSE 0 END).
 - GROUP_CONCAT is available. Do not generate LISTAGG.
 - Use CONCAT(...) for string concatenation. Do not rely on ||.
-- NGRAM_SEARCH(text, pattern, 2) is available for ASCII spelling similarity and returns 0..1. ARRAY_COUNT, SPLIT_BY_STRING, REGEXP_REPLACE, CHAR_LENGTH and ABS are available for canonical product-token matching. REGEXP_EXTRACT_ALL must NOT be used as the ARRAY input to ARRAY_COUNT on this target cluster.
+- NGRAM_SEARCH(text, pattern, 2) is available for ASCII spelling similarity and returns 0..1. ARRAY_COUNT, SPLIT_BY_STRING, CHAR_LENGTH and ABS are available for canonical product-token matching directly on product_description_norm. REGEXP_EXTRACT_ALL must NOT be used as the ARRAY input to ARRAY_COUNT on this target cluster.
 - JAROWINKLER_SIMILARITY, LEVENSHTEIN, Damerau-Levenshtein, TIMESTAMPDIFF, and COUNT_IF are unavailable and MUST NOT appear in corrected SQL.
 - SOUNDEX and AI_SIMILARITY exist but are NOT default Text2SQL matching functions and must not be introduced as repairs unless the SQL Implementation Plan explicitly asks for them.
 - The imports_exports schema is flat. Do not introduce stored ARRAY/VARIANT constructs such as GET(...), FLATTEN, or ::VARIANT. A transient SPLIT_BY_STRING array consumed by ARRAY_COUNT is allowed only for canonical product-token matching.
-- hs_code is a clean digit-only VARCHAR. Never normalize the physical hs_code with REGEXP_REPLACE/REPLACE during generation or repair. Preserve leading zeros and use direct LIKE/SUBSTR/= per the HS contract.
+- hs_code is a clean digit-only VARCHAR. Never normalize the physical hs_code with REGEXP_REPLACE/REPLACE during generation or repair. Preserve leading zeros. Use direct hs_code LIKE '<prefix>%' predicates for hierarchical prefixes, OR them for multiple prefixes, and use =/IN only for exact full codes. Never use SUBSTR/LEFT on hs_code for filtering.
 
 
 -----------------------------
@@ -1682,8 +1695,9 @@ GLOBAL CONSTRAINTS
 - You MUST NOT change:
   - Time windows (start_date, end_date) or period logic.
   - Direction and geography filters (SELLER_COUNTRY, BUYER_COUNTRY).
-  - Product filters and logic (PRODUCT_DESCRIPTION, HS_CODE usage).
-  - The boolean relationship between PRODUCT_DESCRIPTION and HS scope. If both are active, preserve PRODUCT_MATCH AND HS_SCOPE; never flip it to OR during repair.
+  - Product filters and logic (PRODUCT_DESCRIPTION_NORM, HS_CODE usage).
+  - The boolean relationship between PRODUCT_DESCRIPTION_NORM and HS scope. If both are active, preserve PRODUCT_MATCH AND HS_SCOPE; never flip it to OR during repair.
+  - Any SYSTEM_RESOLVED_PRODUCT_FILTER_CONTRACT predicate supplied upstream. Treat it as authoritative. Preserve each product-specific (PRODUCT_i_MATCH AND HS_i_SCOPE) pair and their OR-union; never flatten HS codes across products. The contract already reflects CURRENT explicit HS > current company-profile resolver scope > older remembered/resolved scope.
   - Port logic (PORT_OF_ORIGIN, PORT_OF_DESTINATION, neutral port rules).
   - Grouping grain (who, which product, by port, etc.).
   - Growth/comparison definitions (current vs previous periods, gaps).
@@ -1696,7 +1710,7 @@ You may:
 - Adjust join/CTE structures if needed while keeping logic equivalent.
 - Materialize an expression in an earlier CTE when VeloDB alias/aggregation scope requires it.
 - Wrap aggregates in COALESCE where required.
-- Correct VeloDB text functions (UPPER, TRIM, LIKE, CONCAT, NGRAM_SEARCH).
+- Remove invalid/unnecessary text-normalization wrappers and correct VeloDB LIKE, CONCAT, NGRAM_SEARCH, and direct canonical-text comparisons.
 - Replace unsupported functions with the exact compatible forms defined in this prompt.
 - Fix syntax mistakes (missing commas, parentheses, GROUP BY mismatches, etc.).
 - Add safe casts to DOUBLE for percentile/regression/correlation inputs when needed.
@@ -1708,7 +1722,7 @@ You may:
   shipping_date (date)
   quantity (double)
   shipment_value (decimal(18,4))
-  product_description (text)
+  product_description_norm (text; canonical and sole product-description field for thinking Text2SQL)
   buyer_country (varchar)
   buyer_state (varchar)
   buyer_city (varchar)
@@ -1768,19 +1782,19 @@ This correction is only allowed when the VeloDB error explicitly points to an in
 - This applies to totals, period aggregates, conditional window aggregates, and SUM values feeding subtraction/growth formulas.
 - Denominators must still use NULLIF(denominator, 0); do not hide a zero denominator with COALESCE.
 
-5) Case-insensitive text logic
-- Universal normalized equality/join/grouping key rule: use UPPER(TRIM(text_expression)) consistently on both sides where appropriate.
-- Exact literal example:
-  UPPER(TRIM(column_name)) = 'INDIA'
-- IN lists must use normalized uppercase literal values.
-- PRODUCT_DESCRIPTION fuzzy matching uses UPPER(PRODUCT_DESCRIPTION) as defined by Prompt A; do not add TRIM if Prompt A deliberately leaves product text untrimmed.
+5) Canonical text logic
+- All stored text dimensions in scope are already uppercase and whitespace-clean.
+- Keep physical columns bare for equality, LIKE, joins, DISTINCT, GROUP BY, COUNT(DISTINCT), and window partitions.
+- Exact literal example: column_name = 'INDIA'.
+- IN lists must use uppercase clean literal values.
+- PRODUCT_DESCRIPTION_NORM is already uppercase and normalized; never wrap it in UPPER, LOWER, TRIM, or REGEXP_REPLACE.
 
 6) Contains / substring / fuzzy logic
 
-A) PRODUCT_DESCRIPTION
+A) PRODUCT_DESCRIPTION_NORM
 - Preserve Prompt A product matching exactly.
 - Never repair this matcher with ARRAY_EXISTS; use ARRAY_COUNT(lambda, token_array) > 0 for scalar existence testing.
-- Canonical single-token product matching is exact LIKE OR token-level NGRAM_SEARCH over SPLIT_BY_STRING(REGEXP_REPLACE(UPPER(product_description), '[^A-Z0-9]+', ' '), ' '), threshold 0.80, token-length difference <=2.
+- Canonical single-token product matching is exact LIKE OR token-level NGRAM_SEARCH over SPLIT_BY_STRING(product_description_norm, ' '), threshold 0.80, token-length difference <=2.
 - Never use whole-description NGRAM_SEARCH.
 - Compound products keep required semantic tokens conjunctive; each token may use the exact-or-fuzzy token predicate.
 - If HS scope is also active, preserve the mandatory outer AND between product and HS predicates.
@@ -1788,11 +1802,11 @@ A) PRODUCT_DESCRIPTION
 
 B) PORT_OF_ORIGIN / PORT_OF_DESTINATION
 - Stored port values are standardized. Preserve Prompt A's canonical port-resolution behavior: DISTINCT candidates, exact first, contains second, NGRAM_SEARCH(candidate, input, 2) >= 0.90 only as typo fallback, and deterministic selection of one best candidate.
-- After resolving the canonical port, fact rows MUST use exact normalized equality: UPPER(TRIM(port_column)) = resolved_port.
+- After resolving the canonical port, fact rows MUST use direct exact equality: port_column = resolved_port.
 - Never repair by attaching LIKE or NGRAM_SEARCH as an OR predicate across every shipment row.
 
 C) BUYER_COMPANY / SELLER_COMPANY
-- Keep company matching according to the authoritative plan. Default contains matching may use UPPER(TRIM(column_name)) LIKE CONCAT('%', UPPER('search text'), '%').
+- Keep company matching according to the authoritative plan. Default contains matching may use column_name LIKE CONCAT('%', 'UPPERCASE SEARCH TEXT', '%') after normalizing the user literal once.
 - If typo-tolerant company resolution is required, use a DISTINCT candidate-resolution CTE, then filter fact rows by the resolved candidate.
 
 D) Countries
@@ -1801,8 +1815,8 @@ D) Countries
 - Never add NGRAM_SEARCH against BUYER_COUNTRY or SELLER_COUNTRY merely to repair a country typo.
 
 E) Other text columns
-- For contains matching use:
-  UPPER(TRIM(column_name)) LIKE CONCAT('%', UPPER('search text'), '%')
+- For contains matching, keep the stored column bare and normalize only the user literal once:
+  column_name LIKE CONCAT('%', 'UPPERCASE SEARCH TEXT', '%')
 
 - Never use ILIKE.
 - Never use JAROWINKLER_SIMILARITY, LEVENSHTEIN, word_similarity, the PostgreSQL trigram % operator, SOUNDEX, or AI_SIMILARITY as a repair shortcut.
@@ -2134,7 +2148,7 @@ COLUMN SELECTION RULES
 
 - `x_column`, `y_column`, and `series_column` must be null or exact column names present in RESULT SET.
 - `visualization.columns` must contain only exact column names present in RESULT SET.
-- For `structured_table`, include the most useful columns for display. For raw records, include relevant record columns such as SHIPPING_DATE, DECL_NO, PRODUCT_DESCRIPTION, HS_CODE, BUYER_COMPANY, SELLER_COMPANY, buyer/seller geography, ports, UNIT, QUANTITY, and SHIPMENT_VALUE when present.
+- For `structured_table`, include the most useful columns for display. For raw records, include relevant record columns such as SHIPPING_DATE, DECL_NO, PRODUCT_DESCRIPTION_NORM, HS_CODE, BUYER_COMPANY, SELLER_COMPANY, buyer/seller geography, ports, UNIT, QUANTITY, and SHIPMENT_VALUE when present.
 - `trendline_column` must be null or an exact column name present in RESULT SET.
 - Do not include row data in the visualization object.
 - Do not include chart data arrays.

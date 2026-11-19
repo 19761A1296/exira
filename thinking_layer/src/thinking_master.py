@@ -286,7 +286,9 @@ def run_step(n: int, decision: Dict[str, Any]) -> Dict[str, Any]:
         if tagged["tool"] == TOOL_WEB:
             result = _from_web(thinking_webtool.run(sub_q))
         else:
-            result = _from_text2sql(run_text2sql(sub_q))
+            upper_q = (sub_q or "").upper()
+            print(f"[THINKING TEXT2SQL] {upper_q}")
+            result = _from_text2sql(run_text2sql(upper_q))
     except Exception as exc:                      # both tools are no-raise; this is a last guard
         result = {"status": STATUS_FAILED, "response": "", "sql": "", "rows": [], "cols": [],
                   "visualization": {}, "citations": [], "error": f"{type(exc).__name__}: {exc}"}
