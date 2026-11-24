@@ -4366,10 +4366,6 @@ def render_thinking(trace: dict):
 
                     st.write(step["response"])
 
-                if step.get("citations"):
-
-                    st.caption("Sources: " + " · ".join(step["citations"]))
-
                 if step.get("error"):
 
                     st.caption(f"Error: {step['error']}")
@@ -4379,10 +4375,6 @@ def render_thinking(trace: dict):
             if res.get("stopped_reason"):
 
                 st.caption(f"Stopped: {res['stopped_reason']}")
-
-            if res.get("sources"):
-
-                st.caption("All sources: " + " · ".join(res["sources"]))
 
 
 def render_node_details(trace: dict):

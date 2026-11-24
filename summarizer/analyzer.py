@@ -71,6 +71,102 @@ def _needs_business_identity_resolution(message: str) -> bool:
     return bool(BUSINESS_SELF_REFERENCE_RE.search(message or ""))
 
 
+_FRESH_DISCOVERY_RE = re.compile(
+    r"(?i)\b(?:my|our)\s+(?:strongest|leading|top|biggest|largest|highest(?:[- ]value)?)\s+"
+    r"(?:export\s+|import\s+)?(?:product|market)\b"
+)
+
+_EXPLICIT_BACK_REFERENCE_RE = re.compile(
+    r"(?i)\b(?:that|same|this|previous(?:ly)?|earlier|identified\s+earlier|mentioned\s+earlier|as\s+before|above)\b"
+)
+
+_EXPLICIT_HS_IN_MESSAGE_RE = re.compile(r"(?i)\bHS(?:\s+code)?\s*[:#-]?\s*\d{2,18}\b")
+
+
+def _company_name_from_memory(memory: dict) -> str:
+    """Extract the canonical own-company name from the structured company card."""
+    if not isinstance(memory, dict):
+        return ""
+    for key in ("company_name", "company", "user_company"):
+        value = memory.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    card = memory.get("user_product_info")
+    if isinstance(card, dict):
+        value = card.get("company_name")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    if isinstance(card, str) and card.strip():
+        try:
+            parsed = json.loads(card)
+            if isinstance(parsed, dict) and str(parsed.get("company_name") or "").strip():
+                return str(parsed.get("company_name")).strip()
+        except Exception:
+            m = re.search(r'(?im)["\']?company_name["\']?\s*[:=]\s*["\']?([^"\'\n,}]+)', card)
+            if m:
+                return m.group(1).strip()
+    return ""
+
+
+def _is_fresh_superlative_discovery(message: str) -> bool:
+    """True when a superlative product/market phrase asks EXIRA to recompute scope.
+
+    Phrases such as "my strongest export product" are lookup instructions, not
+    backward references to a product/HS from conversation history.  Only an explicit
+    backward marker (same/that/earlier/etc.) or an HS stated in the current message
+    disables this guard.
+    """
+    text = message or ""
+    return bool(
+        _FRESH_DISCOVERY_RE.search(text)
+        and not _EXPLICIT_BACK_REFERENCE_RE.search(text)
+        and not _EXPLICIT_HS_IN_MESSAGE_RE.search(text)
+    )
+
+
+def _ground_discovery_company_identity(message: str, company_name: str) -> str:
+    """Ground first-person discovery phrases without importing old product/HS scope."""
+    if not company_name:
+        return " ".join((message or "").split())
+    possessive = f"{company_name}'s"
+    text = str(message or "")
+    # Target only business-discovery possessives used by this deterministic guard.
+    text = re.sub(
+        r"(?i)\b(?:my|our)\s+(?=(?:strongest|leading|top|biggest|largest|highest(?:[- ]value)?)\s+(?:export\s+|import\s+)?(?:product|market)\b)",
+        possessive + " ",
+        text,
+    )
+    return " ".join(text.split())
+
+
+def _enforce_fresh_discovery_scope(result: dict, message: str, memory: dict) -> dict:
+    """Prevent conversation history from resolving a fresh superlative lookup.
+
+    This is a deterministic post-model guard.  If the current message asks for "my
+    strongest/leading/top ... product/market" without an explicit backward reference,
+    the database must determine that entity again.  Prior HS/product scope must not be
+    injected just because it appeared in conversation history.
+    """
+    if not isinstance(result, dict) or result.get("relation") != "NEW_INTENT":
+        return result
+    if not _is_fresh_superlative_discovery(message):
+        return result
+
+    result = dict(result)
+    result["resolved_query"] = _ground_discovery_company_identity(
+        message, _company_name_from_memory(memory or {})
+    )
+    carried = dict(result.get("carried_context") or {})
+    carried["entities"] = []
+    carried["resolved_by_this_turn"] = None
+    result["carried_context"] = carried
+    note = str(result.get("notes") or "").strip()
+    guard_note = "Fresh superlative product/market wording preserved as a database lookup; prior product/HS scope was not inherited."
+    result["notes"] = f"{note} {guard_note}".strip()
+    return result
+
+
 PROMPT_ANALYZER = """ROLE
  
 You are the Query Resolution Analyzer that sits between the user and Exira, a
@@ -264,6 +360,14 @@ CORE PRINCIPLES
    for Exira to resolve from the database, not something for you to guess. Pass
    it through as an instruction: "for the product the user imports most by
    volume". Never invent an HS code, product, country or figure.
+
+4A. SUPERLATIVE DISCOVERY LOCK — CRITICAL. Phrases such as "my strongest export
+   product", "my leading product", "my top import product", or "my largest export
+   market" are database lookup instructions, not backward references. Do NOT replace
+   them with a product, HS code, or market merely because one appeared earlier in the
+   conversation. Reuse an earlier concrete entity only when the CURRENT message makes
+   the backward reference explicit with wording such as "that", "same", "previous",
+   "earlier", or "the product identified above".
  
 5. Sticky vs non-sticky context. Entity filters (product, country, supplier,
    period, direction) stick until the user changes them. A deliverable does not
@@ -1039,7 +1143,9 @@ def resolve_query(message: str, history: list = None, memory: dict = None) -> di
                   choice.get("finish_reason"))
             return _log(message, passthrough(message, "empty model reply"))
 
-        return _log(message, _normalize(json.loads(content), message))
+        normalized = _normalize(json.loads(content), message)
+        normalized = _enforce_fresh_discovery_scope(normalized, message, memory or {})
+        return _log(message, normalized)
 
     except json.JSONDecodeError:
         print("resolve_query: reply was not JSON")

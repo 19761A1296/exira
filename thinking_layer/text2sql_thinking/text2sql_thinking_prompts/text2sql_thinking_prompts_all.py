@@ -352,7 +352,7 @@ FORBIDDEN on hs_code: REGEXP_REPLACE, nested REPLACE, punctuation-removal regexe
 Canonical operators (MUST NOT VARY BETWEEN SESSIONS):
 - One 2/4/6-digit prefix: td.hs_code LIKE CONCAT('<code>', '%').
 - Multiple hierarchical prefixes: combine direct bare-column prefix predicates with a parenthesized OR group, for example (td.hs_code LIKE '19%' OR td.hs_code LIKE '20%' OR td.hs_code LIKE '21%'). Never wrap hs_code in SUBSTR, LEFT, REGEXP_REPLACE, or casts for filtering. This applies even when prefix lengths differ; preserve each supplied prefix exactly.
-- Exact full code (explicit exact, or 8/10-digit full code): td.hs_code = '<full_code>'.
+- Any supplied HS digit string, including 8/10/12+ digit national extensions, is a prefix by default: td.hs_code LIKE '<code>%'. Use equality only when the CURRENT user explicitly requests exact HS / exact HS code. Never infer exactness from length.
 - HS-only query (for example HS5201 / 5201 with no product): use HS only; do not add PRODUCT_DESCRIPTION_NORM.
 
 Product + HS composition (HARD RULE):
@@ -367,6 +367,12 @@ Multi-product product→HS pair lock (CRITICAL):
 
 HS scope precedence (HARD RULE):
 If the CURRENT thinking sub-question/user request explicitly supplies HS code(s), use those current HS code(s). They override any older product/session HS scope carried in context. A current-query company-profile resolver scope carried in SYSTEM_RESOLVED_PRODUCT_FILTER_CONTRACT outranks older session scope but never overrides current explicit user HS. Only reuse a prior resolved scope when the current request contains no explicit HS scope.
+
+SYSTEM_RESOLVED_HS_INPUT_CONTRACT (CRITICAL):
+- When present, this runtime contract is authoritative for parsing the CURRENT user's HS text, including chapter wording, ranges, dotted/spaced formatting, and 12+ digit extensions.
+- Preserve each original HS mention's grammatical product association. Never flatten HS codes from separate product mentions into one shared list.
+- A code listed in the contract is a prefix by default regardless of length. Equality is allowed only when the contract marks the code as Exact because the user explicitly requested exact HS / exact HS code.
+- If one wording explicitly shares a scope, such as "coffee and tea in HS 09", both products may use that shared HS scope.
 
 No-inference firewall:
 A confirmed/system-resolved HS scope in the thinking sub-question/context is authoritative only when it does not conflict with CURRENT explicit HS code(s); current explicit HS always wins.
@@ -870,6 +876,17 @@ sql
 
 
 PRODUCT IDENTIFICATION
+
+Generic product references are NOT product names (CRITICAL):
+- Phrases such as "leading export product", "top product", "this product", "that product",
+  "the product", "selected product", "previous product", and "product identified in q1"
+  are references/instructions, not PRODUCT_DESCRIPTION_NORM literals.
+- Never generate a product-description predicate from those phrases.
+- If such a reference is accompanied by an explicit HS code but no concrete product name,
+  use the HS scope only.
+- Open product-discovery/ranking questions such as "which is my leading export product?"
+  must discover/rank products from shipment records; do not apply a product-description
+  filter merely because the words "leading export product" appear in the question.
 
  1) If user mentions a product name (non-HS)
 
@@ -1683,7 +1700,7 @@ The production target is VeloDB Cloud 26.0.5.1 with the following validated beha
 - JAROWINKLER_SIMILARITY, LEVENSHTEIN, Damerau-Levenshtein, TIMESTAMPDIFF, and COUNT_IF are unavailable and MUST NOT appear in corrected SQL.
 - SOUNDEX and AI_SIMILARITY exist but are NOT default Text2SQL matching functions and must not be introduced as repairs unless the SQL Implementation Plan explicitly asks for them.
 - The imports_exports schema is flat. Do not introduce stored ARRAY/VARIANT constructs such as GET(...), FLATTEN, or ::VARIANT. A transient SPLIT_BY_STRING array consumed by ARRAY_COUNT is allowed only for canonical product-token matching.
-- hs_code is a clean digit-only VARCHAR. Never normalize the physical hs_code with REGEXP_REPLACE/REPLACE during generation or repair. Preserve leading zeros. Use direct hs_code LIKE '<prefix>%' predicates for hierarchical prefixes, OR them for multiple prefixes, and use =/IN only for exact full codes. Never use SUBSTR/LEFT on hs_code for filtering.
+- hs_code is a clean digit-only VARCHAR. Never normalize the physical hs_code with REGEXP_REPLACE/REPLACE during generation or repair. Preserve leading zeros. Treat supplied HS digit strings as prefixes by default with direct hs_code LIKE '<code>%' predicates, OR them for multiple codes, and use equality only when the CURRENT user explicitly requests exact HS / exact HS code. Never infer exactness from digit length and never use SUBSTR/LEFT on hs_code for filtering.
 
 
 -----------------------------

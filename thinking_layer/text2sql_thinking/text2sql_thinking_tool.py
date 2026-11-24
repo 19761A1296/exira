@@ -112,6 +112,11 @@ PROMPT_A_MAX_TOKENS = _env_int("THINKING_PROMPT_A_MAX_TOKENS", "PROMPT_A_MAX_TOK
 PROMPT_B_MAX_TOKENS = _env_int("THINKING_PROMPT_B_MAX_TOKENS", "PROMPT_B_MAX_TOKENS", 5000)
 PROMPT_C_MAX_TOKENS = _env_int("THINKING_PROMPT_C_MAX_TOKENS", "PROMPT_C_MAX_TOKENS", 6000)
 MAX_SQL_FIX_ATTEMPTS = _env_int("THINKING_MAX_SQL_FIX_ATTEMPTS", "MAX_SQL_FIX_ATTEMPTS", 3)
+VELODB_TRANSIENT_RETRY_DELAY_SECONDS = float(
+    os.getenv("THINKING_VELODB_TRANSIENT_RETRY_DELAY_SECONDS")
+    or os.getenv("VELODB_TRANSIENT_RETRY_DELAY_SECONDS")
+    or "1.0"
+)
 
 RESULT_ROWS_TRACE_LIMIT = 100          # rows passed to Prompt C, same as text2sql
 
@@ -160,7 +165,7 @@ This hard runtime guard MUST agree with the native VeloDB rules inside Prompt A/
 - REGR_SLOPE / REGR_INTERCEPT are available; REGR_R2 is not. Derive r2 with guarded CORR/VAR_POP when needed.
 - COUNT_IF is unavailable; use SUM(CASE WHEN condition THEN 1 ELSE 0 END).
 - Use CONCAT(...) and GROUP_CONCAT; do not use || or LISTAGG.
-- HS_CODE is a clean digit-only VARCHAR. Preserve leading zeros and keep the physical hs_code bare. Never wrap hs_code in REGEXP_REPLACE/REPLACE, SUBSTR, LEFT, or casts for filtering. Sanitize only user-provided HS text. Use hs_code LIKE '<prefix>%' for one hierarchical prefix, a parenthesized OR of direct LIKE predicates for multiple prefixes, and =/IN only for exact full codes.
+- HS_CODE is a clean digit-only VARCHAR. Preserve leading zeros and keep the physical hs_code bare. Never wrap hs_code in REGEXP_REPLACE/REPLACE, SUBSTR, LEFT, or casts for filtering. Sanitize only user-provided HS text. Treat every supplied HS digit string as a prefix by default: use hs_code LIKE '<code>%' and OR direct LIKE predicates for multiple codes. Use equality only when the CURRENT user explicitly says exact HS / exact HS code; never infer exactness from digit length.
 - PRODUCT_DESCRIPTION_NORM is the ONLY product-description column allowed for thinking Text2SQL. Raw product_description may physically exist but MUST NOT be referenced. product_description_norm is already uppercase, whitespace-clean, and special-character-normalized.
 - Product matching uses exact substring plus token-level NGRAM_SEARCH for ASCII product tokens length >=4. Use SPLIT_BY_STRING(td.product_description_norm, ' ') directly, require token-length difference <=2, and NGRAM_SEARCH(token, pattern, 2) >= 0.80. Never wrap product_description_norm in UPPER/LOWER/TRIM/REGEXP_REPLACE and never run NGRAM_SEARCH against the entire long description.
 - ARRAY_COUNT, SPLIT_BY_STRING, CHAR_LENGTH, ABS and NGRAM_SEARCH are permitted for that canonical product predicate. REGEXP_EXTRACT_ALL must NOT be used as the ARRAY source on this production cluster.
@@ -401,6 +406,95 @@ def reattach_authoritative_product_scope_contract(base_query: str, contract: str
         return contract
     return base + "\n\n" + contract
 
+
+HS_INPUT_CONTRACT_HEADER = "SYSTEM_RESOLVED_HS_INPUT_CONTRACT"
+
+
+def normalize_hs_token(code: str) -> Optional[str]:
+    raw = re.sub(r"[^0-9]", "", (code or "").strip())
+    if not re.fullmatch(r"\d{1,18}", raw):
+        return None
+    if len(raw) <= 2:
+        return raw.zfill(2)
+    return raw
+
+
+def _expand_hs_fragment(fragment: str) -> List[str]:
+    frag = (fragment or "").strip().strip(",;/& ")
+    if not frag:
+        return []
+    frag = re.sub(r"(?i)\band\b", ",", frag)
+    parts = [x.strip() for x in re.split(r"\s*(?:,|/|&)\s*", frag) if x.strip()]
+    out: List[str] = []
+    for part in parts:
+        m = re.fullmatch(r"\s*(\d{1,2})\s*(?:-|–|—|(?i:to))\s*(\d{1,2})\s*", part)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            if 0 <= a <= 99 and 0 <= b <= 99 and a <= b:
+                for n in range(a, b + 1):
+                    code = normalize_hs_token(str(n))
+                    if code and code not in out:
+                        out.append(code)
+                continue
+        code = normalize_hs_token(part)
+        if code and code not in out:
+            out.append(code)
+    return out
+
+
+def extract_explicit_hs_mentions(text: str) -> List[Dict[str, Any]]:
+    raw = text or ""
+    marker_re = re.compile(
+        r"(?i)\b(?P<exact>exact\s+)?hs(?:\s*(?:codes?|chapters?|headings?|prefix(?:es)?))?\s*[-:]?\s*"
+    )
+    mentions: List[Dict[str, Any]] = []
+    for marker in marker_re.finditer(raw):
+        seg = re.match(
+            r"(?i)([0-9][0-9\s\.,/&\-–—]*(?:(?:\band\b|\bto\b)[0-9\s\.,/&\-–—]*)*)",
+            raw[marker.end():],
+        )
+        if not seg:
+            continue
+        codes = _expand_hs_fragment(seg.group(1).rstrip())
+        if codes:
+            end = marker.end() + seg.end(1)
+            mentions.append({
+                "text": raw[marker.start():end],
+                "codes": codes,
+                "exact_codes": list(codes) if marker.group("exact") else [],
+            })
+    if not mentions and re.fullmatch(r"\s*\d{2,18}\s*", raw):
+        code = normalize_hs_token(raw)
+        if code:
+            mentions.append({"text": raw.strip(), "codes": [code], "exact_codes": []})
+    return mentions
+
+
+def extract_exact_hs_codes(text: str) -> List[str]:
+    out: List[str] = []
+    for mention in extract_explicit_hs_mentions(text):
+        for code in mention.get("exact_codes") or []:
+            if code not in out:
+                out.append(code)
+    return out
+
+
+def build_hs_input_contract(raw_query: str) -> str:
+    mentions = extract_explicit_hs_mentions(raw_query)
+    if not mentions:
+        return ""
+    lines = [
+        f"{HS_INPUT_CONTRACT_HEADER} (AUTHORITATIVE PARSING; INTERNAL)",
+        "The runtime parsed the CURRENT user's explicit HS wording below. Preserve the original grammatical product association; NEVER flatten codes from separate product mentions into one shared list.",
+        "Every parsed HS digit string is a hierarchical prefix by default and must use hs_code LIKE '<code>%'. Use equality only for codes listed under Exact codes, which means the user explicitly said exact HS / exact HS code.",
+        "A chapter range such as HS 50-63 has already been expanded to every chapter 50 through 63. Dotted/spaced HS formatting has already been normalized without truncation.",
+    ]
+    for idx, m in enumerate(mentions, 1):
+        lines.append(f"Mention {idx}: {m['text']}")
+        lines.append("Normalized codes: " + ", ".join(m.get("codes") or []))
+        lines.append("Exact codes: " + (", ".join(m.get("exact_codes") or []) or "(none)"))
+    return "\n".join(lines)
+
 # =========================================================
 # NORMALIZE
 # =========================================================
@@ -590,7 +684,36 @@ def _rewrite_hs_prefix_in_to_like(match: re.Match) -> str:
     return "(" + " OR ".join(f"{col} LIKE '{code}%'" for code in codes) + ")"
 
 
-def enforce_static_velodb_sql_contract(sql: str) -> str:
+
+def _rewrite_literal_hs_exactness(sql: str, exact_codes: Optional[List[str]] = None) -> str:
+    exact_set = {c for c in [normalize_hs_token(x) for x in (exact_codes or [])] if c}
+    s = sql or ""
+    eq_re = re.compile(r"(?i)(?P<col>(?:[A-Za-z_][A-Za-z0-9_]*\.)?hs_code)\s*=\s*'(?P<code>\d{1,18})'")
+    def repl_eq(m: re.Match) -> str:
+        code = normalize_hs_token(m.group("code"))
+        if not code or code in exact_set:
+            return m.group(0)
+        return f"{m.group('col')} LIKE CONCAT('{code}', '%')"
+    s = eq_re.sub(repl_eq, s)
+    in_re = re.compile(r"(?is)(?P<col>(?:[A-Za-z_][A-Za-z0-9_]*\.)?hs_code)\s+IN\s*\((?P<items>[^)]*)\)")
+    def repl_in(m: re.Match) -> str:
+        quoted = re.findall(r"'([0-9]{1,18})'", m.group("items"))
+        residue = re.sub(r"'([0-9]{1,18})'", "", m.group("items"))
+        if not quoted or re.sub(r"[\s,]", "", residue):
+            return m.group(0)
+        parts = []
+        for raw in quoted:
+            code = normalize_hs_token(raw)
+            if not code:
+                return m.group(0)
+            if code in exact_set:
+                parts.append(f"{m.group('col')} = '{code}'")
+            else:
+                parts.append(f"{m.group('col')} LIKE CONCAT('{code}', '%')")
+        return parts[0] if len(parts) == 1 else "(" + " OR ".join(parts) + ")"
+    return in_re.sub(repl_in, s)
+
+def enforce_static_velodb_sql_contract(sql: str, user_query: str = "") -> str:
     """Canonicalize stale model SQL to the optimized thinking production access contract."""
     s = sql or ""
 
@@ -636,12 +759,13 @@ def enforce_static_velodb_sql_contract(sql: str) -> str:
         r"(?is)(?:SUBSTR\(\s*(?P<col>(?:[A-Za-z_][A-Za-z0-9_]*\.)?hs_code)\s*,\s*1\s*,\s*(?P<n>\d+)\s*\)|LEFT\(\s*(?P=col)\s*,\s*(?P=n)\s*\))\s+IN\s*\((?P<items>[^)]*)\)"
     )
     s = hs_prefix_in_re.sub(_rewrite_hs_prefix_in_to_like, s)
+    s = _rewrite_literal_hs_exactness(s, extract_exact_hs_codes(user_query))
 
     return s
 
 
-def apply_known_velodb_compatibility_repairs(sql: str, error: str) -> str:
-    current = enforce_static_velodb_sql_contract(sql or "")
+def apply_known_velodb_compatibility_repairs(sql: str, error: str, user_query: str = "") -> str:
+    current = enforce_static_velodb_sql_contract(sql or "", user_query)
     err = (error or "").lower()
     if "lambda argument must be array" in err and "regexp_extract_all" in current.lower():
         def _replace_regexp_extract(m: re.Match) -> str:
@@ -654,7 +778,30 @@ def apply_known_velodb_compatibility_repairs(sql: str, error: str) -> str:
         or "can not cast from origin type" in err
     ) and "array_exists" in current.lower():
         current = _replace_array_exists_with_scalar_count(current)
-    return enforce_static_velodb_sql_contract(current)
+    return enforce_static_velodb_sql_contract(current, user_query)
+
+
+_TRANSIENT_VELODB_ERROR_MARKERS = (
+    "compute_groups_no_alive_be",
+    "no alive be",
+    "backend nodes",
+    "backend node",
+    "compute group",
+    "connection reset",
+    "connection refused",
+    "server has gone away",
+    "lost connection",
+    "read timed out",
+    "connect timeout",
+    "timed out",
+    "temporarily unavailable",
+    "too many connections",
+)
+
+
+def is_transient_velodb_error(error: str) -> bool:
+    low = (error or "").lower()
+    return bool(low and any(marker in low for marker in _TRANSIENT_VELODB_ERROR_MARKERS))
 
 # =========================================================
 # VELODB
@@ -803,13 +950,18 @@ def run(question: str) -> Dict[str, Any]:
         base_question, scope_contract = split_authoritative_product_scope_contract(raw_question)
         normalized_base = normalize_message(base_question)
         question = reattach_authoritative_product_scope_contract(normalized_base, scope_contract)
+        hs_input_contract = build_hs_input_contract(base_question)
+        if hs_input_contract:
+            question = question.rstrip() + "\n\n" + hs_input_contract
         # dbg("QUERY", raw_question)
         # dbg("NORMALIZED", question)
         if scope_contract:
             dbg("AUTHORITATIVE PRODUCT SCOPE CONTRACT PRESERVED", scope_contract)
+        if hs_input_contract:
+            dbg("AUTHORITATIVE HS INPUT CONTRACT", hs_input_contract)
         a_raw = call_gemini(build_prompt_a(question), max_tokens=PROMPT_A_MAX_TOKENS, temperature=0.0)
         a_parts = parse_prompt_a_output(a_raw)
-        sql_to_run = enforce_static_velodb_sql_contract((a_parts.get("sql") or "").strip())
+        sql_to_run = enforce_static_velodb_sql_contract((a_parts.get("sql") or "").strip(), question)
         dbg("SQL FROM PROMPT A", sql_to_run)
 
         if not sql_to_run:
@@ -830,7 +982,23 @@ def run(question: str) -> Dict[str, Any]:
             attempts.append({"sql": sql_to_run, "error": err})
             # dbg(f"SQL FAILED (attempt {attempt_idx})", err)
 
-            local_repair = apply_known_velodb_compatibility_repairs(sql_to_run, err)
+            if is_transient_velodb_error(err):
+                if attempt_idx == MAX_SQL_FIX_ATTEMPTS:
+                    return done(
+                        "sql_infrastructure_failure",
+                        narrative="The trade-data service is temporarily unavailable, so this analysis could not be completed from trade records.",
+                        sql=sql_to_run,
+                        error=err,
+                    )
+                if VELODB_TRANSIENT_RETRY_DELAY_SECONDS > 0:
+                    # Back off between retries so a briefly unhealthy compute group has
+                    # time to recover.  The SQL text itself is never changed for an
+                    # infrastructure failure.
+                    delay = VELODB_TRANSIENT_RETRY_DELAY_SECONDS * (2 ** (attempt_idx - 1))
+                    time.sleep(delay)
+                continue
+
+            local_repair = apply_known_velodb_compatibility_repairs(sql_to_run, err, question)
             if local_repair != sql_to_run:
                 sql_to_run = local_repair
                 continue
@@ -852,7 +1020,7 @@ def run(question: str) -> Dict[str, Any]:
                 max_tokens=PROMPT_B_MAX_TOKENS,
                 temperature=0.0,
             )
-            sql_to_run = enforce_static_velodb_sql_contract(parse_prompt_b_output(b_raw))
+            sql_to_run = enforce_static_velodb_sql_contract(parse_prompt_b_output(b_raw), question)
 
         return done("sql_execution_failure", narrative="SQL execution failed.",
                     sql=sql_to_run, error="No attempts were made")

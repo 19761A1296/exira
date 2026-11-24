@@ -49,7 +49,8 @@ HANDLERS — injected by the caller, so this module imports no engine and no web
 WHAT EACH ROUTE DOES
 
     PERSONAL  personal()
-    TRADE     trade(); if it came back empty, web() is tried as a fallback
+    TRADE     trade() only. A failed/private trade-data query is NEVER silently
+              substituted with a public-web answer.
     WEB       web() alone in a multi-node flow, because the grounding comes from
               the TRADE nodes it depends on; in a single-node flow trade() runs
               first and web() is appended, which is the existing behaviour
@@ -84,6 +85,8 @@ MODEL = os.getenv("MODEL_CONNECTOR")
 REWRITE_MAX_TOKENS = int(os.getenv("CONNECTOR_REWRITE_MAX_TOKENS", "1000"))
 COMBINE_MAX_TOKENS = int(os.getenv("CONNECTOR_COMBINE_MAX_TOKENS", "3000"))
 ANSWER_CHARS = int(os.getenv("CONNECTOR_ANSWER_CHARS", "3000"))
+CONNECTOR_RETRY_MAX_TOKENS = int(os.getenv("CONNECTOR_RETRY_MAX_TOKENS", "12000"))
+CONNECTOR_DEPENDENCY_HARD_LIMIT = int(os.getenv("CONNECTOR_DEPENDENCY_HARD_LIMIT", "50000"))
 PRINT_CONNECTOR = (os.getenv("PRINT_CONNECTOR", "1") or "").strip() not in {"0", "false", "False", ""}
 
 
@@ -678,6 +681,20 @@ def _strip_web_sources_and_urls(text: str) -> str:
         out.append(line)
 
     text = "\n".join(out)
+    # Defensive cleanup for source labels/bullets that may already have been collapsed
+    # inline by an upstream formatter. Do not remove ordinary prose containing the
+    # word "source"; only strip label-shaped trailing fragments.
+    text = re.sub(
+        r"(?im)^\s*(?:sources?|references?|citations?|links?)\s*:\s*(?:[-*]\s*)?$",
+        "",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\s+(?:sources?|references?|citations?|links?)\s*:\s*(?:[-*]\s*)?$",
+        "",
+        text,
+    )
+    text = re.sub(r"(?m)^\s*[-*]\s*$", "", text)
     text = re.sub(r"[ \t]+([,.;:])", r"\1", text)
     text = re.sub(r"\(\s*\)", "", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -756,9 +773,13 @@ def _finalize_user_visible_answer(text: str, question: str) -> str:
     if _schema_only_request(question):
         return _schema_safe_response()
 
+    # Strip source/link presentation first. Later prose-cleanup passes may join lines,
+    # which can otherwise turn a clean source block into an inline ``Sources: -``
+    # fragment that is harder to recognize safely. Grounding remains available to
+    # upstream agents; only the final user-facing presentation is affected here.
+    text = _strip_web_sources_and_urls(text)
     text = _beautify_coverage_metrics(text)
     text = _remove_unrequested_technical_details(text, question)
-    text = _strip_web_sources_and_urls(text)
     text = _humanize_internal_field_names(text)
     return _clean_final_answer(text)
 
@@ -829,28 +850,104 @@ def _company_context_from_memory(memory: dict, max_chars: int = 6000) -> str:
 
 
 def _chat(prompt: str, max_tokens: int, as_json: bool = False) -> str:
-    body = {
-        "model": MODEL,
-        "temperature": 0,
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    if as_json:
-        body["response_format"] = {"type": "json_object"}
+    """Call the connector model and never accept a token-truncated completion as complete."""
+    token_budget = max(1, int(max_tokens))
+    while True:
+        body = {
+            "model": MODEL,
+            "temperature": 0,
+            "max_tokens": token_budget,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if as_json:
+            body["response_format"] = {"type": "json_object"}
 
-    r = requests.post(
-        URL,
-        headers={"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}"},
-        json=body,
-        timeout=90,
-    )
-    r.raise_for_status()
-    payload = r.json()
+        r = requests.post(
+            URL,
+            headers={"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}"},
+            json=body,
+            timeout=90,
+        )
+        r.raise_for_status()
+        payload = r.json()
+        if payload.get("error"):
+            raise RuntimeError(payload["error"].get("message", "OpenRouter error"))
 
-    if payload.get("error"):
-        raise RuntimeError(payload["error"].get("message", "OpenRouter error"))
+        try:
+            choice = payload["choices"][0]
+        except (KeyError, IndexError) as exc:
+            raise RuntimeError(f"Unexpected OpenRouter response: {str(payload)[:500]}") from exc
 
-    return _strip_fences(payload["choices"][0]["message"].get("content") or "")
+        finish_reason = str(choice.get("finish_reason") or "").lower()
+        content = _strip_fences(choice.get("message", {}).get("content") or "")
+
+        if finish_reason == "length":
+            if token_budget < CONNECTOR_RETRY_MAX_TOKENS:
+                next_budget = min(CONNECTOR_RETRY_MAX_TOKENS, max(token_budget * 2, token_budget + 1000))
+                _log("model output hit token limit; retrying", f"{token_budget} -> {next_budget}")
+                token_budget = next_budget
+                continue
+            raise RuntimeError(
+                f"Connector model output was truncated at max_tokens={token_budget}; refusing to return a partial answer."
+            )
+        if not content:
+            raise RuntimeError(f"Connector model returned empty content (finish_reason={finish_reason or 'unknown'}).")
+        return content
+
+
+def _rewrite_looks_malformed(text: str) -> bool:
+    s = (text or "").strip()
+    if not s:
+        return True
+    if s.count("(") != s.count(")") or s.count("[") != s.count("]"):
+        return True
+    if s.endswith("...") or s.endswith("…"):
+        return True
+    if re.search(r"(?i)(?:\.\.\.|…)\s*wait\b|\bwait\s*,\s*(?:actually|no|sorry)?", s):
+        return True
+    return False
+
+
+def _single_hs_from_dependency_answers(dependency_answers: list[str]) -> str:
+    """Return one unambiguous HS code carried by dependency answers.
+
+    This is intentionally conservative: dependent TRADE rewrites may replace generic
+    references such as "the product identified in q1" with a stable HS identifier,
+    but only when the dependency evidence contains exactly one distinct HS code.
+    """
+    codes = []
+    for answer in dependency_answers or []:
+        for match in re.finditer(r"(?i)\bHS(?:\s+code)?\s*[:#-]?\s*(\d{4,18})\b", str(answer or "")):
+            code = match.group(1)
+            if code not in codes:
+                codes.append(code)
+    return codes[0] if len(codes) == 1 else ""
+
+
+def _deterministic_dependency_trade_rewrite(question: str, dependency_answers: list[str]) -> str:
+    """Resolve generic product back-references to a single dependency HS code.
+
+    This avoids asking the rewrite LLM to invent or embellish a product description when
+    the previous trade step already returned the authoritative HS scope.  It deliberately
+    handles only generic dependency phrases; concrete user-specified product wording is
+    left untouched.
+    """
+    hs_code = _single_hs_from_dependency_answers(dependency_answers)
+    if not hs_code:
+        return ""
+
+    q = str(question or "")
+    patterns = [
+        r"(?i)\bthe\s+(?:leading|strongest|top|largest|biggest|highest(?:[- ]value)?)\s+(?:export\s+|import\s+)?product\s+(?:identified|found|selected)\s+in\s+q\d+\b",
+        r"(?i)\bthe\s+product\s+(?:identified|found|selected)\s+in\s+q\d+\b",
+        r"(?i)\bproduct\s+(?:identified|found|selected)\s+in\s+q\d+\b",
+    ]
+    rewritten = q
+    changed = False
+    for pattern in patterns:
+        rewritten, n = re.subn(pattern, f"HS code {hs_code}", rewritten)
+        changed = changed or bool(n)
+    return re.sub(r"\s+", " ", rewritten).strip() if changed else ""
 
 
 def _log(label: str, value="") -> None:
@@ -1000,7 +1097,21 @@ class FlowRun:
                         "question": question, "answer": "",
                         "answers": dict(self.answers)}
 
-            if outcome["text"]:
+            if outcome.get("hard_failure"):
+                self.failed.append(qid)
+                blocked = dependants_of(self.flow, qid)
+                failure_text = (outcome.get("text") or "").strip()
+                if blocked:
+                    self.stopped_reason = failure_text or (
+                        "The trade-data step could not be completed, and the rest of your "
+                        "question depends on it, so I stopped there."
+                    )
+                    _log(f"{qid} trade failure and {blocked} depend on it — stopping")
+                    return self._stopped()
+                if failure_text:
+                    self.answers[qid] = failure_text
+                _log(f"{qid} trade failure, nothing depends on it — keeping the failure message")
+            elif outcome["text"]:
                 self.answers[qid] = outcome["text"]
             else:
                 self.failed.append(qid)
@@ -1026,19 +1137,53 @@ class FlowRun:
         if not deps:
             return node["text"]
 
-        answers = "\n\n".join(
-            f"{d} asked: {self.asked.get(d, '')}\n{d} answered: "
-            f"{self.answers[d][:ANSWER_CHARS]}"
-            for d in deps
-        )
+        dependency_parts = []
+        for d in deps:
+            answer = str(self.answers[d] or "")
+            if len(answer) > CONNECTOR_DEPENDENCY_HARD_LIMIT:
+                raise RuntimeError(
+                    f"Dependency answer for {d} exceeds the safe rewrite context limit; refusing to silently truncate it."
+                )
+            dependency_parts.append(
+                f"{d} asked: {self.asked.get(d, '')}\n{d} answered: {answer}"
+            )
+        answers = "\n\n".join(dependency_parts)
+
+        # For dependent TRADE nodes, a single HS code from earlier trade evidence is a
+        # safer scope key than a generated descriptive label.  Resolve only generic
+        # references deterministically; otherwise fall through to the normal rewrite LLM.
+        if str(node.get("route") or "").upper() == "TRADE":
+            deterministic = _deterministic_dependency_trade_rewrite(
+                node.get("text", ""),
+                [str(self.answers[d] or "") for d in deps],
+            )
+            if deterministic:
+                _log(f"{node['id']} rewritten deterministically", deterministic)
+                return deterministic
+
         prompt = PROMPT_REWRITE.format(answers=answers, question=node["text"])
 
         try:
             parsed = json.loads(_chat(prompt, REWRITE_MAX_TOKENS, as_json=True))
             rewritten = str(parsed.get("question") or "").strip()
-            if rewritten:
+            if _rewrite_looks_malformed(rewritten):
+                repair_prompt = (
+                    prompt
+                    + "\n\nThe previous rewrite was incomplete or malformed. Rewrite again from scratch. "
+                      "Do not self-correct with words like 'wait' or ellipses; keep every required product/HS pair intact; "
+                      "return one complete self-contained question only in the required JSON.\n"
+                    + f"PREVIOUS BAD REWRITE: {rewritten}"
+                )
+                parsed = json.loads(_chat(
+                    repair_prompt,
+                    max(REWRITE_MAX_TOKENS * 2, 2400),
+                    as_json=True,
+                ))
+                rewritten = str(parsed.get("question") or "").strip()
+            if rewritten and not _rewrite_looks_malformed(rewritten):
                 _log(f"{node['id']} rewritten", rewritten)
                 return rewritten
+            raise RuntimeError("rewrite remained incomplete/malformed after retry")
         except Exception as exc:
             print(f"connector: rewrite of {node['id']} failed:",
                   type(exc).__name__, exc)
@@ -1080,13 +1225,23 @@ class FlowRun:
 
             text = (result.get("text") or "").strip()
 
-            if route == "WEB" or not result.get("ok"):
+            # WEB routes may intentionally combine the trade engine with public web.
+            # TRADE routes must remain grounded in the trade database: a DB failure may
+            # not silently switch evidence source and contaminate dependent questions.
+            if route == "WEB":
                 web = self.handlers.get("web")
                 extra = (web(question) if web else "").strip()
                 if extra:
                     text = f"{text}\n\n{extra}".strip() if text else extra
 
-            return {"text": text, "pending": False, "needs_answer": False}
+            # Any completed TRADE result with ok=False is a hard evidence failure.
+            # Pending/clarification states were already handled above.  Do not treat a
+            # user-facing error sentence as a successful dependency and continue into WEB
+            # or another TRADE node.
+            hard_failure = bool(route == "TRADE" and not result.get("ok"))
+
+            return {"text": text, "pending": False, "needs_answer": False,
+                    "hard_failure": hard_failure}
 
         except Exception as exc:
             print(f"connector: {node['id']} handler failed:",

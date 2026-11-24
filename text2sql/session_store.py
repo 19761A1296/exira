@@ -21,7 +21,8 @@ Usage:
 Env:
     REDIS_URL                     e.g. redis://localhost:6379/0
     ENGINE_SESSION_TTL_SECONDS    idle expiry, default 7 days
-    ENGINE_SESSION_LOCK_SECONDS   max time one request may hold a session, default 300
+    ENGINE_SESSION_LOCK_SECONDS   lease time for one request lock, default 300; Redis
+                                  locks are renewed while the request is still active
     ENGINE_SESSION_LOCK_WAIT      how long a second request waits for it, default 120
     ENGINE_SESSION_PREFIX         key prefix, default "exira:engine:"
 """
@@ -147,18 +148,41 @@ class _RedisStore:
     @contextmanager
     def lock(self, sid: str):
         from redis.exceptions import LockError
-        lk = self._r.lock(f"{PREFIX}lock:{sid}",
-                          timeout=LOCK_SECONDS, blocking_timeout=LOCK_WAIT)
+        # thread_local=False allows the renewal heartbeat thread to use the same lock
+        # token safely.  Long LLM/DB workflows can exceed the original lease, so renew
+        # before expiry instead of allowing another worker to enter the same session.
+        lk = self._r.lock(
+            f"{PREFIX}lock:{sid}",
+            timeout=LOCK_SECONDS,
+            blocking_timeout=LOCK_WAIT,
+            thread_local=False,
+        )
         if not lk.acquire():
             raise SessionBusy(sid)
+        stop_renewal = threading.Event()
+
+        def _renew_loop():
+            interval = max(5.0, min(float(LOCK_SECONDS) / 3.0, 60.0))
+            while not stop_renewal.wait(interval):
+                try:
+                    # replace_ttl=True resets the lease to LOCK_SECONDS from now.
+                    lk.extend(LOCK_SECONDS, replace_ttl=True)
+                except Exception as exc:
+                    # Do not crash the request from the heartbeat thread.  Release below
+                    # will still verify ownership; log once per failed renewal attempt.
+                    print(f"[session_store] could not renew lock for {sid}: {type(exc).__name__}: {exc}")
+
+        renewer = threading.Thread(target=_renew_loop, name=f"session-lock-renew-{sid[:8]}", daemon=True)
+        renewer.start()
         try:
             yield
         finally:
+            stop_renewal.set()
+            renewer.join(timeout=1.0)
             try:
                 lk.release()
             except LockError:
-                # held longer than LOCK_SECONDS and already expired
-                print(f"[session_store] lock for {sid} expired before release")
+                print(f"[session_store] lock for {sid} expired/lost before release")
 
 
 def _build():

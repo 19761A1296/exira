@@ -68,6 +68,7 @@ PROMPT_B_MAX_TOKENS = int(os.getenv("PROMPT_B_MAX_TOKENS", "5000"))
 PROMPT_C_MAX_TOKENS = int(os.getenv("PROMPT_C_MAX_TOKENS", "3500"))
 
 MAX_SQL_FIX_ATTEMPTS = int(os.getenv("MAX_SQL_FIX_ATTEMPTS", "3"))
+VELODB_TRANSIENT_RETRY_DELAY_SECONDS = float(os.getenv("VELODB_TRANSIENT_RETRY_DELAY_SECONDS", "1.0"))
 
 # ---------------- VeloDB (Apache Doris, MySQL protocol) ----------------
 VELODB_HOST = (os.getenv("VELODB_HOST") or "").strip()
@@ -120,8 +121,31 @@ NON_PRODUCT_TERMS = {
     "sri lanka", "new zealand", "global", "world", "worldwide", "buyer", "buyers", "seller", "sellers",
     "supplier", "suppliers", "exporter", "exporters", "importer", "importers", "trend", "demand", "competition",
     "price", "seasonality", "market", "markets", "port", "ports", "country", "countries", "state", "city",
-    "this product", "product", "hs", "hs code", "last month", "last year",
+    "this product", "that product", "the product", "product", "products",
+    "leading product", "leading export product", "top product", "top export product",
+    "biggest product", "largest product", "highest value product", "selected product",
+    "previous product", "product identified in q1", "product identified in q2",
+    "hs", "hs code", "last month", "last year",
 }
+
+GENERIC_PRODUCT_REFERENCE_RE = re.compile(
+    r"(?i)^(?:"
+    r"(?:the\s+)?(?:leading|top|biggest|largest|highest(?:[- ]value)?)\s+(?:export\s+|import\s+)?product|"
+    r"(?:the\s+)?(?:selected|previous|identified)\s+product|"
+    r"(?:the\s+)?product\s+(?:identified|selected|found)\s+(?:in|from)\s+q\d+|"
+    r"this\s+product|that\s+product|the\s+product"
+    r")$"
+)
+
+PRODUCT_DISCOVERY_RE = re.compile(
+    r"(?i)(?:"
+    r"\bwhich\s+(?:of\s+[^?]{0,80}\s+)?products?\b|"
+    r"\bwhat\s+(?:is|are)\s+[^?]{0,80}\bproducts?\b|"
+    r"\b(?:leading|top|biggest|largest|highest(?:[- ]value)?)\s+(?:export\s+|import\s+)?products?\b|"
+    r"\bproducts?\s+(?:do|does)\s+[^?]{0,40}\b(?:export|import|sell|buy|deal)\b|"
+    r"\btop\s+\d+\s+(?:export\s+|import\s+)?products?\b"
+    r")"
+)
 
 # =========================================================
 # PROMPTS / CONTEXT PLACEHOLDERS
@@ -182,7 +206,7 @@ This runtime block is authoritative and MUST agree with Prompt A/B. Preserve bus
 - REGR_SLOPE / REGR_INTERCEPT are supported; REGR_R2 is not. Derive r2 with guarded CORR/VAR_POP when required.
 - COUNT_IF is unavailable; use SUM(CASE WHEN condition THEN 1 ELSE 0 END).
 - Use CONCAT(...) for concatenation and GROUP_CONCAT for string aggregation. Do not use || or LISTAGG.
-- HS_CODE is a clean digit-only VARCHAR in production. Preserve leading zeros and filter the physical hs_code directly; never wrap hs_code in REGEXP_REPLACE/REPLACE, SUBSTR, LEFT, or casts for filtering. Sanitize only user-provided HS text before SQL. Use LIKE for one hierarchical prefix, a parenthesized OR of direct hs_code LIKE '<prefix>%' predicates for multiple hierarchical prefixes, and =/IN only for exact full HS codes.
+- HS_CODE is a clean digit-only VARCHAR in production. Preserve leading zeros and filter the physical hs_code directly; never wrap hs_code in REGEXP_REPLACE/REPLACE, SUBSTR, LEFT, or casts for filtering. Sanitize only user-provided HS text before SQL. Treat every supplied HS digit string as a hierarchical prefix by default, regardless of length: use direct hs_code LIKE '<code>%' predicates and OR them for multiple codes. Use equality only when the current user wording explicitly says exact HS / exact HS code. Never infer exactness from digit length.
 - PRODUCT_DESCRIPTION_NORM is the ONLY product-description column allowed for Text2SQL. It is already uppercase, whitespace-clean, and special-character-normalized. Raw product_description may exist physically but MUST NOT be referenced by generated SQL.
 - Product matching uses exact substring plus a token-level NGRAM_SEARCH fallback for ASCII product tokens of length >= 4. The fuzzy branch MUST use tokens directly from SPLIT_BY_STRING(td.product_description_norm, ' '), never REGEXP_REPLACE/UPPER/TRIM around the stored column and never whole-description NGRAM_SEARCH. The canonical threshold is 0.80 with a token-length difference of at most 2 characters. REGEXP_EXTRACT_ALL must NOT be used as the ARRAY source on this production cluster.
 - ARRAY_COUNT, SPLIT_BY_STRING, CHAR_LENGTH, ABS, and NGRAM_SEARCH(text, pattern, 2) are permitted for that canonical product predicate.
@@ -387,7 +411,25 @@ def normalize_product_key(text: str) -> str:
 
 def is_non_product_term(term: str) -> bool:
     clean = re.sub(r"\s+", " ", (term or "").strip().lower())
-    return not clean or clean in NON_PRODUCT_TERMS
+    return not clean or clean in NON_PRODUCT_TERMS or bool(GENERIC_PRODUCT_REFERENCE_RE.fullmatch(clean))
+
+
+def is_open_product_discovery_query(text: str, product_terms: Optional[List[str]] = None) -> bool:
+    """True when the user is asking the database to discover/rank products.
+
+    Open discovery must not be narrowed to the company-profile product card.  The card may
+    identify the user's company, but it is not the candidate universe for questions such as
+    "which is my leading export product?".  A genuinely named product term disables this
+    guard so normal product scoping still applies.
+    """
+    concrete_terms = [
+        t for t in (product_terms or [])
+        if isinstance(t, str) and t.strip() and not is_non_product_term(t)
+    ]
+    if concrete_terms:
+        return False
+    q = re.sub(r"\s+", " ", (text or "").strip())
+    return bool(q and PRODUCT_DISCOVERY_RE.search(q))
 
 def sanitize_sql_literal(value: str) -> str:
     # MySQL-protocol engines treat backslash as an escape character too.
@@ -449,32 +491,31 @@ def build_canonical_product_match_sql(product_term: str, alias: str = "td") -> s
     # exact/fuzzy token match. This keeps required product words conjunctive.
     return f"({exact_phrase} OR ({' AND '.join(token_predicates)}))"
 
-def build_canonical_hs_scope_sql(hs_codes: List[str], alias: str = "td") -> str:
+def build_canonical_hs_scope_sql(
+    hs_codes: List[str],
+    alias: str = "td",
+    exact_hs_codes: Optional[List[str]] = None,
+) -> str:
     """Build the authoritative HS predicate for clean digit-only VARCHAR hs_code.
 
-    Production invariant: the physical column already contains only digits and preserves
-    leading zeros. Sanitize only user input; never normalize hs_code inside SQL.
-    2/4/6-digit values are hierarchical prefixes; 8/10-digit values are full codes.
+    Default semantics are hierarchical prefix matching for every supplied HS digit string,
+    including 8/10/12+ digit national extensions. Equality is used only when the CURRENT
+    query explicitly says "exact HS" / "exact HS code" for that code.
     """
     codes = [c for c in [normalize_hs_token(x) for x in (hs_codes or [])] if c]
     codes = sorted(set(codes))
     if not codes:
         return "1 = 1"
-
-    # Keep the physical hs_code column bare for prefix pruning/index use.
-    # Hierarchical prefixes are always direct LIKE predicates, even when several
-    # prefixes have the same length. Exact full codes may use equality/IN.
-    if len(codes) > 1 and all(len(c) in {8, 10} for c in codes):
-        literals = ", ".join(_sql_string_literal(c) for c in codes)
-        return f"{alias}.hs_code IN ({literals})"
-
+    exact_set = {
+        c for c in [normalize_hs_token(x) for x in (exact_hs_codes or [])] if c
+    }
     parts = []
     for code in codes:
         lit = _sql_string_literal(code)
-        if len(code) in {2, 4, 6}:
-            parts.append(f"{alias}.hs_code LIKE CONCAT({lit}, '%')")
-        else:
+        if code in exact_set:
             parts.append(f"{alias}.hs_code = {lit}")
+        else:
+            parts.append(f"{alias}.hs_code LIKE CONCAT({lit}, '%')")
     return parts[0] if len(parts) == 1 else "(" + " OR ".join(parts) + ")"
 
 def trim_json_for_memory(value: Any, max_list_items: int = RESULT_ROWS_MEMORY_LIMIT, max_str_len: int = 5000) -> Any:
@@ -527,6 +568,7 @@ def new_session_state() -> Dict[str, Any]:
             "pending_product_terms": [],
             "pending_hs_code": None,
             "pending_explicit_hs_codes": [],
+            "pending_explicit_product_hs_map": {},
             "pending_profile_product_hs_map": {},
             "pending_scope_resolver_trace": None,
             "pending_domain_disambiguation": None,
@@ -734,89 +776,226 @@ def _profile_contains_product(profile_blob: str, product_text: str) -> bool:
     p = _resolver_evidence_norm(product_text)
     if not p:
         return False
-    blob = _resolver_evidence_norm(profile_blob)
-    return p in blob
+    return p in _resolver_evidence_norm(profile_blob)
 
 
-def _build_safe_profile_enriched_query(candidate_query: str, resolved_products: List[Dict[str, Any]]) -> str:
-    """Render resolver evidence without allowing the model to rewrite analytical intent."""
-    base = (candidate_query or "").strip()
-    if not resolved_products:
-        return base
-    labels = []
-    for item in resolved_products:
-        product = str(item.get("user_product") or item.get("profile_product") or "").strip()
-        codes = [c for c in item.get("hs_codes") or [] if c]
-        if product and codes:
-            labels.append(f"{product} (HS {', '.join(codes)})")
-    if not labels:
-        return base
-    return base + "\n\nResolved company product scopes for this query: " + "; ".join(labels)
+def _product_term_lookup(product_terms: List[str]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for term in product_terms or []:
+        if isinstance(term, str) and term.strip() and not is_non_product_term(term):
+            clean = re.sub(r"\s+", " ", term.strip())
+            out[normalize_product_key(clean)] = clean
+    return out
 
 
-def _sanitize_resolver_output(data: Dict[str, Any], profile: Any, candidate_query: str) -> Dict[str, Any]:
-    """Fail closed: only profile-verifiable HIGH-confidence product->HS pairs survive."""
+def _deterministic_explicit_product_hs_map(
+    raw_query: str,
+    product_terms: List[str],
+    mentions: List[Dict[str, Any]],
+) -> Dict[str, List[str]]:
+    """Conservative backstop for obvious current-query product->HS links.
+
+    The LLM resolver handles grammar/semantic linking for harder multi-product text. This
+    deterministic layer only covers cases that are safe without interpretation:
+      * exactly one product + one/more explicit HS mentions;
+      * a parenthesized HS mention immediately after a detected product.
+    It never assigns one query-wide HS list to every product.
+    """
+    lookup = _product_term_lookup(product_terms)
+    if not lookup or not mentions:
+        return {}
+    all_codes = dedupe_preserve([c for m in mentions for c in (m.get("codes") or [])])
+    if len(lookup) == 1 and all_codes:
+        only_key = next(iter(lookup))
+        return {only_key: all_codes}
+
+    raw_upper = (raw_query or "").upper()
+    occurrences: List[Tuple[int, int, str]] = []
+    for key, original in lookup.items():
+        term_upper = original.upper()
+        for m in re.finditer(r"(?<![A-Z0-9])" + re.escape(term_upper) + r"(?![A-Z0-9])", raw_upper):
+            occurrences.append((m.start(), m.end(), key))
+    occurrences.sort()
+
+    out: Dict[str, List[str]] = {}
+
+    # Safe shared-scope fallback for wording such as "coffee and tea in HS 09".
+    # Only apply when there is exactly one HS mention and the immediately preceding
+    # comma-free phrase ends with in/under/within/using, so unrelated earlier products
+    # are not swept into the same scope.
+    if len(mentions) == 1 and len(lookup) > 1:
+        mention = mentions[0]
+        before = raw_upper[:int(mention.get("start") or 0)]
+        mscope = re.search(r"(?is)([^,;:.!?]{0,240})\b(?:IN|UNDER|WITHIN|USING)\s*$", before)
+        if mscope:
+            scope_text = mscope.group(1)
+            scoped_keys = [
+                key for key, original in lookup.items()
+                if re.search(r"(?<![A-Z0-9])" + re.escape(original.upper()) + r"(?![A-Z0-9])", scope_text)
+            ]
+            if len(scoped_keys) >= 2:
+                for key in scoped_keys:
+                    out[key] = list(mention.get("codes") or [])
+                return out
+
+    for mention in mentions:
+        m_start = int(mention.get("start") or 0)
+        # Parenthetical form: PRODUCT (HS ...). Find the nearest opening parenthesis
+        # before HS and ensure no ')' closes it first.
+        open_paren = raw_upper.rfind("(", 0, m_start)
+        close_paren = raw_upper.rfind(")", 0, m_start)
+        if open_paren < 0 or open_paren < close_paren:
+            continue
+        candidates = [o for o in occurrences if o[1] <= open_paren]
+        if not candidates:
+            continue
+        nearest = max(candidates, key=lambda x: x[1])
+        between = raw_upper[nearest[1]:open_paren]
+        if len(between) > 12 or re.search(r"[;,]", between):
+            continue
+        key = nearest[2]
+        out.setdefault(key, [])
+        for code in mention.get("codes") or []:
+            if code not in out[key]:
+                out[key].append(code)
+    return out
+
+
+def _sanitize_scope_resolver_output(
+    data: Dict[str, Any],
+    profile: Any,
+    product_terms: List[str],
+    explicit_mentions: List[Dict[str, Any]],
+    prelinked_explicit: Dict[str, List[str]],
+    original_user_query: str = "",
+) -> Dict[str, Any]:
+    """Validate resolver mappings against current-query HS evidence or company profile."""
     profile_blob = _resolver_profile_blob(profile)
     scope_type = str(data.get("scope_type") or "GLOBAL").upper().strip()
     if scope_type not in {"GLOBAL", "USER_COMPANY", "OTHER_COMPANY"}:
         scope_type = "GLOBAL"
 
-    valid_products: List[Dict[str, Any]] = []
-    merged: Dict[str, Dict[str, Any]] = {}
+    term_lookup = _product_term_lookup(product_terms)
+    query_norm = _resolver_evidence_norm(original_user_query)
+    portfolio_query = bool(re.search(
+        r"(?i)\b(?:all|portfolio|products?)\b.*\b(?:my|our|we|deal|sell|export|import|buy)\b|\bproducts?\s+(?:i|we)\s+deal\s+in\b",
+        original_user_query or "",
+    ))
+    explicit_codes = {
+        c for m in explicit_mentions for c in (m.get("codes") or []) if normalize_hs_token(c)
+    }
+    explicit_codes = {normalize_hs_token(c) for c in explicit_codes if normalize_hs_token(c)}
+
+    merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+    def add_mapping(user_product: str, source: str, codes: List[str], profile_product: str = ""):
+        if is_non_product_term(user_product):
+            return
+        key = normalize_product_key(user_product)
+        if source == "CURRENT_USER_EXPLICIT_HS":
+            # Prefer Trade-Agent product_terms when available. For external executors
+            # (Thinking) product_terms may be empty, so allow a literal product phrase
+            # only when it is visibly present in the current query.
+            if key in term_lookup:
+                user_product = term_lookup[key]
+            elif not _resolver_evidence_norm(user_product) or _resolver_evidence_norm(user_product) not in query_norm:
+                return
+            valid_codes = [c for c in codes if c in explicit_codes]
+            if not valid_codes:
+                return
+            profile_product = ""
+        elif source == "COMPANY_PROFILE_RESOLVER":
+            if scope_type != "USER_COMPANY" or profile in (None, "", {}, []):
+                return
+            if not profile_product or not _profile_contains_product(profile_blob, profile_product):
+                return
+            valid_codes = [c for c in codes if _profile_contains_hs(profile_blob, c)]
+            if not valid_codes:
+                return
+            # For named-product queries require the user product to be one of the detected
+            # products. Portfolio/all-product queries may legitimately introduce profile
+            # product names even when product_terms was empty.
+            if term_lookup and key not in term_lookup:
+                return
+            if key in term_lookup:
+                user_product = term_lookup[key]
+            elif not portfolio_query:
+                # External Thinking path may not provide product_terms. In that case
+                # require the resolver's user_product wording to actually appear in the query.
+                if not _resolver_evidence_norm(user_product) or _resolver_evidence_norm(user_product) not in query_norm:
+                    return
+        else:
+            return
+
+        bucket_key = (normalize_product_key(user_product), source)
+        bucket = merged.setdefault(bucket_key, {
+            "user_product": user_product,
+            "source": source,
+            "profile_product": profile_product,
+            "hs_codes": [],
+            "confidence": "HIGH",
+        })
+        if profile_product and not bucket.get("profile_product"):
+            bucket["profile_product"] = profile_product
+        for code in valid_codes:
+            if code not in bucket["hs_codes"]:
+                bucket["hs_codes"].append(code)
+
+    # Preserve deterministic explicit links first. The model may add harder grammar links,
+    # but it cannot erase a safe explicit mapping already established from the query syntax.
+    for key, codes in (prelinked_explicit or {}).items():
+        if key in term_lookup:
+            add_mapping(term_lookup[key], "CURRENT_USER_EXPLICIT_HS", codes)
+
     for item in data.get("resolved_products") or []:
         if not isinstance(item, dict):
             continue
         if str(item.get("confidence") or "").upper().strip() != "HIGH":
             continue
         user_product = re.sub(r"\s+", " ", str(item.get("user_product") or "").strip())
+        source = str(item.get("source") or "").upper().strip()
         profile_product = re.sub(r"\s+", " ", str(item.get("profile_product") or "").strip())
-        if not user_product or not profile_product or not _profile_contains_product(profile_blob, profile_product):
-            continue
-        codes = []
-        for raw_code in item.get("hs_codes") or []:
-            code = normalize_hs_token(str(raw_code))
-            if code and _profile_contains_hs(profile_blob, code) and code not in codes:
-                codes.append(code)
-        if not codes:
-            continue
-        key = normalize_product_key(user_product)
-        if key not in merged:
-            merged[key] = {
-                "user_product": user_product,
-                "profile_product": profile_product,
-                "hs_codes": [],
-                "confidence": "HIGH",
-            }
-        for code in codes:
-            if code not in merged[key]["hs_codes"]:
-                merged[key]["hs_codes"].append(code)
-    valid_products = list(merged.values())
+        codes = [c for c in [normalize_hs_token(str(x)) for x in (item.get("hs_codes") or [])] if c]
+        if user_product and codes:
+            add_mapping(user_product, source, codes, profile_product)
 
-    unresolved = [
-        re.sub(r"\s+", " ", str(x).strip())
-        for x in (data.get("unresolved_products") or [])
-        if isinstance(x, str) and x.strip()
+    resolved = list(merged.values())
+    explicit_product_keys = {
+        normalize_product_key(x["user_product"])
+        for x in resolved
+        if x.get("source") == "CURRENT_USER_EXPLICIT_HS"
+    }
+    resolved = [
+        x for x in resolved
+        if not (
+            x.get("source") == "COMPANY_PROFILE_RESOLVER"
+            and normalize_product_key(x["user_product"]) in explicit_product_keys
+        )
     ]
+    resolved_keys = {normalize_product_key(x["user_product"]) for x in resolved}
+    unresolved = []
+    for term in product_terms or []:
+        if not isinstance(term, str) or not term.strip() or is_non_product_term(term):
+            continue
+        clean = re.sub(r"\s+", " ", term.strip())
+        if normalize_product_key(clean) not in resolved_keys:
+            unresolved.append(clean)
     unresolved = dedupe_preserve(unresolved)
 
-    action = str(data.get("action") or "PASS_THROUGH").upper().strip()
-    # Fail closed for partial/ambiguous mapping: if the resolver says any requested
-    # product is unresolved, leave the whole query untouched and let Text2SQL use its
-    # existing HS-selection flow. This prevents silently analyzing only a subset.
-    if scope_type != "USER_COMPANY" or action != "REWRITE" or not valid_products or unresolved:
-        action = "PASS_THROUGH"
-        valid_products = []
+    used_explicit = {
+        c for x in resolved if x.get("source") == "CURRENT_USER_EXPLICIT_HS" for c in x.get("hs_codes", [])
+    }
+    model_unscoped = [normalize_hs_token(str(x)) for x in (data.get("unscoped_explicit_hs_codes") or [])]
+    unscoped = [c for c in model_unscoped if c and c in explicit_codes and c not in used_explicit]
+    for code in sorted(explicit_codes):
+        if code not in used_explicit and code not in unscoped:
+            unscoped.append(code)
 
-    # The LLM decides scope and semantic profile mapping, but it is not allowed to rewrite
-    # analytics wording directly. Render the enrichment deterministically from the original
-    # candidate query so dates/geography/metrics/engine intent cannot drift.
-    rewritten = _build_safe_profile_enriched_query(candidate_query, valid_products) if action == "REWRITE" else candidate_query
     return {
         "scope_type": scope_type,
-        "action": action,
-        "resolved_products": valid_products,
+        "resolved_products": resolved,
         "unresolved_products": unresolved,
-        "rewritten_query": rewritten,
+        "unscoped_explicit_hs_codes": unscoped,
         "reason": str(data.get("reason") or "").strip(),
     }
 
@@ -825,16 +1004,27 @@ def build_product_scope_resolver_prompt(
     session: Dict[str, Any],
     original_user_query: str,
     candidate_query: str,
-    current_explicit_hs_codes: List[str],
-) -> Optional[str]:
-    profile = get_company_product_profile(session)
-    if profile in (None, "", {}, []):
-        return None
+    product_terms: List[str],
+    explicit_mentions: List[Dict[str, Any]],
+    prelinked_explicit: Dict[str, List[str]],
+) -> str:
     payload = {
         "original_user_query": original_user_query,
         "candidate_query": candidate_query,
-        "company_profile": profile,
-        "current_explicit_hs_codes": current_explicit_hs_codes or [],
+        "product_terms": product_terms or [],
+        "company_profile": get_company_product_profile(session),
+        "explicit_hs_mentions": [
+            {
+                "text": m.get("text", ""),
+                "codes": m.get("codes", []),
+                "exact_codes": m.get("exact_codes", []),
+            }
+            for m in explicit_mentions
+        ],
+        "prelinked_explicit_product_hs": {
+            _product_term_lookup(product_terms).get(k, k): v
+            for k, v in (prelinked_explicit or {}).items()
+        },
     }
     return PRODUCT_SCOPE_RESOLVER_PROMPT_TEMPLATE.replace(
         "{PRODUCT_SCOPE_RESOLVER_INPUT_JSON}",
@@ -842,32 +1032,69 @@ def build_product_scope_resolver_prompt(
     )
 
 
-def resolve_company_product_scope(
+def resolve_product_scope(
     session: Dict[str, Any],
     original_user_query: str,
     candidate_query: str,
-    current_explicit_hs_codes: Optional[List[str]] = None,
+    product_terms: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Use Gemma only for company-profile semantic mapping; failure always passes through."""
+    """Resolve current explicit product->HS links plus company-profile fallback.
+
+    The resolver is deliberately per-product. One explicit HS elsewhere in the message does
+    not disable profile/session/picker resolution for other products.
+    """
     candidate_query = (candidate_query or original_user_query or "").strip()
-    explicit = [c for c in [normalize_hs_token(x) for x in (current_explicit_hs_codes or [])] if c]
+    product_terms = dedupe_preserve([
+        re.sub(r"\s+", " ", x.strip()) for x in (product_terms or [])
+        if isinstance(x, str) and x.strip() and not is_non_product_term(x)
+    ])
+    mentions = extract_explicit_hs_mentions(original_user_query)
+    prelinked = _deterministic_explicit_product_hs_map(original_user_query, product_terms, mentions)
     profile = get_company_product_profile(session)
+
     default = {
         "scope_type": "GLOBAL",
-        "action": "PASS_THROUGH",
         "resolved_products": [],
-        "unresolved_products": [],
-        "rewritten_query": candidate_query,
+        "unresolved_products": list(product_terms),
+        "unscoped_explicit_hs_codes": extract_explicit_hs_codes(original_user_query),
         "reason": "Resolver not applied.",
     }
-    if not candidate_query or profile in (None, "", {}, []):
+    if not candidate_query:
         return default
-    if explicit:
-        default["reason"] = "Current user turn already contains explicit HS code(s)."
+
+    # An explicit HS with no concrete product term is already sufficient scope.  Do not
+    # ask the model to manufacture a pseudo-product such as "leading export product" and
+    # turn that reference into PRODUCT_DESCRIPTION matching.
+    if mentions and not product_terms:
+        default["reason"] = "Explicit HS scope with no concrete product term: keep the query HS-only."
+        dbg("PRODUCT SCOPE RESOLVER BYPASS", default)
         return default
-    prompt = build_product_scope_resolver_prompt(session, original_user_query, candidate_query, explicit)
-    if not prompt:
+
+    # Product-discovery/ranking queries deliberately have no product filter yet.  The
+    # company profile is useful for identifying the user's company, but must never become
+    # an implicit candidate universe for "my leading/top product".  Let Prompt A discover
+    # the product from shipment records instead.
+    if is_open_product_discovery_query(original_user_query, product_terms) or \
+            is_open_product_discovery_query(candidate_query, product_terms):
+        default["reason"] = "Open product-discovery query: resolver bypassed so the database discovers/ranks products."
+        dbg("PRODUCT SCOPE RESOLVER BYPASS", default)
         return default
+
+    # Fast path: one product with explicit HS can be linked deterministically without an LLM.
+    if len(product_terms) == 1 and mentions:
+        return _sanitize_scope_resolver_output(
+            {"scope_type": "GLOBAL", "resolved_products": [], "reason": "Deterministic single-product explicit HS mapping."},
+            profile, product_terms, mentions, prelinked, original_user_query,
+        )
+
+    # No explicit association work and no company profile means there is nothing for this
+    # resolver to add; normal session memory / HS picker remains authoritative downstream.
+    if not mentions and profile in (None, "", {}, []):
+        return default
+
+    prompt = build_product_scope_resolver_prompt(
+        session, original_user_query, candidate_query, product_terms, mentions, prelinked
+    )
     try:
         raw = call_openrouter_model(
             prompt,
@@ -876,23 +1103,79 @@ def resolve_company_product_scope(
             temperature=0.0,
         )
         parsed = parse_json_strict(raw)
-        result = _sanitize_resolver_output(parsed, profile, candidate_query)
+        result = _sanitize_scope_resolver_output(parsed, profile, product_terms, mentions, prelinked, original_user_query)
         dbg("PRODUCT SCOPE RESOLVER", {"model": PRODUCT_SCOPE_RESOLVER_MODEL, "result": result})
         return result
     except Exception as exc:
-        default["reason"] = f"Resolver failed closed: {exc}"
+        default = _sanitize_scope_resolver_output(
+            {"scope_type": "GLOBAL", "resolved_products": [], "reason": f"Resolver failed closed: {exc}"},
+            profile, product_terms, mentions, prelinked, original_user_query,
+        )
         dbg("PRODUCT SCOPE RESOLVER FAILED", str(exc))
         return default
 
 
-def resolver_product_hs_override_map(resolver_result: Dict[str, Any]) -> Dict[str, List[str]]:
-    out: Dict[str, List[str]] = {}
+def prepare_external_query_product_scope(session_id: str, query: str) -> Dict[str, Any]:
+    """Prepare the same product/HS contract for executors that bypass normal chat().
+
+    Used by the Thinking route. It never mutates session memory and never launches the HS
+    picker. Safe explicit/profile/session mappings are attached; unresolved product wording
+    remains in the query for the downstream executor rather than being cross-mapped.
+    """
+    raw_query = (query or "").strip()
+    out = {"query": raw_query, "resolver": None, "explicit_map": {}, "profile_map": {}, "product_terms": []}
+    if not raw_query or not session_id:
+        return out
+    try:
+        session = SESSION_STORE.load(session_id)
+    except Exception:
+        session = None
+    if not isinstance(session, dict):
+        return out
+
+    # Let the resolver identify products directly from the current query when this path has
+    # no Trade Agent product_terms. Also preserve any session product visibly mentioned.
+    result = resolve_product_scope(session, raw_query, raw_query, product_terms=[])
+    explicit_map, profile_map = resolver_product_hs_maps(result)
+    terms = resolver_product_terms(result)
+    for remembered in get_mentioned_memory_products(session, raw_query):
+        if remembered not in terms:
+            terms.append(remembered)
+    terms = dedupe_preserve(terms)
+    scoped = build_product_scopes_context(
+        raw_query,
+        session,
+        terms,
+        explicit_hs_overrides=explicit_map,
+        profile_hs_overrides=profile_map,
+    )
+    out.update({
+        "query": scoped,
+        "resolver": result,
+        "explicit_map": explicit_map,
+        "profile_map": profile_map,
+        "product_terms": terms,
+    })
+    return out
+
+
+def resolver_product_hs_maps(resolver_result: Dict[str, Any]) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+    explicit_map: Dict[str, List[str]] = {}
+    profile_map: Dict[str, List[str]] = {}
     for item in resolver_result.get("resolved_products") or []:
+        if not isinstance(item, dict):
+            continue
         product = re.sub(r"\s+", " ", str(item.get("user_product") or "").strip())
         codes = [c for c in [normalize_hs_token(x) for x in item.get("hs_codes") or []] if c]
-        if product and codes:
-            out[normalize_product_key(product)] = sorted(set(codes))
-    return out
+        if not product or not codes:
+            continue
+        target = explicit_map if item.get("source") == "CURRENT_USER_EXPLICIT_HS" else profile_map
+        key = normalize_product_key(product)
+        target.setdefault(key, [])
+        for code in codes:
+            if code not in target[key]:
+                target[key].append(code)
+    return explicit_map, profile_map
 
 
 def resolver_product_terms(resolver_result: Dict[str, Any]) -> List[str]:
@@ -905,76 +1188,135 @@ def resolver_product_terms(resolver_result: Dict[str, Any]) -> List[str]:
 # =========================================================
 # PRODUCT / HS SETUP
 # =========================================================
-def extract_product_or_hs(text: str) -> Dict[str, Optional[str]]:
-    hs_match = re.search(r"(?i)\b(?:hs|hs code)\b\D*(\d{2,10})\b", text or "")
-    if hs_match:
-        return {"hs_code": hs_match.group(1), "product": None}
-    only_digits = (text or "").strip()
-    if re.fullmatch(r"\d{2,10}", only_digits):
-        return {"hs_code": only_digits, "product": None}
-    return {"hs_code": None, "product": (text or "").strip()}
-
 def normalize_hs_token(code: str) -> Optional[str]:
+    """Normalize user/profile HS text to a digit string without truncation.
+
+    EX-IRA sees national tariff extensions longer than 10 digits, so support up to 18 digits.
+    Leading zeros are preserved. One/two-digit chapter inputs are zero-padded to two digits.
+    """
     raw = re.sub(r"[^0-9]", "", (code or "").strip())
-    if not re.fullmatch(r"\d{1,10}", raw):
+    if not re.fullmatch(r"\d{1,18}", raw):
         return None
     if len(raw) <= 2:
         return raw.zfill(2)
     return raw
 
-def extract_explicit_hs_codes(text: str) -> List[str]:
-    """Extract HS code/prefixes explicitly supplied in the CURRENT user turn.
 
-    Examples supported:
-      HS09
-      HS-09
-      HS 5201
-      HS codes 19, 20, 21 and 35
-      chilli-HS19,20,21,35
+def _expand_hs_fragment(fragment: str) -> List[str]:
+    """Parse the numeric fragment after an explicit HS marker.
 
-    This parser is intentionally conservative: ordinary numbers such as dates,
-    top-N counts, and time windows are ignored unless introduced by an HS marker.
-    A message consisting only of HS digits is also accepted for the HS-only setup flow.
+    Supports lists, 2-digit chapter ranges, dotted codes, and spaced code groups.
+    Examples:
+      50, 51 and 67 -> 50,51,67
+      50-63 -> 50..63
+      0803.90.11 -> 08039011
+      6306 22 00 -> 63062200
     """
-    raw = (text or "").strip()
-    if not raw:
+    frag = (fragment or "").strip().strip(",;/& ")
+    if not frag:
+        return []
+    frag = re.sub(r"(?i)\band\b", ",", frag)
+    # Slash and ampersand are list separators. Commas are also list separators.
+    parts = [x.strip() for x in re.split(r"\s*(?:,|/|&)\s*", frag) if x.strip()]
+    out: List[str] = []
+    for part in parts:
+        # Expand only safe HS chapter ranges. Longer hyphenated forms are treated as
+        # formatting and normalized by stripping punctuation rather than expanded.
+        m = re.fullmatch(r"\s*(\d{1,2})\s*(?:-|–|—|(?i:to))\s*(\d{1,2})\s*", part)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            if 0 <= a <= 99 and 0 <= b <= 99 and a <= b:
+                for n in range(a, b + 1):
+                    code = normalize_hs_token(str(n))
+                    if code and code not in out:
+                        out.append(code)
+                continue
+        code = normalize_hs_token(part)
+        if code and code not in out:
+            out.append(code)
+    return out
+
+
+def extract_explicit_hs_mentions(text: str) -> List[Dict[str, Any]]:
+    """Return explicit HS mentions with spans/codes; ignore ordinary unmarked numbers.
+
+    A6 remains conservative: numbers inside a general sentence are not treated as HS unless
+    introduced by HS/HS code/chapter/heading/prefix wording. A message made only of digits
+    still works for the existing HS-only setup flow.
+    """
+    raw = text or ""
+    if not raw.strip():
         return []
 
-    found: List[str] = []
-    # Capture one HS list immediately following an explicit HS marker:
-    # HS / HTS, optionally followed by CODE(S) / CHAPTER(S) / HEADING(S), or a bare
-    # CHAPTER(S) / HEADING(S) marker (HS chapters/headings in trade context).
-    # Separators may be comma, slash, ampersand, or the word "and".
-        # HS marker, optionally followed by codes / chapters / headings / prefixes,
-    # then a list of codes. Ranges like "50-63" or "50 to 63" are allowed.
-    pattern = re.compile(
-        r"(?i)\bhs(?:\s*(?:codes?|chapters?|headings?|prefix(?:es)?))?\s*[-:]?\s*"
-        r"((?:\d{1,10})(?:\s*(?:-|–|to)\s*\d{1,10})?"
-        r"(?:\s*(?:,|/|&|\band\b|,\s*and\b)\s*\d{1,10}(?:\s*(?:-|–|to)\s*\d{1,10})?)*)"
+    marker_re = re.compile(
+        r"(?i)\b(?P<exact>exact\s+)?hs(?:\s*(?:codes?|chapters?|headings?|prefix(?:es)?))?\s*[-:]?\s*"
     )
-    for match in pattern.finditer(raw):
-        for start, end in re.findall(r"(\d{1,10})(?:\s*(?:-|–|to)\s*(\d{1,10}))?", match.group(1)):
-            tokens = [start]
-            if end and len(start) == len(end) <= 2 and int(start) < int(end) <= 99:
-                # chapter range, e.g. 50-63 -> 50, 51, ..., 63
-                tokens = [str(n) for n in range(int(start), int(end) + 1)]
-            elif end:
-                tokens = [start, end]
-            for token in tokens:
-                norm = normalize_hs_token(token)
-                if norm and norm not in found:
-                    found.append(norm)
+    mentions: List[Dict[str, Any]] = []
+    for marker in marker_re.finditer(raw):
+        tail = raw[marker.end():]
+        # Consume only the numeric/list/range formatting immediately following the marker.
+        # Stop as soon as non-HS prose begins (except connector words 'and'/'to').
+        seg_match = re.match(
+            r"(?i)([0-9][0-9\s\.,/&\-–—]*(?:(?:\band\b|\bto\b)[0-9\s\.,/&\-–—]*)*)",
+            tail,
+        )
+        if not seg_match:
+            continue
+        fragment = seg_match.group(1).rstrip()
+        codes = _expand_hs_fragment(fragment)
+        if not codes:
+            continue
+        end = marker.end() + seg_match.end(1)
+        exact_codes = list(codes) if marker.group("exact") else []
+        mentions.append({
+            "start": marker.start(),
+            "end": end,
+            "text": raw[marker.start():end],
+            "codes": codes,
+            "exact_codes": exact_codes,
+        })
 
-    if not found and re.fullmatch(r"\d{2,10}", raw):
-        norm = normalize_hs_token(raw)
-        if norm:
-            found.append(norm)
+    if not mentions and re.fullmatch(r"\s*\d{2,18}\s*", raw):
+        code = normalize_hs_token(raw)
+        if code:
+            mentions.append({
+                "start": 0,
+                "end": len(raw),
+                "text": raw.strip(),
+                "codes": [code],
+                "exact_codes": [],
+            })
+    return mentions
+
+
+def extract_explicit_hs_codes(text: str) -> List[str]:
+    found: List[str] = []
+    for mention in extract_explicit_hs_mentions(text):
+        for code in mention.get("codes") or []:
+            if code not in found:
+                found.append(code)
+    return found
+
+
+def extract_exact_hs_codes(text: str) -> List[str]:
+    found: List[str] = []
+    for mention in extract_explicit_hs_mentions(text):
+        for code in mention.get("exact_codes") or []:
+            if code not in found:
+                found.append(code)
     return found
 
 
 def extract_explicit_hs_code(text: str) -> Optional[str]:
     codes = extract_explicit_hs_codes(text)
     return codes[0] if codes else None
+
+
+def extract_product_or_hs(text: str) -> Dict[str, Optional[str]]:
+    codes = extract_explicit_hs_codes(text)
+    if codes:
+        return {"hs_code": codes[0], "product": None}
+    return {"hs_code": None, "product": (text or "").strip()}
 
 def _build_hs2_probe_sql(product_term: str, use_fuzzy: bool) -> Tuple[str, List[Any]]:
     # %s placeholders are filled by PyMySQL (safe quoting/escaping).
@@ -1056,6 +1398,27 @@ def run_hs2_probe_sql(product_term: str) -> List[Dict[str, Any]]:
         out.append({"hs2": hs2, "record_count": int(row.get("RECORD_COUNT") or 0), "domain": HS2_DOMAIN_MAP.get(hs2, "Unknown / Other")})
     return out
 
+def full_domain_hs_codes(domain: str) -> List[str]:
+    """Return the full authoritative HS2 chapter set for a named domain."""
+    return sorted([hs2 for hs2, name in HS2_DOMAIN_MAP.items() if name == domain])
+
+def format_hs_chapters_compact(codes: List[str]) -> str:
+    vals = sorted({int(c) for c in codes or [] if re.fullmatch(r"\d{2}", str(c))})
+    if not vals:
+        return ", ".join(codes or [])
+    chunks = []
+    i = 0
+    while i < len(vals):
+        j = i
+        while j + 1 < len(vals) and vals[j + 1] == vals[j] + 1:
+            j += 1
+        if j - i >= 2:
+            chunks.append(f"{vals[i]:02d}-{vals[j]:02d}")
+        else:
+            chunks.extend(f"{vals[k]:02d}" for k in range(i, j + 1))
+        i = j + 1
+    return ", ".join(chunks)
+
 def build_domain_options(hs2_rows: List[Dict[str, Any]], max_options: int = 8) -> List[Dict[str, Any]]:
     grouped: Dict[str, Dict[str, Any]] = {}
     for row in hs2_rows:
@@ -1067,7 +1430,8 @@ def build_domain_options(hs2_rows: List[Dict[str, Any]], max_options: int = 8) -
     options = list(grouped.values())
     for opt in options:
         opt["hs_codes"] = sorted(set(opt["hs_codes"]))
-        opt["label"] = f"Use {opt['domain']} (HS {', '.join(opt['hs_codes'])})"
+        opt["full_domain_hs_codes"] = full_domain_hs_codes(opt["domain"]) or list(opt["hs_codes"])
+        opt["label"] = f"Use {opt['domain']} (full domain HS {format_hs_chapters_compact(opt['full_domain_hs_codes'])})"
     options.sort(key=lambda x: (-x["record_count"], x["domain"]))
     for idx, opt in enumerate(options, start=1):
         opt["option_index"] = idx
@@ -1103,32 +1467,25 @@ def parse_domain_selection_from_text(text: str, pending: Dict[str, Any]) -> Opti
 
     for opt in options:
         if raw.lower() == str(opt.get("label", "")).lower():
-            return [{"domain": opt.get("domain"), "selected_hs_codes": opt.get("hs_codes", [])}]
+            return [{"domain": opt.get("domain"), "selected_hs_codes": opt.get("full_domain_hs_codes") or full_domain_hs_codes(opt.get("domain")) or opt.get("hs_codes", [])}]
 
     if re.fullmatch(r"\s*\d+(\s*,\s*\d+)*\s*", raw):
         scopes = []
         for n in [int(x) for x in re.findall(r"\d+", raw)]:
             if 1 <= n <= len(options):
                 opt = options[n - 1]
-                scopes.append({"domain": opt.get("domain"), "selected_hs_codes": opt.get("hs_codes", [])})
+                scopes.append({"domain": opt.get("domain"), "selected_hs_codes": opt.get("full_domain_hs_codes") or full_domain_hs_codes(opt.get("domain")) or opt.get("hs_codes", [])})
         if scopes:
             return scopes
 
-    hs_text = None
-    m = re.search(r"\(HS\s+([0-9,\s]+)\)", raw, flags=re.I)
-    if m:
-        hs_text = m.group(1)
-    else:
-        m = re.fullmatch(r"(?i)\s*HS\s+([0-9,\s]+)\s*", raw)
-        if m:
-            hs_text = m.group(1)
-        elif re.fullmatch(r"\s*\d{1,10}(\s*,\s*\d{1,10})+\s*", raw):
-            hs_text = raw
-    if hs_text:
-        codes = [normalize_hs_token(x) for x in re.findall(r"\d{1,10}", hs_text)]
+    # Explicit HS text entered while the picker is open uses the same production parser
+    # as normal queries, so ranges/dotted/spaced/12+ digit codes behave consistently.
+    codes = extract_explicit_hs_codes(raw)
+    if not codes and re.fullmatch(r"\s*\d{1,18}(\s*,\s*\d{1,18})+\s*", raw):
+        codes = [normalize_hs_token(x) for x in re.findall(r"\d{1,18}", raw)]
         codes = [c for c in codes if c]
-        if codes:
-            return scopes_from_hs_codes(options, codes)
+    if codes:
+        return scopes_from_hs_codes(options, codes)
     return None
 
 def get_product_memory(session: Dict[str, Any], product_term: str) -> Optional[Dict[str, Any]]:
@@ -1214,6 +1571,7 @@ def build_product_scopes_context(
 
     override_map = explicit_hs_overrides or {}
     profile_map = profile_hs_overrides or {}
+    current_exact_hs_codes = set(extract_exact_hs_codes(base_query))
     blocks = []
     pair_predicates = []
     for term in cleaned_terms:
@@ -1245,7 +1603,9 @@ def build_product_scopes_context(
             continue
 
         product_sql = build_canonical_product_match_sql(term, alias="td")
-        hs_sql = build_canonical_hs_scope_sql(hs_codes, alias="td")
+        hs_sql = build_canonical_hs_scope_sql(
+            hs_codes, alias="td", exact_hs_codes=[c for c in hs_codes if c in current_exact_hs_codes]
+        )
         pair_predicate = f"(({product_sql}) AND ({hs_sql}))"
         pair_predicates.append(pair_predicate)
         blocks.append(
@@ -1284,7 +1644,7 @@ def is_common_question_while_pending(text: str) -> bool:
     return q.startswith(common_starts) or "meant by" in q or "meaning" in q or "definition" in q
 
 def is_stale_domain_button(text: str) -> bool:
-    return bool(re.match(r"(?i)^use .+\(HS [0-9,\s]+\)$", (text or "").strip()))
+    return bool(re.match(r"(?i)^use .+\([^)]*HS [0-9,\s\-–—]+\)$", (text or "").strip()))
 
 def build_domain_clarification_text(product_term: str, options: List[Dict[str, Any]]) -> str:
     lines = [
@@ -1294,10 +1654,26 @@ def build_domain_clarification_text(product_term: str, options: List[Dict[str, A
         "",
     ]
     for idx, opt in enumerate(options, start=1):
-        lines.append(f"{idx}. {opt['domain']} — HS {', '.join(opt['hs_codes'])} ({opt['record_count']} matching rows)")
+        detected = format_hs_chapters_compact(opt.get("hs_codes") or [])
+        full_scope = format_hs_chapters_compact(opt.get("full_domain_hs_codes") or opt.get("hs_codes") or [])
+        lines.append(
+            f"{idx}. {opt['domain']} — detected HS {detected}; selecting this uses full domain HS {full_scope} "
+            f"({opt['record_count']} matching rows in the probe window)"
+        )
     return "\n".join(lines)
 
-def build_domain_clarification_response(session: Dict[str, Any], session_id: str, product_term: str, original_query: str, options: List[Dict[str, Any]], setup_only: bool = False, product_terms: Optional[List[str]] = None):
+def build_domain_clarification_response(
+    session: Dict[str, Any],
+    session_id: str,
+    product_term: str,
+    original_query: str,
+    options: List[Dict[str, Any]],
+    setup_only: bool = False,
+    product_terms: Optional[List[str]] = None,
+    explicit_hs_overrides: Optional[Dict[str, List[str]]] = None,
+    profile_hs_overrides: Optional[Dict[str, List[str]]] = None,
+    scope_resolver_trace: Optional[Dict[str, Any]] = None,
+):
     session["active_focus"]["pending_domain_disambiguation"] = {
         "original_query": original_query,
         "resume_query": original_query,
@@ -1305,6 +1681,9 @@ def build_domain_clarification_response(session: Dict[str, Any], session_id: str
         "options": options,
         "setup_only": setup_only,
         "product_terms": product_terms or [product_term],
+        "explicit_hs_overrides": explicit_hs_overrides or {},
+        "profile_hs_overrides": profile_hs_overrides or {},
+        "scope_resolver_trace": scope_resolver_trace,
     }
     session["state"] = STATE_AWAITING_CLARIFICATION
     clarification = build_domain_clarification_text(product_term, options)
@@ -1320,18 +1699,50 @@ def build_domain_clarification_response(session: Dict[str, Any], session_id: str
         ],
     }
 
-def start_next_unknown_product_scope(session: Dict[str, Any], session_id: str, original_query: str, product_terms: List[str], setup_only: bool = False):
-    unknown_terms = get_unknown_product_terms(session, product_terms)
+
+def start_next_unknown_product_scope(
+    session: Dict[str, Any],
+    session_id: str,
+    original_query: str,
+    product_terms: List[str],
+    setup_only: bool = False,
+    explicit_hs_overrides: Optional[Dict[str, List[str]]] = None,
+    profile_hs_overrides: Optional[Dict[str, List[str]]] = None,
+    scope_resolver_trace: Optional[Dict[str, Any]] = None,
+):
+    explicit_map = explicit_hs_overrides or {}
+    profile_map = profile_hs_overrides or {}
+    candidates = [
+        term for term in product_terms or []
+        if normalize_product_key(term) not in explicit_map
+        and normalize_product_key(term) not in profile_map
+    ]
+    unknown_terms = get_unknown_product_terms(session, candidates)
     if not unknown_terms:
         return None
     term_to_probe = unknown_terms[0]
     hs2_rows = run_hs2_probe_sql(term_to_probe)
     options = build_domain_options(hs2_rows)
     if len(options) > 1:
-        return build_domain_clarification_response(session, session_id, term_to_probe, original_query, options, setup_only, product_terms)
+        return build_domain_clarification_response(
+            session, session_id, term_to_probe, original_query, options, setup_only,
+            product_terms, explicit_map, profile_map, scope_resolver_trace,
+        )
     if len(options) == 1:
-        save_product_scope(session, term_to_probe, [{"domain": options[0]["domain"], "selected_hs_codes": options[0]["hs_codes"]}])
-        return start_next_unknown_product_scope(session, session_id, original_query, product_terms, setup_only)
+        save_product_scope(
+            session,
+            term_to_probe,
+            [{
+                "domain": options[0]["domain"],
+                "selected_hs_codes": options[0].get("full_domain_hs_codes")
+                    or full_domain_hs_codes(options[0]["domain"])
+                    or options[0]["hs_codes"],
+            }],
+        )
+        return start_next_unknown_product_scope(
+            session, session_id, original_query, product_terms, setup_only,
+            explicit_map, profile_map, scope_resolver_trace,
+        )
     return None
 
 # =========================================================
@@ -1615,7 +2026,40 @@ def _rewrite_hs_prefix_in_to_like(match: re.Match) -> str:
     return "(" + " OR ".join(f"{col} LIKE '{code}%'" for code in codes) + ")"
 
 
-def enforce_static_velodb_sql_contract(sql: str) -> str:
+
+def _rewrite_literal_hs_exactness(sql: str, exact_codes: Optional[List[str]] = None) -> str:
+    """Enforce prefix-by-default semantics for literal hs_code equality/IN filters."""
+    exact_set = {c for c in [normalize_hs_token(x) for x in (exact_codes or [])] if c}
+    s = sql or ""
+
+    eq_re = re.compile(r"(?i)(?P<col>(?:[A-Za-z_][A-Za-z0-9_]*\.)?hs_code)\s*=\s*'(?P<code>\d{1,18})'")
+    def repl_eq(m: re.Match) -> str:
+        code = normalize_hs_token(m.group("code"))
+        if not code or code in exact_set:
+            return m.group(0)
+        return f"{m.group('col')} LIKE CONCAT('{code}', '%')"
+    s = eq_re.sub(repl_eq, s)
+
+    in_re = re.compile(r"(?is)(?P<col>(?:[A-Za-z_][A-Za-z0-9_]*\.)?hs_code)\s+IN\s*\((?P<items>[^)]*)\)")
+    def repl_in(m: re.Match) -> str:
+        quoted = re.findall(r"'([0-9]{1,18})'", m.group("items"))
+        # Only rewrite when the IN list is a pure quoted-digit HS list.
+        residue = re.sub(r"'([0-9]{1,18})'", "", m.group("items"))
+        if not quoted or re.sub(r"[\s,]", "", residue):
+            return m.group(0)
+        parts = []
+        for raw in quoted:
+            code = normalize_hs_token(raw)
+            if not code:
+                return m.group(0)
+            if code in exact_set:
+                parts.append(f"{m.group('col')} = '{code}'")
+            else:
+                parts.append(f"{m.group('col')} LIKE CONCAT('{code}', '%')")
+        return parts[0] if len(parts) == 1 else "(" + " OR ".join(parts) + ")"
+    return in_re.sub(repl_in, s)
+
+def enforce_static_velodb_sql_contract(sql: str, user_query: str = "") -> str:
     """Canonicalize stale model SQL to the optimized production access contract."""
     s = sql or ""
 
@@ -1665,11 +2109,15 @@ def enforce_static_velodb_sql_contract(sql: str) -> str:
     )
     s = hs_prefix_in_re.sub(_rewrite_hs_prefix_in_to_like, s)
 
+    # Prefix is the default even for long national tariff codes; equality survives only
+    # when the CURRENT user explicitly requested exact HS semantics.
+    s = _rewrite_literal_hs_exactness(s, extract_exact_hs_codes(user_query))
+
     return s
 
 
-def apply_known_velodb_compatibility_repairs(sql: str, error: str) -> str:
-    current = enforce_static_velodb_sql_contract(sql or "")
+def apply_known_velodb_compatibility_repairs(sql: str, error: str, user_query: str = "") -> str:
+    current = enforce_static_velodb_sql_contract(sql or "", user_query)
     err = (error or "").lower()
     if "lambda argument must be array" in err and "regexp_extract_all" in current.lower():
         def _replace_regexp_extract(m: re.Match) -> str:
@@ -1682,7 +2130,31 @@ def apply_known_velodb_compatibility_repairs(sql: str, error: str) -> str:
         or "can not cast from origin type" in err
     ) and "array_exists" in current.lower():
         current = _replace_array_exists_with_scalar_count(current)
-    return enforce_static_velodb_sql_contract(current)
+    return enforce_static_velodb_sql_contract(current, user_query)
+
+
+_TRANSIENT_VELODB_ERROR_MARKERS = (
+    "compute_groups_no_alive_be",
+    "no alive be",
+    "backend nodes",
+    "backend node",
+    "compute group",
+    "connection reset",
+    "connection refused",
+    "server has gone away",
+    "lost connection",
+    "read timed out",
+    "connect timeout",
+    "timed out",
+    "temporarily unavailable",
+    "too many connections",
+)
+
+
+def is_transient_velodb_error(error: str) -> bool:
+    """Return True for infrastructure/availability failures that SQL rewriting cannot fix."""
+    low = (error or "").lower()
+    return bool(low and any(marker in low for marker in _TRANSIENT_VELODB_ERROR_MARKERS))
 
 # =========================================================
 # VELODB EXECUTION
@@ -1778,7 +2250,7 @@ def execute_prompt_pipeline(final_query_text: str) -> Dict[str, Any]:
         a_prompt = build_prompt_a(final_query_text)
         a_raw = call_gemini(a_prompt, max_tokens=PROMPT_A_MAX_TOKENS, temperature=0.0)
         a_parts = parse_prompt_a_output(a_raw)
-        sql_to_run = enforce_static_velodb_sql_contract((a_parts.get("sql") or "").strip())
+        sql_to_run = enforce_static_velodb_sql_contract((a_parts.get("sql") or "").strip(), final_query_text)
         dbg("SQL FROM PROMPT A", sql_to_run)
         if not sql_to_run:
             return {
@@ -1843,7 +2315,33 @@ def execute_prompt_pipeline(final_query_text: str) -> Dict[str, Any]:
             attempts.append({"sql": sql_to_run, "error": err})
             dbg(f"SQL FAILED (attempt {attempt_idx})", err)
 
-            local_repair = apply_known_velodb_compatibility_repairs(sql_to_run, err)
+            # Availability/network failures are not SQL problems.  Prompt B must never
+            # rewrite a valid query because the compute group happened to be unavailable.
+            # Retry the exact same SQL; if all attempts fail, surface a service-availability
+            # failure so callers can stop dependent TRADE nodes rather than changing source.
+            if is_transient_velodb_error(err):
+                if attempt_idx == MAX_SQL_FIX_ATTEMPTS:
+                    return {
+                        "stage": "sql_infrastructure_failure",
+                        "narrative": "The trade-data service is temporarily unavailable, so this analysis could not be completed from trade records.",
+                        "visualization": default_visualization([], []),
+                        "sql": sql_to_run,
+                        "rows": [],
+                        "cols": [],
+                        "prompt_a_raw": a_raw,
+                        "prompt_a_parts": a_parts,
+                        "prompt_c_raw": "",
+                        "error": err,
+                    }
+                if VELODB_TRANSIENT_RETRY_DELAY_SECONDS > 0:
+                    # Back off between retries so a briefly unhealthy compute group has
+                    # time to recover.  The SQL text itself is never changed for an
+                    # infrastructure failure.
+                    delay = VELODB_TRANSIENT_RETRY_DELAY_SECONDS * (2 ** (attempt_idx - 1))
+                    time.sleep(delay)
+                continue
+
+            local_repair = apply_known_velodb_compatibility_repairs(sql_to_run, err, final_query_text)
             if local_repair != sql_to_run:
                 sql_to_run = local_repair
                 dbg("LOCAL VELODB COMPATIBILITY REPAIR", sql_to_run)
@@ -1873,7 +2371,7 @@ def execute_prompt_pipeline(final_query_text: str) -> Dict[str, Any]:
                 attempt_index=attempt_idx,
             )
             b_raw = call_gemini(b_prompt, max_tokens=PROMPT_B_MAX_TOKENS, temperature=0.0)
-            sql_to_run = enforce_static_velodb_sql_contract(parse_prompt_b_output(b_raw))
+            sql_to_run = enforce_static_velodb_sql_contract(parse_prompt_b_output(b_raw), final_query_text)
 
         return {
             "stage": "unknown_failure",
@@ -1910,20 +2408,28 @@ def handle_pending_domain_selection(req: ChatRequest, session: Dict[str, Any], p
         product_term = pending_domain["product_term"]
         original_query = pending_domain.get("resume_query") or pending_domain.get("original_query") or ""
         product_terms = pending_domain.get("product_terms") or [product_term]
+        explicit_map = pending_domain.get("explicit_hs_overrides") or {}
+        profile_map = pending_domain.get("profile_hs_overrides") or {}
+        resolver_trace = pending_domain.get("scope_resolver_trace")
+
         save_product_scope(session, product_term, selected_scopes)
         session["active_focus"]["pending_domain_disambiguation"] = None
-        session["active_focus"]["pending_product_term"] = None
-        session["active_focus"]["pending_hs_code"] = None
-        session["active_focus"]["pending_explicit_hs_codes"] = []
-        session["active_focus"]["pending_profile_product_hs_map"] = {}
-        session["active_focus"]["pending_scope_resolver_trace"] = None
         append_turn(session, "user", raw_message)
 
         selected_hs = flatten_scope_hs_codes(selected_scopes)
         assistant_text = f"Got it. I’ll use HS {', '.join(selected_hs)} for “{product_term}”."
         append_turn(session, "assistant", assistant_text)
 
-        next_response = start_next_unknown_product_scope(session, req.session_id, original_query, product_terms, setup_only=bool(pending_domain.get("setup_only")))
+        next_response = start_next_unknown_product_scope(
+            session,
+            req.session_id,
+            original_query,
+            product_terms,
+            setup_only=bool(pending_domain.get("setup_only")),
+            explicit_hs_overrides=explicit_map,
+            profile_hs_overrides=profile_map,
+            scope_resolver_trace=resolver_trace,
+        )
         if next_response:
             next_response["messages"].insert(0, msg_answer(assistant_text))
             return next_response
@@ -1936,13 +2442,33 @@ def handle_pending_domain_selection(req: ChatRequest, session: Dict[str, Any], p
                 f"Which month does demand for {product_term} usually peak over the last 36 months?",
             ]
             store_followups(session, followups)
-            return {"session_id": req.session_id, "state": session["state"], "messages": [msg_answer(assistant_text), msg_followup(followups, title="Here are 3 questions you can run:")]}
+            return {
+                "session_id": req.session_id,
+                "state": session["state"],
+                "messages": [msg_answer(assistant_text), msg_followup(followups, title="Here are 3 questions you can run:")],
+            }
 
-        scoped_query = build_product_scopes_context(original_query, session, product_terms)
+        scoped_query = build_product_scopes_context(
+            original_query,
+            session,
+            product_terms,
+            explicit_hs_overrides=explicit_map,
+            profile_hs_overrides=profile_map,
+        )
         session["active_focus"]["pending_query_text"] = scoped_query
         session["active_focus"]["pending_product_terms"] = product_terms
+        session["active_focus"]["pending_explicit_hs_codes"] = dedupe_preserve([
+            c for codes in explicit_map.values() for c in codes
+        ])
+        session["active_focus"]["pending_explicit_product_hs_map"] = explicit_map
+        session["active_focus"]["pending_profile_product_hs_map"] = profile_map
+        session["active_focus"]["pending_scope_resolver_trace"] = resolver_trace
         session["state"] = STATE_AWAITING_CONFIRMATION
-        return {"session_id": req.session_id, "state": session["state"], "messages": [msg_answer(assistant_text), msg_confirm(original_query)]}
+        return {
+            "session_id": req.session_id,
+            "state": session["state"],
+            "messages": [msg_answer(assistant_text), msg_confirm(original_query)],
+        }
 
     if is_common_question_while_pending(raw_message):
         normalized = normalize_user_message(raw_message)
@@ -2051,6 +2577,7 @@ def _chat_impl(req: ChatRequest, session: Dict[str, Any]):
         session["active_focus"]["pending_product_term"] = active_product
         session["active_focus"]["pending_product_terms"] = followup_terms
         session["active_focus"]["pending_explicit_hs_codes"] = followup_explicit_hs
+        session["active_focus"]["pending_explicit_product_hs_map"] = followup_overrides or {}
         session["active_focus"]["pending_hs_code"] = (
             ",".join(followup_explicit_hs) if followup_explicit_hs and not active_product
             else session["active_focus"].get("hs_code")
@@ -2132,31 +2659,30 @@ def _chat_impl(req: ChatRequest, session: Dict[str, Any]):
         if not set(current_explicit_hs_codes).issubset(final_hs):
             final_query_text = raw_message
 
-    # Pre-Text2SQL company product-scope resolver. Run it only for a concrete DB query,
-    # never for definitions/advisory/direct answers, so it does not add unnecessary latency.
+    # Product Scope Resolver: resolve CURRENT explicit product->HS links per product,
+    # then (USER_COMPANY only) fill still-unresolved products from company-profile evidence.
+    # One explicit HS elsewhere in a long query must never disable resolution for other products.
     scope_resolver_result = {
         "scope_type": "GLOBAL",
-        "action": "PASS_THROUGH",
         "resolved_products": [],
-        "unresolved_products": [],
-        "rewritten_query": final_query_text or normalized,
+        "unresolved_products": list(product_terms),
+        "unscoped_explicit_hs_codes": list(current_explicit_hs_codes),
         "reason": "Resolver not needed for this action.",
     }
+    explicit_scope_overrides: Dict[str, List[str]] = {}
     profile_scope_overrides: Dict[str, List[str]] = {}
-    if action == "CONFIRM_QUERY" and not current_explicit_hs_codes:
-        scope_resolver_result = resolve_company_product_scope(
+    if action == "CONFIRM_QUERY":
+        scope_resolver_result = resolve_product_scope(
             session=session,
             original_user_query=raw_message,
             candidate_query=final_query_text or normalized,
-            current_explicit_hs_codes=current_explicit_hs_codes,
+            product_terms=product_terms,
         )
-        profile_scope_overrides = resolver_product_hs_override_map(scope_resolver_result)
-        if scope_resolver_result.get("action") == "REWRITE" and profile_scope_overrides:
-            final_query_text = scope_resolver_result.get("rewritten_query") or final_query_text or normalized
-            for resolved_term in resolver_product_terms(scope_resolver_result):
-                if resolved_term not in product_terms:
-                    product_terms.append(resolved_term)
-            product_terms = dedupe_preserve(product_terms)
+        explicit_scope_overrides, profile_scope_overrides = resolver_product_hs_maps(scope_resolver_result)
+        for resolved_term in resolver_product_terms(scope_resolver_result):
+            if resolved_term not in product_terms:
+                product_terms.append(resolved_term)
+        product_terms = dedupe_preserve(product_terms)
 
     messages: List[Dict[str, Any]] = [msg_answer(assistant_text)]
     append_turn(session, "assistant", assistant_text)
@@ -2166,14 +2692,22 @@ def _chat_impl(req: ChatRequest, session: Dict[str, Any]):
         followups = safe_fallback_followups(session)
     store_followups(session, followups)
 
-    if not hs_code and not current_explicit_hs_codes and product_terms:
+    if product_terms:
         unresolved_for_domain = [
             term for term in product_terms
-            if normalize_product_key(term) not in profile_scope_overrides
+            if normalize_product_key(term) not in explicit_scope_overrides
+            and normalize_product_key(term) not in profile_scope_overrides
         ]
         if unresolved_for_domain:
             response = start_next_unknown_product_scope(
-                session, req.session_id, final_query_text or normalized, unresolved_for_domain, setup_only=False
+                session,
+                req.session_id,
+                final_query_text or normalized,
+                unresolved_for_domain,
+                setup_only=False,
+                explicit_hs_overrides=explicit_scope_overrides,
+                profile_hs_overrides=profile_scope_overrides,
+                scope_resolver_trace=scope_resolver_result,
             )
             if response:
                 return response
@@ -2198,14 +2732,8 @@ def _chat_impl(req: ChatRequest, session: Dict[str, Any]):
             append_turn(session, "assistant", f"Clarification: {clarification_q}")
             return {"session_id": req.session_id, "state": session["state"], "messages": messages}
 
-        # CURRENT explicit HS scope has highest precedence over product_hs_memory.
-        # Store it as pending until the user confirms; on Proceed it becomes the new
-        # latest session scope for the product (so future product-only turns reuse it).
-        explicit_scope_overrides = None
-        if current_explicit_hs_codes and product_terms:
-            explicit_scope_overrides = {
-                normalize_product_key(term): current_explicit_hs_codes for term in product_terms
-            }
+        # Preserve product-specific current explicit mappings. Unscoped explicit HS is kept
+        # separately for HS-only queries; it is never copied onto unrelated products.
         scoped_query = build_product_scopes_context(
             final_query_text,
             session,
@@ -2217,6 +2745,7 @@ def _chat_impl(req: ChatRequest, session: Dict[str, Any]):
         session["active_focus"]["pending_product_term"] = product_terms[0] if product_terms else product_term
         session["active_focus"]["pending_product_terms"] = product_terms
         session["active_focus"]["pending_explicit_hs_codes"] = current_explicit_hs_codes
+        session["active_focus"]["pending_explicit_product_hs_map"] = explicit_scope_overrides
         session["active_focus"]["pending_profile_product_hs_map"] = profile_scope_overrides
         session["active_focus"]["pending_scope_resolver_trace"] = scope_resolver_result
         session["active_focus"]["pending_hs_code"] = hs_code
@@ -2260,6 +2789,7 @@ def _confirm_impl(session_id: str, session: Dict[str, Any], decision: str):
         session["active_focus"]["pending_product_terms"] = []
         session["active_focus"]["pending_hs_code"] = None
         session["active_focus"]["pending_explicit_hs_codes"] = []
+        session["active_focus"]["pending_explicit_product_hs_map"] = {}
         session["active_focus"]["pending_profile_product_hs_map"] = {}
         session["active_focus"]["pending_scope_resolver_trace"] = None
         session["state"] = STATE_IDLE
@@ -2273,6 +2803,7 @@ def _confirm_impl(session_id: str, session: Dict[str, Any], decision: str):
     pending_hs_code = session["active_focus"].get("pending_hs_code")
     pending_product_terms = session["active_focus"].get("pending_product_terms") or []
     pending_explicit_hs_codes = session["active_focus"].get("pending_explicit_hs_codes") or []
+    pending_explicit_product_hs_map = session["active_focus"].get("pending_explicit_product_hs_map") or {}
     pending_profile_product_hs_map = session["active_focus"].get("pending_profile_product_hs_map") or {}
     pending_scope_resolver_trace = session["active_focus"].get("pending_scope_resolver_trace")
 
@@ -2281,16 +2812,30 @@ def _confirm_impl(session_id: str, session: Dict[str, Any], decision: str):
     session["active_focus"]["pending_product_terms"] = []
     session["active_focus"]["pending_hs_code"] = None
     session["active_focus"]["pending_explicit_hs_codes"] = []
+    session["active_focus"]["pending_explicit_product_hs_map"] = {}
     session["active_focus"]["pending_profile_product_hs_map"] = {}
     session["active_focus"]["pending_scope_resolver_trace"] = None
 
-    if pending_explicit_hs_codes and pending_product_terms:
-        # The user explicitly changed the product's HS scope in this turn.
-        # On Proceed this becomes the latest session scope (choice A).
-        explicit_scopes = [{"domain": "User-explicit HS", "selected_hs_codes": pending_explicit_hs_codes}]
-        for term in pending_product_terms:
-            save_product_scope(session, term, explicit_scopes)
-        final_query_text = build_product_scopes_context(final_query_text, session, pending_product_terms)
+    if pending_explicit_product_hs_map and pending_product_terms:
+        # Persist ONLY each product's own explicit HS scope. This fixes the historical bug
+        # where the merged query-wide HS list was saved against every product.
+        term_lookup = {normalize_product_key(t): t for t in pending_product_terms}
+        for key, codes in pending_explicit_product_hs_map.items():
+            term = term_lookup.get(key)
+            clean_codes = [c for c in [normalize_hs_token(x) for x in codes] if c]
+            if term and clean_codes:
+                save_product_scope(
+                    session,
+                    term,
+                    [{"domain": "User-explicit HS", "selected_hs_codes": sorted(set(clean_codes))}],
+                )
+        final_query_text = build_product_scopes_context(
+            final_query_text,
+            session,
+            pending_product_terms,
+            explicit_hs_overrides=pending_explicit_product_hs_map,
+            profile_hs_overrides=pending_profile_product_hs_map,
+        )
     elif pending_profile_product_hs_map and pending_product_terms:
         # Company-profile resolver scope is current-query only. Do NOT save it into generic
         # product_hs_memory, otherwise a later GLOBAL product query could be silently narrowed.
@@ -2306,7 +2851,7 @@ def _confirm_impl(session_id: str, session: Dict[str, Any], decision: str):
         session["active_focus"]["product_name"] = None
         session["active_focus"]["selected_hs_codes"] = pending_explicit_hs_codes
     elif pending_product_terms:
-        # No HS in the current turn: reuse the latest saved scope for each product.
+        # No current explicit/profile HS for these products: reuse saved per-product scope.
         final_query_text = build_product_scopes_context(final_query_text, session, pending_product_terms)
 
     result = execute_prompt_pipeline(final_query_text)

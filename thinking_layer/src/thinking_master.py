@@ -328,12 +328,14 @@ def _trace(step: Dict[str, Any]) -> Dict[str, Any]:
 # ENTRY POINT
 # =========================================================
 def run(query: str, engine_id: Optional[str],
-        dependency_answers: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        dependency_answers: Optional[Dict[str, Any]] = None,
+        display_query: Optional[str] = None) -> Dict[str, Any]:
     """Thinking layer for one query. Never raises; the temp engine session is always deleted."""
     started = time.time()
     query = (query or "").strip()
+    user_facing_query = (display_query or query or "").strip()
     final = {
-        "query": query, "engine_id": engine_id, "temp_engine_id": None,
+        "query": user_facing_query, "scoped_query": query, "engine_id": engine_id, "temp_engine_id": None,
         "text": "", "charts": [], "sources": [], "steps": [],
         "steps_used": 0, "stopped_reason": "", "error": "", "seconds": 0.0,
     }
@@ -358,7 +360,7 @@ def run(query: str, engine_id: Optional[str],
                 break
             steps.append(run_step(len(steps) + 1, decision))
 
-        connected = connect(query, context, steps, dependency_answers)
+        connected = connect(user_facing_query, context, steps, dependency_answers)
         final.update(text=connected["text"], charts=connected["charts"], sources=connected["sources"],
                      error=connected["error"], stopped_reason=stopped)
     except Exception as exc:
