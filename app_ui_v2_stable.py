@@ -12,6 +12,7 @@
 # -> approve each field -> resolve again -> build profile, with 3 attempts.
 
 import json
+import time
 import re
 import html
 
@@ -2158,6 +2159,16 @@ def push_turn(
     content: str,
     trace=None
 ):
+
+    # ⏱ Response timer (testing): clock starts when the user sends a message and is
+    # stamped on the next answer that carries a trace. Stored in the trace, so it is
+    # saved with the answer and shown again when the chat is reopened.
+    if role == "user":
+        S["q_started"] = time.time()
+    elif isinstance(trace, dict) and "elapsed_s" not in trace and S.get("q_started"):
+        elapsed = time.time() - S["q_started"]
+        if elapsed >= 1.0:  # skips instant re-pushes when an old chat is restored
+            trace["elapsed_s"] = round(elapsed, 1)
 
     S.turns.append(
         {
@@ -4857,6 +4868,9 @@ def page_chat():
         with st.chat_message(turn["role"], avatar=avatar):
             if turn["role"] == "assistant":
                 st.markdown(turn["content"])
+                elapsed = (turn.get("trace") or {}).get("elapsed_s") if isinstance(turn.get("trace"), dict) else None
+                if elapsed is not None:
+                    st.caption(f"⏱ {int(elapsed) // 60:02d}:{int(elapsed) % 60:02d}")
                 render_visual(turn.get("trace"))
                 render_thinking(turn.get("trace"))
                 render_node_details(turn.get("trace"))
