@@ -1190,6 +1190,23 @@ class FlowRun:
 
         return node["text"]
 
+    def _hs_context(self, node: dict) -> dict:
+        """Parents of a TRADE node, for the HS resolution layer."""
+        parents = []
+        for d in node.get("depends_on", []) or []:
+            parent = self.questions.get(d) or {}
+            parents.append({
+                "id": d,
+                "route": str(parent.get("route") or "").upper(),
+                "asked": self.asked.get(d, parent.get("text", "")),
+                "answer": str(self.answers.get(d) or "")[:1500],
+            })
+        return {
+            "derived": any(p["route"] in ("WEB", "PERSONAL") for p in parents),
+            "parents": parents,
+            "original_question": self.original_question,
+        }
+
     def _run_node(self, node: dict, question: str) -> dict:
         """Dispatch one node. Returns {'text', 'pending', 'needs_answer'}."""
         route = node.get("route", "TRADE")
@@ -1213,6 +1230,9 @@ class FlowRun:
             # new Trade Mini Connector can read node["trade_decision"].
             # Legacy one-argument handlers remain supported.
             fn = self.handlers.get("trade")
+            # HS resolution layer: tell the engine whether this node's products came
+            # from a WEB / PERSONAL step (enables the web HS6 lookup for them).
+            node["hs_context"] = self._hs_context(node)
             result = _call_trade_handler(fn, question, node)
             if result.get("pending"):
                 return {"text": "", "pending": True, "needs_answer": False}

@@ -794,6 +794,7 @@ def init_state():
     )
 
     d.setdefault("flow_traces", [])        # [{"question","trace"}] per TRADE node
+    d.setdefault("thinking_hs", [])        # HS layer traces of THINKING tasks in this flow
     d.setdefault("flow_run", None)  
     d.setdefault("pending_clarify", None)         # {"qid","question","options"} while open
     d.setdefault("last_flow", None)
@@ -2760,6 +2761,12 @@ def _thinking_task_handler(task: dict) -> dict:
         or {}
     )
 
+    # HS layer once before the thinking loop (never the picker); the thinking
+    # layer's session copy then reads the resolved codes from the cache.
+    hs_trace = ENGINE.prepare_hs_for_thinking(S.sid, query)
+    if hs_trace:
+        S.thinking_hs.append({"question": query, **hs_trace})
+
     final = thinking_run(
         query,
         S.sid,
@@ -2835,6 +2842,14 @@ def ui_trade(
     The complete Decision Layer result is attached to node["trade_decision"]
     before FlowRun starts.
     """
+
+    # HS resolution layer: where did this node's products come from? (WEB/PERSONAL
+    # parents enable the web HS6 step). Reset to {} for nodes without context.
+    if S.sid:
+        ENGINE.set_hs_context(
+            S.sid,
+            (node or {}).get("hs_context") if isinstance(node, dict) else {},
+        )
 
     # ---------------------------------------------------------
     # Safety / backward-compatible fallback
@@ -2993,6 +3008,16 @@ def finish_flow(out: dict):
         if qid:
             charts.append({"qid": qid, "trace": item["trace"]})
     charts.sort(key=lambda c: c["qid"])
+    hs_resolutions = []
+    for item in S.flow_traces:
+        hs = (item.get("trace") or {}).get("hs_resolution")
+        if hs:
+            hs_resolutions.append({"question": item.get("question") or "", **hs})
+    hs_resolutions.extend(S.thinking_hs or [])
+    if not hs_resolutions and (S.last_trade_trace or {}).get("hs_resolution"):
+        hs_resolutions.append(S.last_trade_trace["hs_resolution"])
+    if hs_resolutions:
+        trace["hs_resolutions"] = hs_resolutions
     if len(charts) > 1:
         trace["charts"] = charts
     if S.last_web:
@@ -3109,6 +3134,7 @@ def start_flow(text: str, sent: str, memory: dict):
     S.last_trade_trace = None
     S.last_trade_execution = None
     S.flow_traces = []
+    S.thinking_hs = []
     S.thinking_results = []
     S.last_web = None
 
@@ -4113,6 +4139,19 @@ def sidebar():
             else:
                 st.caption("No responses captured yet.")
 
+        hs_cache = ENGINE.hs_cache(S.sid) if S.sid else {"company": "", "rows": []}
+        with st.expander(f"🧬 HS cache ({len(hs_cache['rows'])})"):
+            if hs_cache.get("company"):
+                st.caption(f"Company: {hs_cache['company']}")
+            if hs_cache["rows"]:
+                st.dataframe(
+                    pd.DataFrame(hs_cache["rows"]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.caption("No products resolved to HS yet in this session.")
+
         st.divider()
 
         if st.button("End session & save", type="primary", use_container_width=True):
@@ -4572,6 +4611,148 @@ def _debug_html(value):
     )
 
 
+HS_STEP_ICONS = {
+    "HIT": "✅", "MISS": "❌", "SKIPPED": "⏭️", "ERROR": "⚠️",
+    "ASKED": "❓", "IGNORED": "🚫",
+}
+
+
+def _render_hs_step_detail(step: dict):
+    detail = step.get("detail") or {}
+    if not detail:
+        return
+    if detail.get("sql"):
+        st.code(detail["sql"], language="sql")
+    if detail.get("candidates"):
+        st.markdown("**Candidates from company data**")
+        st.dataframe(pd.DataFrame(detail["candidates"]), use_container_width=True, hide_index=True)
+    validator = detail.get("validator") or {}
+    if validator:
+        st.markdown(
+            f"**Sonar validation** · `{validator.get('model', '')}` · status **{validator.get('status', '')}**"
+            + (f" · {validator.get('elapsed_ms')} ms" if validator.get("elapsed_ms") is not None else "")
+        )
+        if validator.get("groups"):
+            st.markdown("Meaning groups")
+            st.dataframe(pd.DataFrame([
+                {
+                    "meaning": g.get("meaning"),
+                    "records": g.get("record_count"),
+                    "hs_codes (top 10)": ", ".join(g.get("hs_codes") or []),
+                    "codes found": g.get("codes_total"),
+                    "chosen": "yes" if g.get("meaning") == validator.get("chosen_group") else "",
+                }
+                for g in validator["groups"]
+            ]), use_container_width=True, hide_index=True)
+            st.caption(
+                f"Chosen by {validator.get('choice_reason') or '—'}"
+                + (f" · context pointed to: {validator['context_group']}" if validator.get("context_group") else "")
+            )
+        if validator.get("kept"):
+            st.markdown("Kept")
+            st.dataframe(pd.DataFrame(validator["kept"]), use_container_width=True, hide_index=True)
+        if validator.get("rejected"):
+            st.markdown("Rejected")
+            st.dataframe(pd.DataFrame(validator["rejected"]), use_container_width=True, hide_index=True)
+        if validator.get("error"):
+            st.error(validator["error"])
+    if detail.get("hs6"):
+        st.markdown(f"**Sonar web lookup** · status **{detail.get('status', '')}**")
+        if detail.get("interpretation"):
+            st.caption(f"Interpreted as: {detail['interpretation']}")
+        st.dataframe(pd.DataFrame(detail["hs6"]), use_container_width=True, hide_index=True)
+    if detail.get("removed_other_product_codes"):
+        st.caption("Removed (codes of other products in this question): " + ", ".join(
+            f"{r['code']} → {r['belongs_to']}" for r in detail["removed_other_product_codes"]
+        ))
+    if step.get("step") == "WEB" and detail.get("error") and not detail.get("hs6"):
+        st.error(detail["error"])
+    if detail.get("domains"):
+        st.markdown("**HS domains**")
+        st.dataframe(pd.DataFrame(
+            [d if isinstance(d, dict) else {"domain": d} for d in detail["domains"]]
+        ), use_container_width=True, hide_index=True)
+    if detail.get("matched_items"):
+        st.caption("Profile items: " + "; ".join(detail["matched_items"]))
+    if detail.get("meanings"):
+        st.markdown("**Cached meanings**")
+        st.dataframe(pd.DataFrame([
+            {
+                "meaning": m.get("meaning"),
+                "hs_codes": ", ".join(m.get("hs_codes") or []),
+                "records": m.get("record_count"),
+                "default": "yes" if m.get("meaning") == detail.get("default") else "",
+            }
+            for m in detail["meanings"]
+        ]), use_container_width=True, hide_index=True)
+        sonar = detail.get("sonar") or {}
+        if sonar:
+            st.caption(f"Sonar choice: {sonar.get('choice')} — {sonar.get('reason') or sonar.get('error') or ''}")
+
+
+def render_hs_resolution(trace: dict):
+    """HS resolution section: how each product got its HS codes."""
+    resolutions = (trace or {}).get("hs_resolutions") or []
+    if not resolutions:
+        return
+    n_products = sum(len(r.get("products") or []) for r in resolutions)
+    with st.expander(f"HS resolution · {n_products} product{'s' if n_products != 1 else ''}"):
+        for idx, res in enumerate(resolutions):
+            if len(resolutions) > 1:
+                st.markdown(f"**Question:** {res.get('question') or res.get('query') or ''}")
+            meta = [
+                f"Company: {res.get('company') or '—'}",
+                f"Window: {' → '.join(res.get('window') or [])}",
+                "Route: " + (res.get("route") or "TEXT2SQL"),
+            ]
+            st.caption(" · ".join(meta))
+
+            parse = res.get("explicit_parse") or {}
+            if parse.get("items"):
+                st.markdown("**Explicit HS in the question**")
+                st.dataframe(pd.DataFrame([
+                    {"text": i.get("text"), "codes": ", ".join(i.get("codes") or []),
+                     "label": i.get("label") or "", "exact": "yes" if i.get("exact") else ""}
+                    for i in parse["items"]
+                ]), use_container_width=True, hide_index=True)
+            notes = []
+            if parse.get("hs_only"):
+                notes.append("HS-only codes: " + ", ".join(parse["hs_only"]))
+            if parse.get("wrappers"):
+                notes.append("Ignored wrapper phrases: " + "; ".join(parse["wrappers"]))
+            if res.get("dropped"):
+                notes.append("Not physical goods (no HS): " + "; ".join(res["dropped"]))
+            if res.get("ignored"):
+                notes.append("Over the cap (word match only): " + "; ".join(res["ignored"]))
+            for n in notes:
+                st.caption(n)
+
+            summary = [
+                {
+                    "product": p.get("product"),
+                    "status": p.get("status"),
+                    "meaning": p.get("meaning") or "",
+                    "hs_codes": ", ".join(p.get("final_codes") or []),
+                    "source": p.get("source") or "",
+                }
+                for p in res.get("products") or []
+            ]
+            if summary:
+                st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
+
+            for p in res.get("products") or []:
+                st.markdown(f"**{p.get('product')}**")
+                for step in p.get("steps") or []:
+                    icon = HS_STEP_ICONS.get(step.get("outcome"), "•")
+                    note = f" — {step['note']}" if step.get("note") else ""
+                    st.markdown(f"{icon} `{step.get('step')}` {step.get('outcome')}{note}")
+                    if step.get("detail"):
+                        with st.container(border=True):
+                            _render_hs_step_detail(step)
+            if idx < len(resolutions) - 1:
+                st.divider()
+
+
 def render_trace(trace: dict):
     if not trace:
         return
@@ -4681,6 +4862,7 @@ def page_chat():
                 render_node_details(turn.get("trace"))
                 render_resolution(turn.get("trace"))
                 render_trace(turn.get("trace"))
+                render_hs_resolution(turn.get("trace"))
             else:
                 st.write(turn["content"])
 

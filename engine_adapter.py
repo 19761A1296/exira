@@ -1,6 +1,7 @@
 # engine_adapter.py
 from text2sql import text2sql_tool as engine
 from text2sql.session_store import STORE, SessionBusy
+from text2sql import hs_resolver
 
 
 HS2_DOMAIN_MAP = engine.HS2_DOMAIN_MAP
@@ -56,6 +57,20 @@ class Engine:
         """Push router-side memory into the engine session before every call."""
         def apply(session):
             session["active_focus"]["user_memory"] = memory
+            # HS cache is per company: clear it here too, so the Thinking layer
+            # (which copies this session) never sees another company's scopes.
+            hs_resolver.sync_cache_company(session)
+        self._update(sid, apply)
+
+    def set_hs_context(self, sid: str, ctx: dict | None) -> None:
+        """Tell the HS layer where this trade question came from.
+
+        ctx = {"derived": bool, "parents": [{"route", "asked", "answer"}], "original_question"}
+        derived=True (a WEB / PERSONAL parent produced the products) enables the
+        web HS6 lookup step. Called before every TRADE node; {} resets it.
+        """
+        def apply(session):
+            hs_resolver.set_flow_context(session, ctx or {})
         self._update(sid, apply)
 
     # ── engine calls ─────────────────────────────────────────
@@ -95,6 +110,21 @@ class Engine:
         if s["active_focus"].get("pending_domain_disambiguation"):
             return False                  # that is the HS pick, handled elsewhere
         return s.get("state") == "AWAITING_CLARIFICATION"
+
+    def prepare_hs_for_thinking(self, sid: str | None, query: str) -> dict | None:
+        """Run the HS layer once before a THINKING task (no picker). Returns its trace."""
+        if not sid:
+            return None
+        return engine.prepare_hs_for_thinking(sid, query)
+
+    def hs_cache(self, sid: str | None) -> dict:
+        """Session HS cache for the UI: {"company", "rows": [{product, hs_codes, source, resolved_at}]}."""
+        if not sid:
+            return {"company": "", "rows": []}
+        s = STORE.load(sid)
+        if not s:
+            return {"company": "", "rows": []}
+        return hs_resolver.cache_view(s)
 
     def current_scope(self, sid: str) -> dict:
         """What the engine is actually focused on right now."""

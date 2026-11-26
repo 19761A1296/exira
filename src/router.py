@@ -719,6 +719,13 @@ def begin_session(old_session_memory: str = "", user_product_info: str = "",
             or {}
         )
 
+        # HS layer once before the thinking loop (never the picker).
+        hs_trace = ENGINE.prepare_hs_for_thinking(sid, query)
+        if hs_trace:
+            print("[HS LAYER · THINKING]", json.dumps(
+                [(p["product"], p["status"], p["final_codes"]) for p in hs_trace.get("products") or []]
+            ))
+
         final = thinking_run(
             query,
             sid,
@@ -796,6 +803,12 @@ def begin_session(old_session_memory: str = "", user_product_info: str = "",
                    -> TEXT2SQL
                    -> THINKING
         """
+
+        # HS resolution layer: tell the engine where this node's products came from.
+        ENGINE.set_hs_context(
+            sid,
+            node.get("hs_context") if isinstance(node, dict) else {},
+        )
 
         # ----------------------------------------------------
         # Backward-compatible fallback
