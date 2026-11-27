@@ -111,9 +111,9 @@ def _row_get(row: Dict[str, Any], *names: str) -> Any:
     return None
 
 
-def _sql_literal(value: str) -> str:
-    # MySQL-protocol engines treat backslash as an escape character too.
-    return (value or "").replace("\\", "\\\\").replace("'", "''").strip()
+# def _sql_literal(value: str) -> str:
+#     # MySQL-protocol engines treat backslash as an escape character too.
+#     return (value or "").replace("\\", "\\\\").replace("'", "''").strip()
 
 
 def _parse_json_loose(text: str) -> Dict[str, Any]:
@@ -263,6 +263,8 @@ def company_search_window(today: Optional[datetime.date] = None) -> Tuple[dateti
 
 def build_company_hs_sql(table: str, company: str, product: str,
                          start: datetime.date, end: datetime.date) -> str:
+    company = (company or "").replace("\\", "\\\\").replace("'", "''").strip()
+    product = (product or "").upper().replace("\\", "\\\\").replace("'", "''").strip()
     return f"""
 SELECT
     td.hs_code AS HS_CODE,
@@ -271,10 +273,10 @@ SELECT
 FROM {table} td
 WHERE td.shipping_date BETWEEN '{start.isoformat()}' AND '{end.isoformat()}'
   AND (
-        td.seller_company = '{_sql_literal(company)}'
-        OR td.buyer_company = '{_sql_literal(company)}'
+        td.seller_company = '{company}'
+        OR td.buyer_company = '{company}'
       )
-  AND td.product_description_norm MATCH_ALL '{_sql_literal(product.upper())}'
+  AND td.product_description_norm MATCH_ALL '{product}'
   AND td.hs_code IS NOT NULL
   AND td.hs_code <> ''
 GROUP BY td.hs_code
